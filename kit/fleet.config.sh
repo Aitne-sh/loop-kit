@@ -4,7 +4,7 @@
 # Maximum concurrent task loops (each live loop is one claude session at a time,
 # and contract generation for a new task also occupies a slot). Subscription
 # rate windows are shared across ALL runs — keep this modest.
-FLEET_MAX_PARALLEL="2"
+FLEET_MAX_PARALLEL="3"
 
 # --drain exits only after the fleet has been idle for this many CONSECUTIVE
 # dispatch ticks (a tick is ~2s in production). The grace window is what makes

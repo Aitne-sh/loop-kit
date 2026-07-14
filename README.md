@@ -848,7 +848,7 @@ than ~1 in 4 iterations, raise the threshold for that project.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `FLEET_MAX_PARALLEL` | 2 | Concurrent task slots. All runs share your rate limit — keep it modest. |
+| `FLEET_MAX_PARALLEL` | 3 | Concurrent task slots. All runs share your rate limit — keep it modest. |
 | `WORKTREE_SETUP_CMD` | (empty) | Runs once in each new worktree (e.g. `npm ci`). It's arbitrary code, so the supervisor confirms it at start. |
 | `FLEET_DECOMPOSE` | 1 | 0 = always run the classic single loop, never decompose. |
 | `FLEET_MAX_TASKS` | 12 | Upper bound on tasks one decomposition may emit. Phased chains consume slots too. |

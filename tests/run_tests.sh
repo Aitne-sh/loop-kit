@@ -375,6 +375,12 @@ check "certificate verify-log hash" success "$(sha256 < .loop/last-verify.log)" 
 if [ -f .loop/observations-manifest.jsonl ]; then manifest_actual=$(sha256 < .loop/observations-manifest.jsonl); else manifest_actual=$(printf '' | sha256); fi
 check "certificate evidence-manifest hash" success "$manifest_actual" "$(json_scalar "$CERT" evidence_manifest_sha256)"
 if grep -q 'machine record: .loop/docs/certification.json' .loop/docs/evidence-report.md; then ok "evidence report displays the machine certificate"; else bad "certificate view missing from evidence report" success; fi
+# a completed run has no forward loop command — the only next move is a new task
+if grep -q 'To start another task' "$WORK/last-run.out" && grep -q './loop.sh start' "$WORK/last-run.out"; then
+  ok "SUCCESS points at ./loop.sh start for a new task"
+else
+  bad "SUCCESS missing the 'start another task' hint" nextcmd
+fi
 
 echo "== log namespace rejects relative-path task/run identifiers =="
 make_fixture log-id-boundary
@@ -398,12 +404,6 @@ LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" LOOP_FAKE_REVIEW="APPROVE
   ./loop.sh resume >"$WORK/log-runid-boundary.out" 2>&1 </dev/null || RC=$?
 check "resume with corrupt run id still verifies" log-runid-boundary 0 "$RC"
 if [ "$(json_scalar .loop/docs/certification.json run_id)" != ".." ]; then ok "corrupt checkpoint run id was not used as a path segment"; else bad "relative run id reached certificate/log paths" log-runid-boundary; fi
-# a completed run has no forward loop command — the only next move is a new task
-if grep -q 'To start another task' "$WORK/last-run.out" && grep -q './loop.sh start' "$WORK/last-run.out"; then
-  ok "SUCCESS points at ./loop.sh start for a new task"
-else
-  bad "SUCCESS missing the 'start another task' hint" nextcmd
-fi
 
 echo "== HTML authoring is rubric-gated by default (trivial run -> skipped + journaled) =="
 # the success run above had no LOOP_HTML override -> html=auto -> the skill's
@@ -5162,7 +5162,7 @@ echo "== config: FLEET_MAX_* defaults agree across code fallback, README, fleet.
 # guard the three-way mirror so a future edit to one place can't silently diverge
 # (the exact drift Fix B closed: code fallback that disagreed with the shipped value)
 mirror_ok=1
-for key in FLEET_MAX_TASKS FLEET_MAX_REPLAN_TASKS FLEET_MAX_PLAN_REVISIONS; do
+for key in FLEET_MAX_PARALLEL FLEET_MAX_TASKS FLEET_MAX_REPLAN_TASKS FLEET_MAX_PLAN_REVISIONS; do
   shipped=$(grep -E "^${key}=" "$ROOT/kit/fleet.config.sh" | tail -1 | sed -E 's/[^0-9]//g')
   badfb=$(grep -oE "fcfg ${key} [0-9]+" "$ROOT/bin/loop.sh" | awk -v s="$shipped" '$3!=s{print}')
   readme_n=$(grep -E "^\| .${key}. \|" "$ROOT/README.md" | head -1 | awk -F'|' '{gsub(/[^0-9]/,"",$3); print $3}')

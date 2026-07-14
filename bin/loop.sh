@@ -1889,6 +1889,7 @@ observation_tokens() { # stdin -> supported observation path tokens
 }
 
 checklist_observation_paths() { # verified run-row artifact paths only
+  [ -f .loop/docs/acceptance-checklist.md ] || return 0
   awk -F'|' '
     /^\|[[:space:]]*AC-[0-9]+[[:space:]]*\|/ {
       m=$5; st=$6; ev=$7
@@ -4336,14 +4337,14 @@ cmd_fleet_add() {
       id=$(enqueue_task "$(cat "$a")" "$a" "$auto")
       [ -z "$after" ] || renv_set "$id" DEPENDS_ON "$after"
       fnote "queued $id (from $a)${after:+ — after: $after}"
-      fnote "queue: $ahead ahead in new/ | slots: $(active_slots)/$(fcfg FLEET_MAX_PARALLEL 2) busy${after:+ | waits for: $after (must be merged)} | order: id-lexical (--after for strict order)"
+      fnote "queue: $ahead ahead in new/ | slots: $(active_slots)/$(fcfg FLEET_MAX_PARALLEL 3) busy${after:+ | waits for: $after (must be merged)} | order: id-lexical (--after for strict order)"
     done
   else
     ahead=$(tasks_in new | wc -l | tr -d ' ')
     id=$(enqueue_task "${args[*]}" "(inline)" "$auto")
     [ -z "$after" ] || renv_set "$id" DEPENDS_ON "$after"
     fnote "queued $id${after:+ — after: $after}"
-    fnote "queue: $ahead ahead in new/ | slots: $(active_slots)/$(fcfg FLEET_MAX_PARALLEL 2) busy${after:+ | waits for: $after (must be merged)} | order: id-lexical (--after for strict order)"
+    fnote "queue: $ahead ahead in new/ | slots: $(active_slots)/$(fcfg FLEET_MAX_PARALLEL 3) busy${after:+ | waits for: $after (must be merged)} | order: id-lexical (--after for strict order)"
   fi
   # honest dispatch hint: who (if anyone) will pick this task up, and when
   if [ "$(cat .loop/state 2>/dev/null)" = "FLEET_RUNNING" ] && supervisor_alive; then
@@ -4367,7 +4368,7 @@ cmd_fleet_add() {
 cmd_fleet_run() {
   need_project
   ensure_fleet_dirs
-  MAX_PARALLEL=$(fcfg FLEET_MAX_PARALLEL 2)
+  MAX_PARALLEL=$(fcfg FLEET_MAX_PARALLEL 3)
   local drain=0 args=() a auto_flag=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -5936,7 +5937,7 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
       || die "invalid fleet run id in .loop/fleet/run-id — inspect possible state corruption, then restart the orchestration"
   fi
   check_fleet_contract_binding
-  MAX_PARALLEL=$(fcfg FLEET_MAX_PARALLEL 2)
+  MAX_PARALLEL=$(fcfg FLEET_MAX_PARALLEL 3)
   fixup_cap=$(fcfg FLEET_MAX_INTEGRATION_FIXUPS 1)
   stall_cap=$(fcfg FLEET_STALL_TICKS 30)     # 0 disables the stall watchdog
   case "$stall_cap" in ''|*[!0-9]*) stall_cap=30 ;; esac
