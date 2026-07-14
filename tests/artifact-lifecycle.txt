@@ -1,0 +1,86 @@
+# artifact-lifecycle.txt — every .loop/ path bin/loop.sh touches must be
+# classified here, or the meta-lint test in run_tests.sh fails.
+#
+# Format: <path-prefix> <scope>   (first matching prefix wins; longest/specific
+# entries go before general ones). Scopes and their reset boundaries:
+#   run        — reset at every fresh run (cmd_run pre-routing block + FRESH list)
+#   contract   — archived + reset when a NEW task is defined (reset_contract_scoped_docs);
+#                fleet queue/plan entries are bound to the contract via
+#                .loop/decompose-approved (check_fleet_contract_binding)
+#   persistent — never reset (audit trail, approval records, user-owned inputs,
+#                deployed harness pieces)
+#   liveness   — pid/heartbeat/lock signals; owned by the running process,
+#                removed by finish()/on_interrupt or reaped by liveness probes
+#
+# Adding a new artifact? Decide which boundary must clear it BEFORE adding it
+# here — an artifact nobody resets is how stale-state bugs are born (a prior
+# run's decision.html once opened in the middle of an unrelated task).
+
+# --- run-scoped ---
+.loop/agent-state run
+.loop/stagnation-count run
+.loop/fail-fingerprints run
+.loop/ac-seen run
+.loop/futile-count run
+.loop/met-count run
+.loop/stop-nudge.md run
+.loop/split-nudge.md run
+.loop/context-nudge.md run
+.loop/review-feedback.md run
+.loop/review-diff.patch run
+.loop/last-cost run
+.loop/last-turns run
+.loop/cost-total run
+.loop/last-verify.log run
+.loop/verify-flake.log run
+.loop/baseline-verify.log run
+.loop/req-verdicts run
+.loop/supervisor-guidance.md run
+.loop/reports/decision.html run
+.loop/reports/evidence.html run
+.loop/run-checkpoint run
+.loop/docs/evidence-report.md run
+.loop/docs/certification.json run
+.loop/state run
+.loop/loop.sh.new run
+.loop/.parallel-context.md.tmp run
+
+# --- contract-scoped ---
+.loop/docs/run-archive/ persistent
+.loop/docs/product-contract.md contract
+.loop/docs/acceptance-checklist.md contract
+.loop/docs contract
+.loop/observations-manifest.jsonl contract
+.loop/observations contract
+.loop/task-id contract
+.loop/docs-contract contract
+.loop/reports contract
+.loop/contract-review-feedback.md contract
+.loop/last-instruction.md contract
+.loop/decompose-approved contract
+.loop/decompose-feedback.md contract
+.loop/decompose-parse.err contract
+.loop/decompose-review-feedback.md contract
+.loop/master-contract.md contract
+.loop/parallel-context.md contract
+.loop/phase-context contract
+.loop/supervise/ contract
+.loop/fleet/supervisor-session contract
+.loop/fleet/supervisor.lock.d liveness
+.loop/fleet-worker persistent
+.loop/fleet contract
+
+# --- persistent ---
+.loop/journal.jsonl persistent
+.loop/approved persistent
+.loop/approved-harness persistent
+.loop/kit-source persistent
+.loop/instruction.md persistent
+.loop/bin persistent
+.loop/logs persistent
+.loop/templates persistent
+.loop/.gitignore persistent
+
+# --- liveness ---
+.loop/run.pid liveness
+.loop/run.heartbeat liveness

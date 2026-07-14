@@ -1,0 +1,15 @@
+# Force LF on all shell/text assets, independent of the checkout platform.
+#
+# Why this matters: with Git's Windows default core.autocrlf=true, a clone would
+# rewrite these files to CRLF on checkout. That breaks loop-kit two ways:
+#   1. a CRLF shebang ("#!/usr/bin/env bash\r") is a "bad interpreter" — loop.sh
+#      and evaluate.sh won't start under Git Bash.
+#   2. loop.config.sh is *sourced*, so every value would gain a trailing \r
+#      (PERMISSION_MODE="acceptEdits"\r), corrupting the harness's own parsing.
+# Pinning eol=lf keeps the Git Bash path (which the README endorses) working.
+
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf

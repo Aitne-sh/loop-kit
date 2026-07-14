@@ -1,0 +1,16 @@
+[project]
+name = "mathkit"
+version = "0.1.0"
+description = "Tiny stats helpers (loop-kit demo project)"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["uv_build>=0.8"]
+build-backend = "uv_build"

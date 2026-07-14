@@ -1,0 +1,1263 @@
+# loop-kit — run Claude Code as a loop, not a one-off chat
+
+**loop-kit** turns Claude Code from a single conversation into a *system that keeps
+working until the job is provably done.* You describe a task once, approve it once,
+and a small shell script drives Claude Code around a work cycle — implement, verify,
+review, improve — over and over until a stop condition is met.
+
+The whole toolkit is a **shell script plus a set of prompts**. There is no server,
+no daemon, and no Python. The script (`loop.sh`) decides *when* to run the agent and
+*when to stop*; the prompts (`.claude/skills/*`) decide *what the agent thinks about*;
+and a separate script (`evaluate.sh`) decides — without ever asking the model — whether
+the work actually passed.
+
+### The one idea to take away
+
+> Don't hand the agent a detailed design and make it obey. Instead, **lock down three
+> things — the requirements ("the contract"), the acceptance criteria, and an external
+> checker that re-runs your tests — and let the agent figure out the implementation as
+> it goes.** You never review every diff. You review **evidence, spec-drift reports,
+> and the occasional decision request.**
+
+Two rules make that trustworthy:
+
+1. **The agent never grades its own work.** Success is decided by a deterministic
+   script that re-runs your verification commands, plus an *independent* reviewer
+   running in a separate, read-only session. An agent saying "done" proves nothing.
+2. **There is no path where an error, a timeout, or a spent budget becomes SUCCESS.**
+   The only way to succeed is for every check to genuinely pass.
+
+---
+
+## Table of contents
+
+- [How it works at a glance](#how-it-works-at-a-glance)
+- [What you need](#what-you-need)
+- [Quickstart](#quickstart)
+- [The everyday workflow](#the-everyday-workflow)
+- [What happens each iteration](#what-happens-each-iteration)
+- [The contract — what you lock down](#the-contract--what-you-lock-down)
+- [Running tasks in parallel (the fleet)](#running-tasks-in-parallel-the-fleet)
+- [Resuming after a crash, stop, or escalation](#resuming-after-a-crash-stop-or-escalation)
+- [Configuration reference](#configuration-reference)
+- [HTML views (reports, questions, mockups)](#html-views-reports-questions-mockups)
+- [Safety and tamper defenses](#safety-and-tamper-defenses)
+- [State model and exit codes](#state-model-and-exit-codes)
+- [Artifact lifecycle — what survives which boundary](#artifact-lifecycle--what-survives-which-boundary)
+- [Security model — what the harness does and does not provide](#security-model--what-the-harness-does-and-does-not-provide)
+- [Tests](#tests)
+- [Managing a deployment (update / uninstall)](#managing-a-deployment-update--uninstall)
+- [Command reference](#command-reference)
+- [How the theory maps to the implementation](#how-the-theory-maps-to-the-implementation)
+
+---
+
+## How it works at a glance
+
+You state a requirement once and approve it once. From there the harness runs one
+spine, whether the work turns out to be one task or many:
+
+```
+your instruction
+      │
+      ▼
+ ┌──────────────┐   an interview that asks only what it can't figure out itself,
+ │  1. CONTRACT │   then writes the fixed requirements + stop conditions
+ └──────┬───────┘
+        ▼
+ ┌──────────────┐   you say yes; the harness records a hash of exactly what you
+ │  2. APPROVE  │   approved, so nothing can quietly change the goalposts later
+ └──────┬───────┘
+        ▼
+ ┌──────────────┐   the harness splits the contract into tasks: one task runs the
+ │ 3. DECOMPOSE │   classic loop in place; several run in parallel worktrees
+ └──────┬───────┘
+        ▼
+ ┌──────────────┐   implement → verify → review → improve, in a fresh context each
+ │  4. LOOP     │   time, until every requirement is met (or it stops for you)
+ └──────┬───────┘
+        ▼
+ ┌──────────────┐   you read an evidence report, not a diff. Parallel runs are also
+ │ 5. EVIDENCE  │   re-reviewed as a merged whole against the original contract
+ └──────────────┘
+```
+
+The three files that matter, and who is allowed to touch them:
+
+| File | What it is | Who edits it |
+|---|---|---|
+| `.loop/docs/product-contract.md` | The requirements you locked in | **You** (agent may not) |
+| `loop.config.sh` | The machine-checkable stop conditions (test commands, budgets, path rules) | **You** (hash-protected) |
+| `.loop/docs/evidence-report.md` | What the loop did, for you to review instead of the diff | The agent, at the end |
+
+Everything else — the plan, the progress notes, the running code — the agent is free
+to rewrite as it learns.
+
+---
+
+## What you need
+
+The harness itself needs only a normal Unix shell. **No Python, no `jq`.** Concretely:
+
+- `bash` (3.2+ — the harness avoids bash-4-only features, so macOS's system bash
+  works), plus `awk`, `sed`, `grep`, `git`, `date` — all standard, preinstalled on
+  macOS and Linux. (JSON parsing and the audit logs are done in `awk`, so nothing
+  extra is required.)
+- A **SHA-256 tool** — either `shasum` *or* `sha256sum`, whichever your system has.
+  Every approval and tamper check hashes through it, so if neither exists the harness
+  refuses to start with a clear error rather than run without its safety checks.
+- The **`claude`** CLI (Claude Code) for real runs. The test suite stubs it out, so
+  the tests cost zero tokens.
+
+### Platform support
+
+| Platform | Status |
+| --- | --- |
+| **macOS**, **Linux** | Fully supported — single runs *and* the parallel fleet. |
+| **Windows (WSL)** | Fully supported, and the **recommended** way to run loop-kit on Windows: WSL is Linux, so it behaves exactly like the Linux row. |
+| **Windows (native Git Bash / MSYS2)** | Best-effort for **single runs** (`start` / `run` / `auto`). The **parallel fleet is not supported here — use WSL or Linux** for it: the fleet relies on POSIX process-group isolation, an atomic-hardlink work queue, and `ps`-based liveness that MSYS doesn't provide. |
+
+The harness uses fractional `sleep` (e.g. `sleep 0.2`), so a busybox-only environment
+isn't supported. Your *own* project can use any language or toolchain — you tell the
+harness how to verify it via `VERIFY_COMMANDS`. The bundled demos happen to use Python
+with `uv`/`pytest`.
+
+---
+
+## Quickstart
+
+### 1. Deploy the kit into a project
+
+```bash
+# Run from anywhere; point it at the project you want to build.
+~/Projects/loop/bin/loop.sh init /path/to/your-project
+```
+
+loop-kit keeps its own files out of the way — only a few visible files land at your
+project root; everything else lives in hidden directories:
+
+```
+your-project/
+├── loop.sh              ← the entry point. Single and parallel runs both start here.
+├── loop.config.sh       ← stop conditions (hash-protected once approved)
+├── loop.models.sh       ← which model runs each step (edit any time, no re-approval)
+├── fleet.config.sh      ← parallel-execution settings (edit any time)
+├── loop-instruction.md  ← (optional) where you write your instructions
+├── .claude/skills/      ← the loop's prompts (hidden; standard Claude Code location)
+└── .loop/               ← everything else (hidden)
+    ├── bin/evaluate.sh  ← the external checker
+    ├── docs/            ← contract, plan, progress, evidence, decisions, and the
+    │                       requirement/assumption ledgers (persistent memory, git-tracked)
+    ├── templates/       ← pristine doc templates (used when a parallel worktree starts)
+    ├── fleet/           ← the task queue and per-run metadata
+    └── logs/<task>/<run>/ journal.jsonl state run-checkpoint task-id …
+                                             (run state, not git-tracked)
+```
+
+### 2. Try a demo
+
+Two ready-made demos let you watch the loop work end to end before you point it at
+real code:
+
+```bash
+# demo1 — fix failing tests (1–3 cycles, cheap; models preset to haiku)
+~/Projects/loop/bin/loop.sh init /tmp/loop-demo1 --template demo1-bugfix
+cd /tmp/loop-demo1
+./loop.sh          # the contract is already filled in — just answer 'y' to approve
+./loop.sh report   # read the evidence
+
+# demo2 — build a small feature and its tests from a contract (uses sonnet)
+~/Projects/loop/bin/loop.sh init /tmp/loop-demo2 --template demo2-feature
+cd /tmp/loop-demo2
+./loop.sh
+```
+
+**See the contract lock for yourself:** after a demo finishes, add one line to
+`.loop/docs/product-contract.md` and run `./loop.sh run` again. It refuses — the
+approval hash no longer matches. Only `./loop.sh approve` lets it continue. That is
+the mechanism that stops an agent (or an accident) from moving the goalposts mid-run.
+
+### 3. Point it at your own project
+
+```bash
+cd your-project
+vi loop-instruction.md    # write what you want built
+
+./loop.sh                 # guided: an interview, then you approve, then it runs
+#   — or —
+./loop.sh auto            # hands-off: no questions, auto-approved, runs to completion
+```
+
+---
+
+## The everyday workflow
+
+There are two ways to start a run. They share the same spine; they differ only in how
+much they pause for you.
+
+### Guided — `./loop.sh` (needs an interactive terminal)
+
+```
+1. Read instruction   Finds loop-instruction.md and opens an interactive session.
+2. Explore & ask      The agent studies your codebase — it finds your test commands,
+                      conventions, and risky areas on its own — and asks you only the
+                      questions it genuinely can't answer itself.
+3. Define the loop    Your answers are folded into the full loop definition:
+                      the contract (goal / requirements / non-goals / acceptance
+                      criteria) plus loop.config.sh (test commands, budgets, path rules).
+4. You approve        When the session ends, the shell asks: [y = approve and start /
+                      r = another revision round / n = quit].
+5. It runs            The harness splits the work into tasks and runs the loop.
+6. You review         ./loop.sh report — evidence, spec drift, decisions, and cost.
+```
+
+The "interview" is smarter than a questionnaire. It is an **unknowns pass**: the agent
+first surveys the repo (conventions, risky areas, what earlier runs learned), sorts
+what's still unknown into categories — open questions, "I'll know it when I see it"
+taste calls, and "will this even work" feasibility — probes the risky feasibility ones
+with throwaway spikes, and only *then* asks you anything. It asks one question at a
+time, biggest-impact question first. Everything it learns is written to
+`.loop/docs/unknowns.md`, and the contract's **`## Human Approval Required If`** section
+is filled in from that analysis. That section is the run's escalation bar: below it the
+loop decides on its own (recording each choice); above it, it stops and asks you.
+
+### Hands-off — `./loop.sh auto`
+
+Use this when there's no terminal to answer prompts (a script, CI, another agent) or
+when you simply don't want the run to pause.
+
+- If no contract exists yet, one is **generated for you, headlessly.** Anything that
+  would have been a question is instead recorded under `## Assumptions (auto mode)` in
+  the contract, so you can audit every judgment call later.
+- **A second opinion checks the contract before it runs.** In auto mode the model is
+  writing the very goalposts the checker will enforce — so no contract is approved
+  unattended without an independent, read-only review session confirming it: does it
+  cover the whole ask, and is `VERIFY_COMMANDS` a real, discriminating test (not
+  `true` or `echo ok`)? If the review asks for changes, the contract is regenerated
+  **once** against that feedback; if it still fails, the run stops and asks you rather
+  than running against a weak contract. (Turn this off with `LOOP_CONTRACT_REVIEW=0`;
+  run it by hand any time with `./loop.sh contract-review`.)
+- The contract is then **auto-approved** (recorded in the audit log) and the loop starts.
+- It only stops where a human is genuinely required — the escalations below.
+
+> **Ask-first (opt-in):** `LOOP_ASK_CRITICAL=1 ./loop.sh auto` lets the generator raise
+> *critical* unknowns — ones where no safe default exists because every option risks
+> something irreversible or scope-defining — instead of assuming through them. Those
+> park the run for your answer instead of guessing.
+
+`start`, too, is a direct way in: `./loop.sh start "<your instruction>"` (or a file
+path) runs the guided interview on that instruction without you editing
+`loop-instruction.md` first.
+
+If a run is already in flight, `start` (and `auto "<instruction>"`) never resets it:
+the instruction is routed to the task queue instead — exactly `./loop.sh add`. A
+running supervisor picks it up on its next tick; beside a single-loop run, dispatch the
+queue after that run finishes with `./loop.sh fleet run` (a bare `./loop.sh run`
+dispatches it only when the contract decomposes into parallel tasks). Defining a
+genuinely new task requires the current run to stop first.
+
+---
+
+## What happens each iteration
+
+This is the heart of the system. Every pass through the loop is a **fresh `claude`
+call** — the agent remembers nothing from the last iteration except what's written in
+the `.loop/docs/*` files and git history. That "fresh context every time, memory on
+disk" design is deliberate: it keeps each iteration focused and prevents context from
+rotting over a long run.
+
+```
+1. IMPLEMENT   The agent reads the contract, the plan, the progress notes, the three
+               ledgers (below), and any reviewer feedback; implements ONE milestone;
+               self-checks it; and declares a state in .loop/agent-state.
+
+2. EVALUATE    evaluate.sh runs — no model involved. It re-checks the contract hash,
+               applies the path rules, RE-RUNS your VERIFY_COMMANDS itself, and refuses
+               a "ready" claim unless the requirements ledger shows every requirement
+               met AND the acceptance checklist shows every expected behavior verified.
+               It prints exactly one line: a state and a reason.
+
+3. REVIEW      A fresh, read-only reviewer session judges the work. It reads the
+               requirements FIRST and the diff LAST, so the code can't frame its
+               judgment. It checks for regressions (did this break something that
+               already worked?), drift (does this serve a requirement, or wander?),
+               and honest bookkeeping.
+
+4. STOP-EVAL   A lightweight model gives a quick, advisory read: keep going, looks
+               done, or looks futile. It cannot declare success on its own.
+
+5. COMMIT      The iteration is snapshotted ("loop: iter N — <state>") and logged.
+```
+
+A few things make this rigorous rather than hopeful:
+
+**The checker re-runs your tests; it never trusts the agent.** `evaluate.sh` has no
+model in it. It runs your `VERIFY_COMMANDS` itself and reads the exit codes. Nothing is
+more trustworthy than actually running the tests.
+
+**The reviewer runs in two modes.** During the run it does *interim* reviews of just the
+latest change — "is this step correct?" — and incompleteness is expected, not a defect.
+At the end it runs a *gate* review of the whole run against every requirement, and must
+produce one verdict line per requirement:
+`REQ-001: MET | PARTIAL | UNMET | REGRESSED — evidence`. The harness parses those lines,
+and an "APPROVE" that's missing a line, or has any non-`MET` line, is automatically
+downgraded to "needs revision." A single overall thumbs-up can hide an unmet requirement;
+a per-requirement table can't. If the task diff is empty, the gate does not skip review:
+it switches to `scope=state` and independently checks the current implementation, ledgers,
+verify log, and observation manifest. The absence of a diff is never completion evidence.
+
+**It periodically zooms out.** Reviewing one diff at a time is structurally blind to slow
+decay across iterations — duplicated logic, dead code, two approaches fighting each other.
+So every few iterations (`HOLISTIC_EVERY_N`), or whenever one change is large
+(`HOLISTIC_TRIGGER_LINES`), the same review widens to look at the whole run so far.
+
+**The agent can't stall the loop forever.** If the stop evaluator says "looks done"
+several times in a row (`MET_FORCE_N`) with all tests green, the harness *forces* the
+success gate to run — but the gate review, the evidence, and a final re-check still make
+the real call. The stop evaluator only forces the question; it never answers it. Every
+`MET` must first pass a model-free preflight: the latest verify log is green, every ledger
+REQ is `met`, every checklist row is verified, and all cited runtime observations are
+current. A failed preflight resets the streak, journals `FORCED_GATE_REFUSED`, and keeps
+looping in every review mode.
+
+**"It compiles" is never "it works".** At definition time the contract session
+decomposes every requirement into the fine-grained behaviors the user actually expects —
+including the *implicit* ones nobody states ("after the GPU migration the particles are
+still visible and still animate"; "a Mario-like game has stomp-kills, pit death, and a
+game-over") — and assigns each a **verification method**: `cmd` (a deterministic command
+proves it), `run` (only running the artifact and observing proves it — probe script or
+browser observation with a screenshot saved under `.loop/observations/`), or `human`.
+These live as rows in the **acceptance checklist** (below); `evaluate.sh` refuses success
+while any row is unverified, the reviewer opens the cited observation artifacts, and the
+contract reviewer rejects any gate a plausibly-broken implementation could pass unseen.
+
+**A fleet worker can't quietly outgrow its budget either.** Once `SPLIT_NUDGE_AT`% of
+`MAX_ITERATIONS` is spent with requirements still unmet, the harness injects a *split
+nudge*: either justify continuing, or bring the tree to a clean committed boundary and
+declare `NEEDS_DECOMPOSITION` so the supervisor can split the remainder into phased tasks
+(see the fleet section). The nudge is advisory — the declaration is the only stop path.
+
+### The three ledgers the agent keeps
+
+Alongside the free-form plan and progress notes, three structured files give the loop a
+reliable memory and give you an honest paper trail.
+
+- **`requirements-ledger.md`** tracks *outcomes*: one row per requirement, with a status
+  (`unstarted / in-progress / met / at-risk / regressed`) and the evidence for it. The
+  harness seeds it automatically from your contract's `REQ-` headings, the agent updates
+  it every iteration, and the reviewer verifies it. A requirement can only be marked
+  `met` with concrete evidence — a file, a test, an observable behavior — and
+  `evaluate.sh` refuses to let a run succeed while any row is not `met`.
+
+- **`acceptance-checklist.md`** tracks *expectations*: one row per fine-grained behavior
+  the user expects (`AC-001 | REQ-001 | expectation | method | status | evidence`),
+  written by the contract session before approval — implicit must-be expectations
+  included — and each assigned a verification method (`cmd` / `run` / `human`). A `run`
+  row can only become `verified` by actually running the artifact and saving what was
+  observed (screenshot, probe log) under `.loop/observations/`; reading the code never
+  counts. The deterministic evaluator stamps each cited artifact in
+  `.loop/observations-manifest.jsonl` with its content hash, AC hash, and product-tree hash.
+  A code or AC change makes unchanged evidence stale until it is recaptured; a fresh retry
+  within the same task preserves evidence whose hashes still match. Mid-run, newly noticed
+  but unverified behaviors are *appended* as new rows, so
+  "I saw it but didn't check it" can't evaporate. `evaluate.sh` refuses success while any
+  row is not `verified`; the gate reviewer audits the rows (and opens the artifacts)
+  against the frozen contract. You may edit this file by hand — the loop may not weaken
+  it (obligations anchor to the `AC-` ids named in the approved contract, so deleting
+  rows can't shrink them). If a run stops for a `human` row (BLOCKED, with a decision
+  request naming exactly what to look at), you close it yourself: look, edit that row's
+  status to `verified` (a short note in Evidence is your sign-off), then `./loop.sh
+  resume`. If you have changes to request instead, there are **two distinct channels,
+  and picking the wrong one is the classic dead-end**:
+    - *Within the contract* (tune a reversible knob — how much motion, how fast a swirl):
+      `./loop.sh refine '<what to change>'` opens an interactive session to adjust and
+      preview live, then offers to sign off and re-certify; or `./loop.sh resume --note
+      '<what to adjust>'` hands your findings to one headless iteration.
+    - *Change the contract* (remove or alter a REQUIRED behavior — a verified `AC-` row
+      or a `REQ`): revise it with `/loop-contract`, then `./loop.sh approve`. This will
+      **not** go through `resume --note` (the loop rejects it as drift), and re-running
+      `approve` on an *unchanged* contract just re-locks it and stops at the same gate —
+      so the harness warns you when you approve a byte-identical contract at a decision
+      stop. Every stop — BLOCKED, STALLED, BUDGET_EXCEEDED, or a decision — prints a
+      **NEXT ACTION** box spelling out the exact next command, and every error ends with
+      a `→ next:` recovery line, so no flow ever leaves you wondering what to run next.
+
+- **`assumptions.md`** is the controlled middle ground between "stop everything" and
+  "bury it in a note." When the agent hits a gap that *doesn't* require changing the
+  contract — an under-specified detail, a small design choice — it records the gap, picks
+  the most conservative option (smallest, most reversible, closest to existing behavior),
+  and keeps going. Every open assumption is judged at the gate (sound / must-fix /
+  ask-the-human) and shown to you in the evidence report. A recorded assumption is never
+  silently lost; an *un*recorded one would be.
+
+Discoveries that *do* require changing the contract still stop the run and ask you.
+
+---
+
+## The contract — what you lock down
+
+The contract is the one thing you're really responsible for getting right. The trick is
+**granularity**: pin the *what*, leave the *how* free.
+
+```
+✗ too vague:      "make a nice agent-creation feature"
+✗ too rigid:      "build AgentCreateForm.tsx with Zustand and fields x, y, z"
+✓ just right:     "Users can create, edit, delete, and list agents. An agent has a
+                   name, a prompt, and skills. An invalid MCP config can't be saved.
+                   Running agents is out of scope. Existing lint/typecheck/test/build
+                   stay green."
+```
+
+A contract has a small, fixed set of sections (there's a template at
+`.loop/docs/product-contract.md`): **Goal**, **Requirements** (numbered `REQ-001`,
+`REQ-002`, …), **Non-goals**, **Constraints**, a **Quality baseline** (bars that must
+stay true, like "no new lint warnings"), **Acceptance Criteria**, **Validation Commands**
+(the human-readable mirror of `VERIFY_COMMANDS`), and **Human Approval Required If** (the
+escalation bar).
+
+The definition session also digs *below* the stated requirements before anything is
+locked. It inventories what already works in the blast radius (a migration must not lose
+behavior users can see), expands the taken-for-granted expectations of a 0→1 build
+("Mario-like" implies stomp-kills, pit death, game-over), and runs a premortem — "every
+gate is green and the user is still disappointed: why?" Each resulting expectation
+becomes a row of `.loop/docs/acceptance-checklist.md` with a verification method
+(`cmd` / `run` / `human`). If a behavior is observable only at runtime, the gate must
+include a runtime observation, proven to work headlessly (a contract-time spike) before
+it becomes binding — a lesson learned the hard way from gates that were all green while
+the page rendered nothing.
+
+> **`REQ-` ids are also the unit of parallelism.** When the harness splits a contract into
+> parallel tasks, each requirement is normally owned by exactly one task. The one exception
+> is a REQ *shared across phases of one piece of work* with a single **completing owner** — a
+> strictly sequential chain, or a fork-join whose join owns the REQ and depends on every
+> branch (see [Phased workflows](#phased-workflows--how-long-running-work-is-split)). Outside
+> that case a REQ cannot be shared or split, so give independently-deliverable pieces of work
+> their own `REQ` ids.
+
+<details>
+<summary>Example: the demo1 bug-fix contract</summary>
+
+```markdown
+# Product Contract — demo1: fix the failing tests
+
+## Goal
+All tests in `tests/` pass. The tests are correct as written; the bugs are in
+`src/mathkit/`. Fix the implementation, not the tests.
+
+## Requirements
+### REQ-001: mean
+`mean(xs)` returns the arithmetic mean of a non-empty sequence and raises
+`ValueError` on empty input.
+### REQ-002: median … ### REQ-003: clamp …
+
+## Non-goals
+- New features, API changes, performance work / any change to the tests /
+  refactoring beyond what the fixes require
+
+## Constraints
+- `tests/**` must not be modified (a denied path)
+- No new dependencies (`pyproject.toml` is an escalate path)
+
+## Acceptance Criteria
+- `uv run pytest -q` exits 0 with all tests passing
+
+## Human Approval Required If
+- Any test appears wrong and would need changing / a dependency must be added
+```
+
+The matching `loop.config.sh` sets `VERIFY_COMMANDS=("uv run pytest -q")`, lists the
+tests under `DENIED_PATHS`, and puts `pyproject.toml` under `ESCALATE_PATHS`. Notice the
+contract fixes only *what* ("the tests pass") and never *how* to fix it — that is the
+whole idea in one file.
+</details>
+
+---
+
+## Running tasks in parallel (the fleet)
+
+You never decide "single or parallel" yourself. After you approve the contract, the
+harness runs a **decomposition step** that splits it into tasks and picks the shape:
+
+- **One task** → the classic loop runs in place (no overhead).
+- **Several tasks** → they run as a **fleet**: one supervisor, each task in its own git
+  worktree and branch, running the same loop engine, with results merged back one at a
+  time and the merged whole reviewed against the original contract.
+
+The plan is written to `.loop/docs/task-plan.md` (git-tracked, so you can audit it) and a
+deterministic validator checks it before anything runs: unique task ids, dependencies that
+resolve and don't form a cycle, and every requirement covered — owned by exactly one task,
+or shared by tasks with a single *completing owner*: a strictly sequential dependency
+chain, or a fork-join whose final task depends on every other owner (a *phased
+workflow*, below). You can preview it without running (`./loop.sh decompose`) or opt out
+of decomposition entirely (`FLEET_DECOMPOSE=0`).
+
+### Phased workflows — how long-running work is split
+
+A task too large for one worker (as a guide: more than ~6–8 focused iterations, or a diff
+no reviewer can hold in one gate review) is not emitted as one giant task. The decomposer
+splits it into **phases**: separate tasks connected by `DEPENDS`, allowed to
+share the same requirement id — the validator accepts a shared REQ *only* when it has a
+single **completing owner**, the one task that depends (directly or transitively) on every
+other owner and certifies the REQ in full. Two shapes qualify: a totally-ordered
+sequential chain, and a **fork-join** — parallel branches whose join task also owns the
+REQ and depends on all of them (join-less parallel sharing is rejected deterministically).
+Phases mix freely with parallel tasks in one plan, e.g.:
+
+```
+phase 1: task1 ∥ task2 ∥ task3-a     (independent -> parallel)
+phase 2:                 task3-b     (DEPENDS: task3-a)
+phase 3:        task3-c ∥ task3-d    (both DEPEND on task3-b, disjoint branch scopes)
+phase 4:                 task3-e     (DEPENDS: task3-c,task3-d — the completing owner)
+```
+
+Here `task3-c`, `task3-d` and `task3-e` may all share one REQ: the join `task3-e`
+integrates both branches, *reconciles* any conflicting decision or assumption they made
+in isolation (each branch runs blind to the other), and certifies the REQ (with distinct
+REQs per branch the same shape works without any sharing).
+
+There is no global phase barrier — each task starts the moment *its* dependencies have
+merged, so a slow `task1` never holds up `task3-b`. Each phase is an ordinary fleet task:
+own worktree branched from the merged predecessor, own sub-contract, own gate review, own
+serial merge — which is the point: review and merge granularity stay bounded no matter how
+big the overall change is, and every session works with a small context.
+
+What connects the phases:
+
+- **Phase context.** A later phase's worktree receives each merged predecessor's archived
+  sub-contract, evidence report, and assumptions ledger — direct *and* transitive ancestors —
+  under `.loop/phase-context/<id>/`: the *why* behind
+  the code it inherits (decisions, known gaps, recorded assumptions). A fork's join reads its
+  branches' assumption ledgers to *reconcile* any conflicting decision they made in isolation.
+  Advisory only: a
+  predecessor's "met" claims are phase-scoped, and the master integration gate remains the
+  sole authority on master requirements.
+- **Phase-boundary plan review** (`FLEET_PLAN_REVIEW`). When a task with queued dependents
+  merges — or (`FLEET_PLAN_REVIEW_ON_DRIFT`) any merged phase that recorded drift while
+  queued work remains, so an independent phase's drift can re-plan the remainder too — a
+  read-only supervisor call re-judges the *queued* remainder of the plan against
+  the merged reality: **KEEP** (default), **REVISE** (replace still-unclaimed tasks —
+  REQ-conserving, deterministically validated, capped by `FLEET_MAX_PLAN_REVISIONS`; a
+  REVISE naming a forked REQ replaces all of its queued owners as a unit), or
+  **ESCALATE** (a human must re-decide; all queued phases stay held until you decide and run
+  `./loop.sh fleet ack-plan <merged-id>` — rerunning without the ack stops at the same
+  decision request, never a silent release). Claimed or merged work is never touched.
+- **Mid-run splitting.** A worker that discovers its remaining work exceeds its iteration
+  budget declares `NEEDS_DECOMPOSITION` at a clean commit boundary (a deterministic
+  *split nudge* prompts it to consider this once `SPLIT_NUDGE_AT`% of the budget is spent
+  with requirements still unmet). The supervisor then REPLANs it into phases — a chain,
+  or a fork-join when the remainder genuinely parallelizes — and
+  with `FLEET_SPLIT_CARRYOVER=1` the block's unique first phase is *seeded* with the
+  escalated task's committed work (merged in at bootstrap; a conflict — or a fork with
+  two roots — skips the carryover, journaled, and the work stays on the archived branch —
+  never lost, never merged ungated).
+
+### Why this is safe to run in parallel
+
+Coordinating parallel agents is where naive setups corrupt each other's work. loop-kit
+leans on two independent layers so they can't:
+
+1. **Structural isolation.** Each task runs in its *own* git worktree, so one agent's
+   changes literally do not exist in another's working tree. It is structurally impossible
+   for one agent to overwrite or revert another's work.
+2. **Explicit awareness.** On every tick the supervisor rewrites a
+   `.loop/parallel-context.md` file inside each worktree listing the sibling tasks (running
+   / waiting / merged / stopped) and a reminder to stay in its own lane. The loop's prompts
+   read that file early — before doing task work — and obey its scope rules, so even a
+   merged or stopped sibling's work won't get silently reimplemented or rolled back.
+
+Merges follow the **Refinery pattern**: finished branches land in `main` one at a time with
+`git merge --no-ff`, and only when the parent tree is clean. Because every run also edits
+`.loop/docs/**`, the parent's copy always wins there and the run's own contract + evidence
+are archived under `.loop/docs/run-archive/<id>/`. A real conflict in *your* code aborts
+the merge and hands it to you — the branch is kept, nothing is lost.
+
+### Driving the queue by hand
+
+The queue is also usable directly. There is always **exactly one supervisor per
+repository** (enforced with a lock — a second `fleet run` just tells you to use `add`),
+because running two dispatchers against one repo is a well-known way to corrupt a queue.
+
+```bash
+cd your-project
+./loop.sh fleet run task-a.md task-b.md   # queue two tasks and start the supervisor
+                                          # (foreground; Ctrl-C stops every loop safely)
+
+# From another terminal, while it runs:
+./loop.sh add task-c.md                   # add a task any time (picked up next tick)
+./loop.sh add "fix the typo in the README"   # a plain instruction works too, not just a file
+./loop.sh add task-d.md --after task-a    # run only after task-a has merged
+```
+
+`add` works in every phase: **before the first run** the task is parked in the queue
+and dispatched alongside the decomposed plan when `./loop.sh run` starts (decomposition
+is not suppressed; with `--single`, `FLEET_DECOMPOSE=0`, or a plan that decomposes to a
+single in-place task, parked tasks stay queued for a later `./loop.sh fleet run`).
+**During a single-loop run** the task is queued but not picked up mid-run — dispatch it
+after the run finishes: `./loop.sh fleet run`.
+
+```bash
+./loop.sh fleet approve <id>              # review + approve a task's contract
+./loop.sh fleet status --overlap          # every task's state, plus files touched by 2+ branches
+./loop.sh fleet report <id>               # evidence and cost for one task
+./loop.sh fleet clean --done              # remove worktrees/branches for merged runs
+```
+
+A task's state is simply which queue directory it sits in, and every transition is an
+atomic rename (the classic maildir trick — no locking needed):
+
+```
+add → queue/new/ → claimed/ (worktree → contract → await approval → running → merged)
+                              → done/ (merged)  |  failed/ (blocked / escalated / conflict)
+```
+
+<details>
+<summary>Fleet details: approvals, escalations, dependencies, and the guards that keep it from hanging</summary>
+
+- **The approval gate still applies in parallel.** Each task's contract is generated and
+  then waits in `PENDING_APPROVAL`; only what you approve with `./loop.sh fleet approve
+  <id>` runs. `--auto` (or `LOOP_AUTO=1`) approves automatically — but even then each
+  contract must first pass the independent contract review, and a rejection demotes that
+  task back to `PENDING_APPROVAL` with feedback instead of running an unvetted contract.
+
+- **Dependencies serialize.** A task added `--after <id>` (or given `DEPENDS_ON` by the
+  decomposer) is only claimed once its dependency has *merged*, so its worktree contains
+  that code. Adding `--after` a task that has already failed is refused (it would just
+  park) unless you force it with `--force-after`.
+
+- **Mid-run escalations go to the supervisor first.** When an orchestrated task hits a
+  decision, a read-only supervisor call decides: **ANSWER** (the harness writes
+  guidance into the worktree and the task relaunches), **REPLAN** (swap the task for
+  better-scoped replacements — possibly a phased chain or fork-join — keeping the old
+  one for autopsy), or **ESCALATE** (park it for you). This is capped per task
+  (`FLEET_MAX_SUPERVISE_PER_TASK`). Tamper-class stops (`RISK_REQUIRES_APPROVAL`) are
+  *never* supervised — always a human.
+
+- **The supervisor keeps one conversation, files stay the truth.** Supervisor calls
+  (task decisions and phase-boundary plan reviews) resume one conversational session
+  (`FLEET_SUPERVISOR_SESSION`) so repeat calls don't re-read everything from scratch.
+  The session is a cache, never authority: it is dropped and restarted on any call
+  failure, unparseable verdict, orchestration restart, the `FLEET_SUPERVISOR_SESSION_MAX`
+  cap — and after every applied plan mutation, so a stale conversational view of the
+  plan can never outlive the files. Every payload it produces still passes the same
+  deterministic validators either way.
+
+- **The integration gate is the real finish line.** Individual task success isn't enough:
+  the *merged whole* is reviewed against the original (master) contract — a gate review, a
+  master evidence report, and `evaluate.sh` over the full combined diff. A "needs revision"
+  here buys a bounded number of supervisor fix-up rounds
+  (`FLEET_MAX_INTEGRATION_FIXUPS`), then SUCCESS or BLOCKED. (The gate always reviews, even
+  if `REVIEW_MODE=off` — that setting only governs the per-iteration loop.)
+
+- **The autonomy boundary is yours, enforced by the machine.** *Within* the approved
+  master contract the supervisor decides on its own and logs everything. Anything that
+  would *change* the master contract always stops for you.
+
+- **Nothing hangs silently.** A stall watchdog (`FLEET_STALL_TICKS`) stops a run that
+  makes no progress; a task stuck waiting on approval surfaces as a decision request; and
+  a `--drain` that can only make progress by merging into a dirty parent tree exits after
+  ~30s telling you to commit or stash, rather than spinning.
+
+- **A task added mid-run is picked up in that run** — even during the integration gate,
+  which re-scans the queue. But a mid-run `add` runs as a *manual* task outside the master
+  contract (it warns you), and if it fails, the planned work still completes and merges;
+  the failure surfaces at the end as a decision request rather than aborting everything.
+
+The full manual surface is `./loop.sh fleet <run | add | approve | status | report | logs
+| stop | resume | merge | clean | unlock>`; run `./loop.sh fleet help` for the details.
+</details>
+
+<details>
+<summary>Operational notes for parallel runs</summary>
+
+- Worktrees are created *outside* the repo, in `../<project-name>-loops/<task-id>/`, so
+  the parent's test runner and `grep` don't pick up N copies of everything (override with
+  `LOOP_WORKTREE_ROOT`). **`git clean -dfx` in the parent won't remove them** — always use
+  `./loop.sh fleet clean`, which calls `git worktree remove` correctly.
+- Worktrees isolate files, **not** ports, databases, or global caches. Each run gets a
+  `LOOP_FLEET_INDEX` (1, 2, 3, …) you can use to offset those in your verify commands.
+- **All parallel runs share your subscription's rate limit**, so keep `FLEET_MAX_PARALLEL`
+  modest. If the rate window runs out, several runs may go BLOCKED together; once it resets,
+  `./loop.sh fleet resume <id>` continues each from its checkpoint rather than restarting.
+- The first line of each task's instructions is copied into every sibling's
+  `.loop/parallel-context.md`. If you paste task text from an untrusted source, be aware
+  that's a channel for information to flow between worktrees.
+
+</details>
+
+<details>
+<summary>Design rationale (primary-source research)</summary>
+
+- What a supervisor needs to be — a race-safe queue plus serialized merge integration:
+  [Gas Town](https://steve-yegge.medium.com/welcome-to-gas-town-4f25ee16dd04) (the Refinery
+  pattern lands changes one at a time) / [MultiDevin](https://cognition.com/blog/devin-can-now-manage-devins)
+  (1 manager + N workers) / [Claude Code agent teams](https://code.claude.com/docs/en/agent-teams).
+- Parallelizing *independent* tasks doesn't need an LLM decomposer:
+  [Anthropic's multi-agent research system](https://www.anthropic.com/engineering/built-multi-agent-research-system)
+  ("coding parallelizes far less cleanly than research does") /
+  [Cognition: Don't Build Multi-Agents](https://cognition.com/blog/dont-build-multi-agents).
+- One long-lived dispatcher + an appendable queue is the pattern everyone converges on:
+  [GNU parallel jobqueue](https://www.gnu.org/software/parallel/parallel_examples.html) /
+  [claude-task-master](https://github.com/eyaltoledano/claude-task-master) /
+  [beads](https://github.com/steveyegge/beads). Multiple concurrent dispatchers have real
+  reported split-brain failures.
+- File-based queues via atomic rename ("no locking required at all"):
+  [D. J. Bernstein: maildir](https://cr.yp.to/proto/maildir.html).
+- Worktree isolation is Claude Code's own recommendation for parallel sessions:
+  [worktrees](https://code.claude.com/docs/en/worktrees); `git worktree add` and merges
+  still need to be serialized through one place
+  ([reported lock contention](https://github.com/anthropics/claude-code/issues/55724)).
+
+</details>
+
+---
+
+## Resuming after a crash, stop, or escalation
+
+Every run keeps a durable checkpoint (`.loop/run-checkpoint`, rewritten at the top of each
+iteration) recording the iteration number, the streak counters, the running cost, and the
+run review baseline. A separate, off-tree `task-start-ref` records the fixed commit at which
+the task first began — not the start of each run — and survives `--fresh`, so retries still
+review the whole task and cannot relabel already-committed task work as `NO_OP`.
+So a run that dies partway **continues where it left off** instead of restarting from
+iteration 1 and re-spending your whole budget.
+
+| Situation | State | How to resume |
+|---|---|---|
+| Crash / Ctrl-C / machine died | `RUNNING` / `INTERRUPTED` | Just `./loop.sh run` — it **auto-resumes** (counters, cost, and any uncommitted work restored). `./loop.sh run --fresh` forces a clean restart. |
+| Terminal failure | `BLOCKED` / `STALLED` | Fix the cause, then `./loop.sh resume` (iteration and cost intact; the stop-heuristic streaks — stagnation, futility, repeat-fail fingerprints, review rejections — get a **fresh window** so one repeat can't instantly re-block a legitimately fixed run). Pass what changed with `./loop.sh resume --note '<guidance>'` — the note reaches the next iteration as the human decision and is journaled as `RUN_NUDGE`. A bare `run` starts fresh. |
+| Ran out of iterations | `BUDGET_EXCEEDED` | Raise `MAX_ITERATIONS`, `./loop.sh approve`, then `./loop.sh resume`. A budget-only re-approval is recognized and continues under the bigger cap. |
+| Rate / usage limit (transient) | `BLOCKED` (api-stall guidance) | Nothing is wrong with your loop — **wait for the limit to reset, then `./loop.sh run`** (checkpoint and counters intact). The stop shows this wait-and-retry guidance instead of the sign-off box; if it keeps failing, check `.loop/logs/failed/` and your Claude auth. |
+| An escalation (`NEEDS_*` / `RISK_*`) | needs your answer | **Never auto-resumes.** Make the call (edit the contract if needed), then `./loop.sh approve` re-binds the checkpoint to the new approval, and the next `./loop.sh run` resumes with counters and cost intact. |
+| A plan-review escalation (phase boundary) | `NEEDS_SPEC_DECISION`, queued phases held | Decide the `DR-FLEET-PLAN-*` question (edit/clean the queue if needed), acknowledge with `./loop.sh fleet ack-plan <merged-id>`, then `./loop.sh run`. A rerun **without** the ack stops at the same request — restarts never release the held phases silently. |
+
+Runs and fleet tasks are also resumable by id:
+
+```bash
+./loop.sh resume --list        # every session, its phase, and whether/how it resumes
+./loop.sh resume <task-id>     # flip a stopped task runnable AND dispatch it
+./loop.sh fleet clean --orphans   # garbage-collect worktrees/branches that lost their queue entry
+```
+
+`resume <id>` exits with the relaunched task's real outcome (`0` done, `3` needs a human,
+`4` failed again, `5` out of budget), so scripts can branch on it.
+
+<details>
+<summary>Why resuming can't be used to fake success</summary>
+
+The checkpoint lives under `.loop/`, which the agent can write, so it deliberately carries
+**no success authority**: it's parsed as data (never executed). Resume metadata such as
+`RUN_ID` and counters may be read, but ids are labels for log/certificate correlation only;
+they cannot supply a contract, preflight, review, or evidence verdict. The path to SUCCESS
+stays gated by in-memory/off-tree approval data and fresh harness validation. A forged run
+review baseline is validated as an ancestor of HEAD or replaced with a conservative fallback;
+the fixed task baseline comes from the off-tree task record. A `MAX_RESUMES` backstop
+(default 10) stops an endless crash-loop.
+</details>
+
+Every way a run stops is journaled: Ctrl-C/SIGTERM writes a `RUN_INTERRUPTED` row from the
+trap itself, and a death that never reached the trap (SIGKILL, crash, power loss) is
+reported as `RUN_ABEND` by the next resume — a silent death is visible in
+`.loop/journal.jsonl` either way, and every `RUN_RESUME` row names the state it resumed
+from. Failed agent calls keep their evidence: the exact error (exit code, API error
+message, stderr, watchdog-kill marker) rides the `AGENT_ERROR`/`REVIEW_ERROR` journal rows,
+and the failing call's raw JSON/stderr sidecars are preserved under `.loop/logs/failed/`
+(newest 20) where the next run's identically-named logs can't overwrite them.
+Successful calls are namespaced under `.loop/logs/<task-id>/<run-id>/`; the evidence agent
+is given exactly that directory and must neither inspect nor cite sibling task/run logs.
+This is a prompt/citation policy backed by harness namespace and integrity checks, not an OS
+filesystem sandbox: a process running as the same UID with full Bash may still be physically
+able to read sibling logs or off-tree files. Use a separate UID/container boundary when that
+physical isolation is required.
+
+---
+
+## Configuration reference
+
+### `loop.config.sh` — the stop conditions (hash-protected)
+
+This file is part of the contract: it's hashed at approval time, and any change stops the
+loop until you re-approve. The key settings:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `VERIFY_COMMANDS` | (you set) | The success gate. Every command must exit 0. This is what the checker re-runs; keep it honest and fast. |
+| `VERIFY_RETRIES` | 0 | Rerun ALL verify commands up to N more times when they fail, absorbing environmental flakes (sqlite I/O, fd exhaustion). A red-then-green rerun is journaled as `VERIFY_FLAKE` with the failing log preserved (`.loop/verify-flake.log`) — never silently hidden. 0 = every red is trusted as-is. |
+| `DENIED_PATHS` | `.env* secrets/** …` | Touching these stops the run for approval (`RISK_REQUIRES_APPROVAL`). |
+| `ESCALATE_PATHS` | (empty) | Touching these asks for a decision (`NEEDS_ARCHITECTURE_DECISION`) — e.g. dependency or schema files. |
+| `MAX_ITERATIONS` | 10 | Hard cap on loop iterations per run. |
+| `MAX_ITER_SECONDS` | 900 | Default wall-clock watchdog on each individual agent call. |
+| `TIMEOUT_<ROLE>` | (empty → inherits `MAX_ITER_SECONDS`) | Per-role watchdog override (seconds), e.g. `TIMEOUT_IMPLEMENT=1800` so a heavy implement iteration outlasts the clerical `STOP_EVAL`/`EVIDENCE` calls. Roles: `IMPLEMENT REVIEW PLAN CONTRACT EVIDENCE STOP_EVAL DECOMPOSE SUPERVISE`. Lives here (not `loop.models.sh`) because the watchdog is a safety budget — raising it is gated by re-approval. A blank/non-numeric value silently inherits the global. |
+| `MAX_RUN_SECONDS` | (empty) | Optional wall-clock cap on the whole run. A later resume gets a fresh window. |
+| `MAX_COST_USD` | (empty = no cap) | A hard USD cap. Left off by default — see below. |
+| `STAGNATION_N` | 2 | Consecutive no-diff iterations → STALLED. |
+| `REPEAT_FAIL_N` | 3 | Identical verify failure this many times → BLOCKED. Also derives the oscillation window: ≤2 distinct failure fingerprints across `2×N` consecutive failing iterations → BLOCKED (catches the fix-A-breaks-B ping-pong the identical rule misses). |
+| `FUTILE_N` | 2 | Consecutive "futile" stop-eval verdicts → STALLED. |
+| `MET_FORCE_N` | 2 | Consecutive "looks done" verdicts (with tests green) force the success gate. 0 disables. |
+| `REVIEW_MODE` | `always` | `always` / `candidate` (gate only) / `off`. |
+| `SPLIT_NUDGE_AT` | 70 | Fleet workers: past this % of `MAX_ITERATIONS` with requirements unmet, nudge the agent to declare `NEEDS_DECOMPOSITION` at a clean boundary. 0 disables. |
+| `HOLISTIC_EVERY_N` | 3 | Every Nth interim review widens to the whole run (erosion audit). |
+| `HOLISTIC_TRIGGER_LINES` | 400 | Also widen when one iteration changes at least this many lines. |
+| `MAX_REVISIONS` | 3 | Consecutive reviewer rejections → BLOCKED. Interim and gate rejections are counted *separately*, so interim churn never eats the gate's budget. |
+| `GATE_RETRY_N` | 0 (kit ships 2) | When the *gate reviewer call itself* fails twice (an outage, not a verdict), retry up to N times with backoff before the fail-closed BLOCKED. Journaled as `GATE_RETRY`; certification still requires an explicit APPROVE. 0 = block immediately. |
+| `GATE_RETRY_WAITS` | `"60 300"` | Seconds to wait before gate retry 1, 2, … (the last entry repeats). The run heartbeat stays fresh throughout the wait. |
+| `LOOP_OBS_MAX_FILE_KB` | 2048 | Maximum size of one runtime observation the evaluator may stamp into the manifest. Oversize evidence remains unverified. |
+| `LOOP_OBS_MAX_TOTAL_MB` | 50 | Maximum combined size of `.loop/observations/` eligible for certification. |
+| `PERMISSION_MODE` | `acceptEdits` | How Claude Code handles tool permissions (see below). |
+
+### `loop.models.sh` — which model runs each step (edit freely, no re-approval)
+
+Each step of the loop can use a different model. This file is parsed as plain `key=value`
+pairs — never executed — so changing it never needs a re-approval.
+
+| Role | Used for | Default |
+|---|---|---|
+| `MODEL_CONTRACT` | The contract-definition session | **opus** |
+| `MODEL_PLAN` | The implementation plan (iteration 0) | **opus** |
+| `MODEL_IMPLEMENT` | Implementation and revisions, every iteration | **opus** |
+| `MODEL_REVIEW` | The gate/decompose/contract reviews (certification) | **opus** |
+| `MODEL_REVIEW_INTERIM` | Interim (per-iteration) reviews only; empty = inherit `MODEL_REVIEW` | sonnet |
+| `MODEL_EVIDENCE` | Generating the evidence report | sonnet |
+| `MODEL_STOP_EVAL` | The advisory stop check, every iteration | **haiku** (lightweight) |
+| `MODEL_DECOMPOSE` | Supervisor: contract → task plan | **opus** |
+| `MODEL_SUPERVISE` | Supervisor: mid-run decisions on tasks | **opus** |
+
+The same file also sets the reasoning effort passed to every `claude` call
+(`low | medium | high | xhigh | max`): `LOOP_EFFORT` (default `xhigh`) is the global value,
+and `EFFORT_<ROLE>` (e.g. `EFFORT_STOP_EVAL`, `EFFORT_IMPLEMENT`) overrides it per role —
+the kit ships `EFFORT_STOP_EVAL="low"` and `EFFORT_EVIDENCE="medium"` so the clerical roles
+stop paying maximum-thinking prices. An empty or unrecognized override falls back to
+`LOOP_EFFORT` (a typo can never break a running loop). Models that support effort levels
+(Opus 4.8 and similar) honor it; others ignore it.
+
+`TURNS_NUDGE_AT` (kit ships 70, ≈ p90 of healthy production iterations) is the
+runaway-context signal: when one implement call consumes at least that many agent turns,
+the next iteration gets an advisory `.loop/context-nudge.md` telling it to re-plan into a
+smaller committed step instead of resuming mid-flight — long-tail iterations are where
+cache-read cost explodes. Journaled as `CONTEXT_NUDGE`; empty = off. If it fires on more
+than ~1 in 4 iterations, raise the threshold for that project.
+
+> **Implement and gate review default to the same model.** The maker–checker separation here
+> is *procedural* (a fresh context, a read-only process) — not statistical. A blind spot one
+> model shares can pass both roles. The shipped `MODEL_REVIEW_INTERIM="sonnet"` already adds
+> cross-tier diversity on the highest-frequency review path; for the gate too, point
+> `MODEL_REVIEW` at a different family or tier. The deterministic `VERIFY_COMMANDS` gate is
+> unaffected either way, and **the primary stop decision is never a model's** — it's the
+> checker re-running your commands.
+
+### `fleet.config.sh` — parallel-execution settings (edit freely)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `FLEET_MAX_PARALLEL` | 2 | Concurrent task slots. All runs share your rate limit — keep it modest. |
+| `WORKTREE_SETUP_CMD` | (empty) | Runs once in each new worktree (e.g. `npm ci`). It's arbitrary code, so the supervisor confirms it at start. |
+| `FLEET_DECOMPOSE` | 1 | 0 = always run the classic single loop, never decompose. |
+| `FLEET_MAX_TASKS` | 12 | Upper bound on tasks one decomposition may emit. Phased chains consume slots too. |
+| `FLEET_MAX_SUPERVISE_PER_TASK` | 2 | Supervisor interventions per escalated task before it goes to a human. |
+| `FLEET_MAX_REPLAN_TASKS` | 6 | Replacement tasks the supervisor may add per run (cumulative). An N-phase split spends N; a seeded fork-join needs a prep root (4). Raise for long phased workflows. |
+| `FLEET_MAX_INTEGRATION_FIXUPS` | 1 | Fix-up rounds after a failed integration gate. |
+| `FLEET_SUPERVISE` | 1 | 0 sends escalated tasks straight to a human. |
+| `FLEET_SPLIT_CARRYOVER` | 1 | Seed a `NEEDS_DECOMPOSITION` split's first phase with the escalated task's committed work (0 = replacements start clean). |
+| `FLEET_PLAN_REVIEW` | 1 | Phase-boundary plan review: re-judge queued tasks after a phase with dependents merges (0 disables). |
+| `FLEET_PLAN_REVIEW_ON_DRIFT` | 1 | Also fire the plan review after *any* merged phase that recorded drift (`Drift detected: yes`) while queued tasks remain — so an independent phase's drift can re-plan the remainder, not only a dependency merge (0 = dependency-triggered only). |
+| `FLEET_MAX_PLAN_REVISIONS` | 4 | Plan revisions the phase-boundary review may apply per run, cumulative across all boundaries — a 6-phase chain crosses 5. Raise for long phased workflows. |
+| `FLEET_SUPERVISOR_SESSION` | 1 | Resume one conversational session across supervisor calls (rotated on failure/mutation; 0 = every call fresh). |
+| `FLEET_SUPERVISOR_SESSION_MAX` | 20 | Supervisor calls per session before a forced rotation. |
+| `FLEET_STALL_TICKS` | 30 | No-progress watchdog (0 disables). |
+| `FLEET_DRAIN_GRACE_TICKS` | 3 | How long `--drain` idles before exiting, so late `add`s are still caught. |
+| `FLEET_DRAIN_HUMAN_TICKS` | 150 | Standalone-drain watchdog when everything waits on human approval (0 disables). |
+
+### Cost and budgets (built for subscription usage)
+
+On a Pro/Max subscription there's no per-token charge and the reported USD figure is
+notional, so the **default runaway guards are iterations and time, not dollars** —
+`MAX_ITERATIONS`, `MAX_ITER_SECONDS`, and optional `MAX_RUN_SECONDS`. `MAX_COST_USD` is
+**unset by default**; set it only if you're on API billing and want a hard cost ceiling
+(it then enforces an in-memory running total and adds `--max-budget-usd` to every call).
+The contract session never suggests or sets a USD cap unless you bring up cost yourself.
+Cost is always tracked and logged regardless — `./loop.sh status` shows the last run **and**
+the lifetime total across all runs (derived from the append-only journal), and
+`./loop.sh report --text` breaks the last run down by role (implement / interim vs gate
+review / plan / evidence / stop-eval) plus the largest implement call by agent turns, so a
+runaway iteration is visible instead of buried in one total. Every journal row also carries
+the call's `turns` count, and each iteration prints its cost and turns live.
+
+<details>
+<summary>Permission mode &amp; the tool allow/deny lists</summary>
+
+The worker runs in `acceptEdits` mode with a **broad allow-list** (`ALLOWED_TOOLS` — all common
+built-in tools plus web access by default) and an **opt-in deny-list** (`DISALLOWED_TOOLS`) that is
+the primary control you tune. Deny wins over allow; nothing is denied by default. Containment
+otherwise lives in the checker layer (evaluator, independent reviewer, approval hash,
+`DENIED_PATHS`/`ESCALATE_PATHS`), not in clipping tools.
+
+Set `DISALLOWED_TOOLS` in `loop.config.sh` to block specific tools (it re-triggers approval):
+`"WebSearch,WebFetch"` (no web), `"Bash(sudo *),Bash(git push *)"` (no privilege-escalation / no
+push). Bash rules are prefix-globs matched per sub-command across `&&`/`||`/`|`/`;`.
+
+MCP servers can't be wildcard-granted in a deny-enforcing mode — list a server explicitly in
+`ALLOWED_TOOLS` (e.g. `mcp__github`) to use it in the loop. Two caveats: `claude-in-chrome` needs an
+interactive browser session and won't attach to a headless loop regardless; and
+`PERMISSION_MODE="bypassPermissions"` grants literally everything (including all MCP) but then
+**ignores `DISALLOWED_TOOLS`** — it skips the whole permission system.
+</details>
+
+---
+
+## HTML views (reports, questions, mockups)
+
+Loop-engineering theory is thorough about verifiers and stop conditions but nearly silent
+on **how an agent should present results, evidence, and decisions to a human** — which is
+exactly where loop-kit puts you. So at the three moments a human is actually looking, the
+harness can show a self-contained HTML page in your browser:
+
+- **Result reports** — the evidence agent can write `.loop/reports/evidence.html` alongside
+  the Markdown; a successful interactive run opens it, and `./loop.sh report` reopens it any
+  time (`--text` forces plain text).
+- **Contract questions and directions** — during the interactive contract session the agent
+  can build a page to explain a complex mechanism before you confirm it, or to show 2–3
+  directions to choose between (UI mockups, or competing flow/architecture sketches).
+- **Escalations** — a decision that's visual or architectural can be shown as
+  `.loop/reports/decision.html`.
+
+Whether a page gets authored is decided **by a rubric, not by a mode.** The model authors a
+page only when at least one pre-declared rubric item applies — a genuine choice between
+alternatives, an inherently visual subject, a structure that needs a diagram, an
+architectural decision, or a genuinely complex run's evidence. A single color tweak never
+qualifies; when in doubt, it's skipped. (`LOOP_HTML=1` forces pages on, `LOOP_HTML=0` off.)
+
+<details>
+<summary>Design and safety boundaries</summary>
+
+- **The model authors the HTML; the shell only opens it.** There's no Markdown→HTML
+  converter — Claude writes the page directly, in a session that's already open, so the
+  common path costs no extra model call.
+- **Markdown stays canonical; HTML is only a view.** The `.loop/docs/*.md` files (plus git
+  history) are the tracked record; the HTML is a disposable view. If they ever disagree, the
+  Markdown wins.
+- **Written in your language.** The model detects the language of your instruction and writes
+  the human-facing prose (contract, plan, evidence, decisions) in that language. The
+  machine-parsed control lines (state tokens, config keys, `REQ-` ids) always stay ASCII, so
+  localization never breaks the harness.
+- **Answers always come back in the terminal.** There's no local server and no form round-trip.
+- **Never unattended.** Automatic opens fire only in an interactive terminal with auto mode
+  off — fleet and `auto` runs never pop a browser.
+- Every page follows a fixed content contract (kept byte-identical across the authoring
+  skills): an explanation zone (what this is, why you're seeing it, what you're asked) and a
+  data zone (the evidence/options/definition), with a provenance footer pinning the exact
+  commit and contract it's evidence for. It may show nothing that isn't already in the
+  canonical Markdown, and it may not silently drop a section.
+- **Reads like a report, not like a spec.** The contract's item names ("why now", section
+  names) are instructions to the model, never on-page labels — the page is natural prose and
+  headings in your language, internal jargon glossed on first use, and every page starts from
+  one canonical inline style block so all pages of all runs share a single visual identity.
+  `.loop/reports/` holds only user-facing pages and their assets — never scratch tooling.
+- **Advisory lint.** After a page is authored the harness runs a small deterministic check
+  (markdown residue in rendered text, missing `<html lang>`, missing/duplicate `<h1>`,
+  placeholder text) and journals any findings as `HTML_LINT_WARN`. Like the authorship check,
+  it never fails the run — a scruffy page is a presentation defect, not a contract breach.
+- `./loop.sh open <file>` opens any page under the same rules; `LOOP_BROWSER_CMD` overrides
+  the opener.
+
+</details>
+
+---
+
+## Safety and tamper defenses
+
+The harness assumes the agent's own output is untrusted, and that repository content can try
+to steer a session. So the pieces that decide success are protected from the pieces that do
+the work. The short version:
+
+- **You approve a hash, not a promise.** `approve` records SHA-256 hashes of the contract +
+  config, the harness itself (`loop.sh` / `evaluate.sh` / the skills), and the session/model
+  config. When a run starts, those hashes are loaded **into the running script's own memory**
+  and re-checked every iteration. An agent can't forge its way past them by editing a file on
+  disk, and the contract hash is checked *before* `loop.config.sh` is ever sourced — so a
+  tampered config's code can never run.
+- **Approvals are anchored outside the repo.** Because everything under the repo is
+  agent-writable, `approve` also records the hashes in a store outside the repository
+  (`~/.loop-kit/approvals/…`, relocatable via `LOOP_APPROVAL_HOME`). A run refuses to start
+  unless that off-tree store matches — repo-local files alone are no longer trusted.
+- **The checkers are structurally read-only.** The reviewer, the stop evaluator, the contract
+  review, and the supervisor all run with `--tools Read,Glob,Grep` — no editor, no Bash. The
+  supervisor never writes anything itself: its decisions travel back as text and the *harness*
+  performs every write, logging each one.
+- **Nothing gets into SUCCESS unreviewed.** The evidence report is generated *after* the
+  reviewer approves, and the harness's success gate then confirms there's zero code change
+  (outside `.loop`) since the HEAD the reviewer actually looked at. Any later change is BLOCKED.
+- **Certification is harness-generated.** On `SUCCESS`/`NO_OP`,
+  `.loop/docs/certification.json` binds the task/run ids, contract and harness hashes,
+  task/run baselines, reviewed HEAD, review verdict/scope, verify log, requirement verdicts,
+  and observation manifest. A single-task certificate records `preflight: "PASS"` only
+  after its deterministic preflight; the Fleet parent/integration certificate records
+  `preflight: "NOT_APPLICABLE"` because that parent has no per-task checklist and instead
+  relies on its integration review and final verify gate. The model-authored evidence report
+  is a non-authoritative human-readable view. Certification authority comes from the
+  harness's deterministic validation of those inputs and the hashes that bind the manifest,
+  each cited observation's bytes, its AC anchor, and the product tree.
+
+<details>
+<summary>The full tamper-defense table</summary>
+
+| Target | Defense |
+|---|---|
+| Contract + config | Approval hash held **in `loop.sh`'s memory**, passed to the evaluator each iteration (`--approved-hash`); forging `.loop/approved` has no effect. The hash check runs *before* the config is sourced, so tampered config code never executes. |
+| Approval provenance | Also recorded in an **off-tree store** (`~/.loop-kit/approvals/<repo-id>/<slot-id>/`, where the ids are hashes of the repo's and the worktree's git paths — so fleet worktrees group under one repo but keep distinct slots); a run refuses to start (exit 2) unless the store matches. `LOOP_APPROVAL_HOME` relocates it; the literal value `repo` opts back into repo-local-only records for containers with no `$HOME`. Honest residual: this moves the trust boundary out of the repo, not out of your account — a `VERIFY_COMMANDS` entry still runs with your privileges. |
+| The harness (loop.sh / evaluate.sh / skills) | A start-of-run hash kept in memory is re-checked every iteration, right after implementation (before the evaluator runs), and after evidence. A change → `RISK_REQUIRES_APPROVAL`; a tampered evaluator can never actually run. Skill edits are also caught by the diff policy on `.claude/**`. |
+| Session config (`.claude/settings*.json` / `.mcp.json`) | Folded into the harness hash and checked in memory each iteration, so an agent can't inject a permission allowlist or MCP server that would take effect in a *future* session. |
+| Model config (`loop.models.sh`, `fleet.config.sh`) | Parsed as safe `key=value`, never sourced. Gitignored, so the diff policy alone wouldn't see edits — its hash is taken into memory at run start, and any change during a run → `RISK_REQUIRES_APPROVAL`. Editing between runs is free. |
+| Observation manifest + certificate inputs | The evaluator-owned manifest is pinned in memory and may change only through a trusted preflight/canonicalization step. Before evidence generation, the contract, ledgers, reviewer verdicts, manifest, and cited observation bytes are snapshotted; any evidence-agent mutation is BLOCKED. Report citations are then resolved back through checklist + manifest + bytes. |
+| Budget | The running cost total lives in memory, so a file edit can't bypass it. With `MAX_COST_USD` set, each call also gets `--max-budget-usd`. |
+| Master contract in worktrees | Each task gets a read-only copy whose expected sha256 the parent pins outside that task worktree; a mismatch is restored and journaled `MASTER_TAMPER`. This prevents a local-copy edit from passing the harness check, but the pin is not OS-inaccessible to a same-UID process with full Bash. |
+| Decompose containment | The decomposition step may write only its plan file; any project-file change after it → `RISK_REQUIRES_APPROVAL`. |
+| Post-review changes | The harness confirms at the success gate that there is zero non-`.loop` diff from the reviewed HEAD; any diff → BLOCKED. No change that skipped review can reach SUCCESS. |
+| Resume checkpoint | Agent-writable, so it carries no success authority: parsed as data; resume ids/counters may be read but ids are labels only. A forged run review base is validated as an ancestor of HEAD or replaced conservatively; the task-wide base is the fixed off-tree task record. |
+
+</details>
+
+---
+
+## State model and exit codes
+
+Every run ends in exactly one named state, with a matching exit code so scripts can branch:
+
+| State | Meaning | Exit |
+|---|---|---|
+| `SUCCESS` | Acceptance criteria verified and review-approved | 0 |
+| `NO_OP` | Verified — no change was needed | 0 |
+| `NEEDS_SPEC_DECISION` | The contract needs to change (your call) | 3 |
+| `NEEDS_ARCHITECTURE_DECISION` | A judgment call (new dependency, schema change, …) | 3 |
+| `NEEDS_DECOMPOSITION` | The remaining work exceeds one worker's iteration budget and should be split into phases (in a fleet the supervisor usually handles it; single loops stop for you) | 3 |
+| `RISK_REQUIRES_APPROVAL` | Touched a denied path or the harness itself | 3 |
+| `BLOCKED` | Can't make progress (same error repeating, review rejected repeatedly) | 4 |
+| `STALLED` | No progress (no diff for N iterations / repeated "futile" verdicts) | 4 |
+| `BUDGET_EXCEEDED` | Hit the iteration cap, or (only if set) the USD budget | 5 |
+| (usage error) | Something's misconfigured or unapproved | 2 |
+
+**The only path to SUCCESS**, stated in full: every `VERIFY_COMMAND` passes when the
+evaluator re-runs it, **and** (at a single-task gate) the deterministic preflight accepts
+every ledger/checklist obligation and observation stamp, **and** the success gate ran,
+**and** (when review is enabled) the independent reviewer explicitly said APPROVE with a
+clean per-requirement table — using a state review if the task diff is empty — **and** an
+evidence report was generated, **and** there is no unreviewed code change after that report,
+**and** the harness wrote `certification.json`. No error, timeout, stale observation, skipped
+review, or spent budget can produce SUCCESS. (`REVIEW_MODE="off"` remains the explicit
+user-approved single-loop exception; its deterministic preflight still applies. The Fleet
+parent has no per-task checklist, so its integration gate uses the merged-tree final verify
+plus mandatory integration review.) The certificate records preflight `PASS` for a
+single-task gate and `NOT_APPLICABLE` for that Fleet parent/integration gate.
+
+During a parallel run the parent's state is `FLEET_RUNNING` while the fleet dispatches, then
+ends in one of the states above. Individual tasks also carry a per-task result — `NEEDS_HUMAN`
+(the supervisor escalated to you), `REPLANNED` (superseded by a replacement — not a failure),
+or `DEP_FAILED` (a dependency failed; fix it, then resume the task).
+
+---
+
+## Artifact lifecycle — what survives which boundary
+
+Every `.loop/` artifact has a declared scope, and each scope has exactly one boundary
+that resets it. This is enforced: the test suite fails if `loop.sh` touches a `.loop/`
+path that is not classified in `tests/artifact-lifecycle.txt`. The rule exists because
+an artifact nobody resets is how stale-state bugs are born — a prior run's decision
+brief once opened in the browser mid-way through an unrelated task, and a prior
+contract's `met` ledger rows can alias a new contract's REQ ids.
+
+| Scope | Reset at | Examples |
+|---|---|---|
+| **run-scoped** | every fresh run (a resume keeps them — same logical run) | `agent-state`, counters, review feedback, `supervisor-guidance.md`, `stop-nudge.md` / `split-nudge.md`, `last-verify.log` / `baseline-verify.log`, `decision.html` / `evidence.html`; a filled `evidence-report.md` and its `certification.json` are retired to `run-archive/<ts>-prevrun/` before the new run |
+| **contract-scoped** | a **new task definition** (`./loop.sh start`, or the first definition in `auto`) — archived to `.loop/docs/run-archive/<ts>-root/` **and** committed, then reset from templates | working docs and reports, `.loop/task-id`, `.loop/observations/` + its manifest, the decompose plan/feedback, `phase-context/`, the fleet queue, and the supervisor session record |
+| **persistent** | never | namespaced `.loop/logs/<task>/<run>/`, `journal.jsonl`, `docs/run-archive/`, approval records, git history |
+| **liveness** | owned by the running process; removed on exit or reaped by the liveness probes | `run.pid`, `run.heartbeat`, the fleet supervisor lock |
+
+When observations are archived, manifest paths written live as
+`.loop/observations/<file>` are rebased to `observations/<file>`. Archive consumers resolve
+that path relative to the containing `.loop/docs/run-archive/<id>/` directory; they never
+fall back to the live `.loop/observations/` tree or another task's archive.
+
+**Amendment vs. new task.** A hash can't tell "I answered a decision by editing the
+contract" (memory must carry forward) from "this is a different task" (memory must
+reset) — only you know the intent, so the **entry point** is the signal:
+
+- `./loop.sh start "<instruction>"` — **new task**: the previous task's loop memory is
+  archived and reset before the definition session begins.
+- Hand-edit `product-contract.md` + `./loop.sh approve` — **amendment**: memory carries
+  forward. This is exactly the flow the decision-stop message tells you to use.
+  Approving interactively after a contract change asks you which of the two you meant;
+  headless approve keeps memory and says so loudly; `auto` mode refuses a contract that
+  was replaced outside both a definition session and a pending decision (exit 3),
+  because unattended code must not guess.
+- `r` (revise) at the approval prompt — **same task**: memory kept.
+
+The fleet has the same boundary: queued *planned* tasks are bound to the contract they
+were decomposed from (`.loop/decompose-approved`). If the contract changes while an
+orchestration is interrupted, `run` / `fleet run` refuse to resume the stale queue
+instead of merging and gating old work against the new contract.
+
+---
+
+## Security model — what the harness does and does not provide
+
+**Provided by the harness:**
+
+- **Deterministic gates outside the model** — the evaluator re-runs `VERIFY_COMMANDS` itself
+  and never trusts the agent's self-report; the diff policy (denied/escalate paths); and
+  hash-locked contract, harness, skills, and session config with in-memory baselines that a
+  forged on-disk file can't defeat, anchored in an off-tree approval store.
+- **Structurally read-only checkers** — reviewer / stop-eval / contract-review sessions get
+  `Read,Glob,Grep` only: no editor, no Bash.
+- **Opt-in tool deny-list** — the worker gets a broad tool allow-list; block specific tools
+  (web access, `Bash(...)` commands, MCP servers) via `DISALLOWED_TOOLS` in `loop.config.sh`.
+  Deny wins over allow (enforced under the default `acceptEdits` mode).
+
+**Not provided — bring your own environment.** Following Simon Willison's writing on prompt
+injection and the recent agent-security literature, these belong at the OS/container boundary,
+not in a shell harness:
+
+- **Process/filesystem/network sandboxing.** The loop runs with your user's privileges. For
+  untrusted repos or instructions, run the whole loop inside a container or VM with only the
+  project mounted. In particular, same-UID sessions with full Bash can physically read
+  off-tree approval files and sibling task/run logs; their normal isolation is a harness
+  integrity check plus prompt/citation policy, not an OS access-control boundary.
+- **Scoped credentials.** Nothing stops a command in `VERIFY_COMMANDS` (or a hook in the
+  project's own build) from reading `~/.aws` and friends. Give the loop least-privilege,
+  short-lived tokens.
+- **Prompt-injection immunity.** Repository content is untrusted input to every session. The
+  diff policy, deterministic gates, and read-only reviewers *contain* what an injected
+  instruction can achieve (it can't change the goalposts, the harness, or certify its own
+  success), but they don't prevent the injection itself.
+
+**Honest gap list:** the zero-token test suite covers the harness's control flow and tamper
+defenses, not model behavior. Not yet covered: regression evals over real agent traces,
+adversarial fuzzing (a fake agent that actively tries to defeat the gates), and a
+prompt-injection regression corpus for the skills.
+
+---
+
+## Tests
+
+```bash
+tests/run_tests.sh
+```
+
+The suite runs a **fake agent** in place of `claude` (`LOOP_CLAUDE_CMD` swaps it in) to
+drive every terminal state end to end — 900+ assertions in a few minutes, at zero token
+cost. It covers review and stop-eval, the pre-approval contract review, verdict parsing,
+counter separation, forced and fail-closed gates, model routing, the tamper defenses, the
+off-tree approval store, the full resume matrix (auto-resume, resume-by-id, budget-raise
+continuation, the decision rebind, the `MAX_RESUMES` backstop), and the whole fleet:
+queue atomicity, dynamic add + drain grace, the approval gate, isolation, serialized
+merges, conflict aborts, the singleton lock, crash/interrupt recovery, decomposition and
+its validator, master-contract injection and tamper restore, dependency gating,
+supervision (answer / replan / escalate), the integration gate, the stall/approval
+watchdogs, and the `MAX_RUN_SECONDS` cap.
+
+Tests shorten the harness's real-time sleeps via `LOOP_WATCHDOG_POLL` / `LOOP_FLEET_TICK`,
+and every wait on the supervisor is bounded — a hang shows up as a FAIL, not a silent block.
+
+---
+
+## Managing a deployment (update / uninstall)
+
+**`update`** refreshes only the deployed harness files (`loop.sh`, `evaluate.sh`, the
+`loop-*` skills) to the latest kit. Your contract, `loop.config.sh`, `loop.models.sh`, and
+anything under `.loop/docs/*` are **never overwritten.**
+
+```bash
+cd your-project
+./loop.sh update             # kit location resolved from .loop/kit-source
+./loop.sh update --approve   # update and re-approve in one step
+
+# or from the kit repo, pointing at a project:
+~/Projects/loop/bin/loop.sh update /path/to/your-project [--approve]
+```
+
+Updating the harness changes its hash, so it invalidates the old approval on purpose —
+re-approve with `--approve` or `./loop.sh approve`. If there's nothing to update, it says
+so and does nothing (so it never invalidates your approval for no reason). New config keys
+in the kit are surfaced with a diff, keeping your existing values; removed skills are cleaned
+up (your own skills are left alone).
+
+**`uninstall`** removes loop-kit from a project entirely — every file `init` deployed plus all
+run state — returning the project to how it looked before:
+
+```bash
+./loop.sh uninstall            # lists what will be removed, asks to confirm [y/N]
+./loop.sh uninstall --force    # skip the prompt (required without a terminal)
+```
+
+It keeps your own files, your `loop-instruction.md`, any skills you wrote, and the git
+history (commits the loop made stay in history). It refuses to run while a supervisor or task
+loop is active, warns you before discarding unmerged fleet branches, and refuses to run
+against the kit repository itself.
+
+---
+
+## Command reference
+
+| Command | What it does |
+|---|---|
+| `bin/loop.sh init <dir> [--template t]` | Deploy the kit into a project (records its source in `.loop/kit-source`). |
+| `./loop.sh` | Guided run: interview → approve → loop. |
+| `./loop.sh auto [instruction]` | Hands-off run: generate, self-review, auto-approve, loop. |
+| `./loop.sh start <instruction>` | Run the guided interview on an instruction directly. |
+| `./loop.sh approve` | Approve contract + config + harness (records the hashes). Runs a deterministic definition lint first — contract-anchored AC ids need checklist rows, rows must reference defined REQs, duplicate ids, destructive `VERIFY_COMMANDS` patterns, and a contract with no `### REQ-xxx` headings are refused (unattended: refuse; interactive: explicit override). |
+| `./loop.sh contract-review` | Independent read-only review of the loop definition itself. |
+| `./loop.sh run [--fresh] [--single]` | Run the approved contract (auto-resumes after a crash; `--fresh` restarts; `--single` skips decomposition — queued fleet tasks stay parked). |
+| `./loop.sh decompose [--force]` | Preview or regenerate the task split without running. |
+| `./loop.sh resume [<id>\|--list]` | Continue a stopped run or task. |
+| `./loop.sh refine ['<note>']` | At a human sign-off gate (BLOCKED): open an interactive session to adjust reversible within-contract knobs and preview live. End it (Ctrl-C / `/exit`), then confirm to sign off the `human` rows and re-certify. A REQUIRED-behavior change is a contract change (`/loop-contract`), not this. |
+| `./loop.sh add <task> [--after <id>]` | Queue a fleet task any time (alias for `fleet add`). |
+| `./loop.sh fleet <cmd>` | The parallel supervisor's manual surface (`fleet help`). |
+| `./loop.sh watch [--interval s] [--max-runs n]` | Re-run `run` on an interval until success or escalation. |
+| `./loop.sh status` / `report [--text]` | State and cost / evidence, drift, decisions. |
+| `./loop.sh open <file>` | Open an HTML report or mockup in the browser. |
+| `./loop.sh update [--approve]` | Update the deployed harness (contract/config/docs preserved). |
+| `./loop.sh uninstall [--force]` | Remove the deployed kit and its run state (your project stays). |
+
+### Using this alongside Claude Code's built-in primitives
+
+loop-kit covers long-running autonomous work; for shorter jobs the built-ins are lighter:
+
+- **Goal-based** — `claude "/goal <acceptance criteria>, stop after 8 turns"`.
+- **Time-based** — `/loop 15m /loop-iterate` inside a session, or the kit's own
+  `./loop.sh watch --interval 900`.
+- **Proactive** — schedule a `/schedule` cloud routine with your approved contract.
+- **An extra review pass** — after SUCCESS, layer the built-in `/code-review` on top.
+
+---
+
+## How the theory maps to the implementation
+
+loop-kit is a deliberate implementation of loop-engineering ideas from a set of primary
+sources. Each row is a claim from that literature and where the code satisfies it.
+
+| Idea | Source | Implementation |
+|---|---|---|
+| A loop is a work cycle that runs until a stop condition; four kinds (turn / goal / time / proactive) | [Anthropic: Getting started with loops](https://claude.com/blog/getting-started-with-loops) | The external shell loop covers long-running work; combined with `/goal`, `/loop`, and `/schedule`, all four kinds are covered |
+| A loop spec is a bounded, reusable artifact with five parts: trigger, goal, verification, stopping rule, memory | [arXiv 2607.00038](https://arxiv.org/abs/2607.00038) (Macedo, *Stop Hand-Holding Your Coding Agent*) | Spec = contract + config; verification = `evaluate.sh`; stopping = eight named states with exit codes; memory = `.loop/docs` + git |
+| "The verifier is the bottleneck" — deterministic checks first | same / [Firecrawl](https://www.firecrawl.dev/blog/loop-engineering) | The first gate re-runs the actual commands outside the model; AI review is second; humans see only the evidence |
+| Three hard stops against runaways: iteration cap, budget, stagnation | 2026 practitioner write-ups | `MAX_ITERATIONS` + `MAX_ITER_SECONDS` by default, optional `MAX_COST_USD`, plus stagnation / repeat-failure / futile detection |
+| Fixed requirements contract, flexible plan, evidence review, escalation | Loop-engineering design theory | Contract locked by an approval hash / plan free to evolve / evidence reports / the `NEEDS_*` states |
+| Maker–checker separation (no self-grading; a fresh-context verifier) | [Firecrawl](https://www.firecrawl.dev/blog/loop-engineering) / [Addy Osmani](https://addyosmani.com/blog/agent-harness-engineering/) | An independent read-only reviewer each iteration + the deterministic evaluator — applied to the *goalposts themselves* too (the auto-mode contract review) |
+| The Ralph loop (fresh context each time; memory in the filesystem) | [Geoffrey Huntley](https://ghuntley.com/ralph/) / [ralph-wiggum plugin](https://github.com/anthropics/claude-code/blob/main/plugins/ralph-wiggum/README.md) | A new `claude -p` call every iteration; memory in `.loop/docs` + git |
+| Orchestrator–worker: decompose with explicit boundaries and dependencies; parallelize independent, serialize dependent; verify before merge | [Anthropic: multi-agent research system](https://www.anthropic.com/engineering/built-multi-agent-research-system) / [Claude Code worktrees](https://code.claude.com/docs/en/worktrees) | `/loop-decompose` + deterministic validation (Kahn cycle check, REQ coverage) + independent decompose review; dependency gating on merged work; worktree isolation + serial merges + the integration gate |
+| Analytic rubrics beat holistic judgment: one verdict per criterion prevents halo effects | [Autorubric, arXiv 2603.00077](https://arxiv.org/abs/2603.00077) | The gate reviewer renders one machine-parsed verdict per `REQ`; the harness downgrades an APPROVE whose table is missing or non-`MET` (fail closed) |
+| Agentic entropy: iterating agents degrade code; per-diff review is blind to cross-iteration damage | [Beyond the Diff, arXiv 2604.16323](https://arxiv.org/abs/2604.16323) / [SlopCodeBench, arXiv 2603.24755](https://arxiv.org/abs/2603.24755) | Requirement-first read order + a widened `scope=run` erosion audit every `HOLISTIC_EVERY_N` iterations or on a large diff; the requirements ledger gives reviews cross-iteration memory |
+| Controlled spec evolution: mid-run discoveries become structured, reviewable records — not a full stop, not silent improvisation | [OpenSpec delta specs](https://openspec.dev/) | `assumptions.md`: non-contract-changing discoveries recorded with a conservative default; the gate adjudicates each; the evidence report shows them all |
+| TDD's red-green rule: see the check fail before making it pass — an always-green gate proves nothing about new behavior | Beck, *Test-Driven Development: By Example* | The contract interview always confirms the acceptance gate with the user (a concrete proposal is always offered) and classifies each `VERIFY_COMMAND` red→green vs stays-green; the harness snapshots the run-start verify (`.loop/baseline-verify.log`) and the evidence report shows baseline→final per command |
+| A safe way to skip permission prompts (classifier-supervised auto mode) | [Anthropic: Auto mode](https://claude.com/blog/auto-mode) | `PERMISSION_MODE="auto"`, plus `./loop.sh auto` (auto-approvals still logged for audit) |
+| Must-be quality is unstated: users never ask for what they assume ("of course it still renders") | Kano model (Kano et al., 1984, "must-be quality" / atarimae hinshitsu) | The contract skill's expectation-decomposition pass — preservation invariants, domain baseline, premortem — lands as acceptance-checklist rows the evaluator enforces |
+| Verification methods are not interchangeable: Inspection / Analysis / Demonstration / Test — analyzing the code never substitutes for demonstrating the behavior | NASA Systems Engineering Handbook §6.7 / INCOSE SE Handbook (verification methods) | Every checklist row carries `cmd` / `run` / `human`; a `run` row closes only with an observation artifact whose manifest stamp binds its bytes to the current AC and product tree, then the gate reviewer opens and judges it |
+| The test-oracle problem: rendered/visual output often has no automatable oracle | Barr et al., *The Oracle Problem in Software Testing* (IEEE TSE 2015); VRT practice (screenshot testing) | Scriptable observations become self-terminating probe commands in the verify gate; the remainder becomes screenshot evidence a reviewer/human judges — never silently waived |
+| Test the gate itself: would a broken implementation still pass it? | Mutation testing (DeMillo, Lipton & Sayward 1978); specification-gaming literature | The contract reviewer's falsifiability audit: describe one plausible broken-but-green implementation per REQ; if it exists and matters, the definition is rejected until the gate discriminates |
+| Premortem: imagine the failure first, then work backwards to its causes | Klein, *Performing a Project Premortem* (HBR 2007) | The definition session names the 3 most plausible "gates green, user disappointed" outcomes and converts each into a checklist row, a Non-goal, or a recorded assumption |
+| Evaluation criteria are generated dynamically but must execute as a frozen contract — post-hoc edits are goalpost-moving | Dynamic evaluator-generation design theory (evaluation-contract pattern; cf. Goodhart's law) | Obligations anchor to contract-named AC ids; the evaluator's run-scoped id ledger (`.loop/ac-seen`) refuses promotion when a recorded row vanishes, and a row's method cell may not weaken vs its contract anchor (`run` → `cmd`) |
+| Audit coverage and traceability BEFORE locking the contract: every mandatory requirement maps to a criterion, every criterion traces back to a requirement | same (coverage = 1.0 rule; traceability audit) | The approve-time definition lint: contract-anchored AC ids need rows, rows must reference defined REQs, duplicate ids refused — all before the approval hash is written; the contract reviewer audits per-row provenance and atomicity |
+| Never execute model-generated commands unaudited (allowlist-oracle principle) | same (shell-implementation principles) | Destructive-pattern lint over `VERIFY_COMMANDS` at approval — refused unattended, explicit human override interactively; the contract reviewer's Safe-gate rule judges intent, not just patterns |
+| A repeating failure *set* — not just an identical failure — is a stop condition | same (stop-kernel conditions: cycling artifacts / repeated failure sets) | Oscillation window in the evaluator: ≤2 distinct failure fingerprints across `2×REPEAT_FAIL_N` consecutive failing iterations → `BLOCKED` |
+
+---
+
+*loop-kit is a shell harness plus a set of prompts. Read the contract and the evidence
+report; let the loop handle the diffs.*

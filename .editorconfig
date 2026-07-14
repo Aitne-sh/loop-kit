@@ -1,0 +1,9 @@
+# Editor-level complement to .gitattributes: keep shell/text assets LF + UTF-8 so
+# an editor on Windows doesn't reintroduce CRLF that would break the shebangs and
+# the sourced loop.config.sh (see .gitattributes for the full rationale).
+root = true
+
+[*]
+end_of_line = lf
+charset = utf-8
+insert_final_newline = true

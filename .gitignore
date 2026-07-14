@@ -1,0 +1,39 @@
+# ─────────────────────────────────────────────────────────────────────────
+# loop-kit .gitignore
+#
+# This repo is the SOURCE of loop-kit (shell + prompt files). Every tracked
+# file here ships as the product. The rules below keep local dev byproducts
+# and personal working notes out of the repo.
+#
+# IMPORTANT: `.loop/` and `.claude/` are ANCHORED with a leading `/` on
+# purpose. An UNANCHORED rule (e.g. `.loop/`) also swallows the shipped
+# `examples/*/.loop/docs/product-contract.md` fixtures and would drop the
+# `kit/.claude/**` product skills on a fresh clone/`git init`. Do not remove
+# the leading slash.
+# ─────────────────────────────────────────────────────────────────────────
+
+# ── OS / editor cruft ──
+.DS_Store
+
+# ── Python byproducts (the examples use uv + pytest) ──
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# ── Loop run-state at the repo ROOT only (regenerated each run, never shipped).
+#    Anchored so examples/*/.loop/docs/ fixtures stay tracked. ──
+/.loop/
+
+# ── Local Claude Code session/settings at the ROOT only.
+#    Anchored so the kit/.claude/** product skills stay tracked. ──
+/.claude/
+
+# ── Local scratch / promo working areas ──
+/scratch/
+/promo/
+
+# ── Personal working docs & design notes — keep local, never push ──
+/SPEC_AND_DESIGN.md
+/evidence-gate-hardening-plan.md
+/*-findings.md

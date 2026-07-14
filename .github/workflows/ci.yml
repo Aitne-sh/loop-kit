@@ -1,0 +1,172 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
+# loop-kit is shell + prompt files — no build. CI proves the harness stays portable
+# across the BSD/GNU/Windows userland split (see README "Platform support").
+
+jobs:
+  # BSD (macOS) + GNU (Linux) full behavioral suite — the primary regression net.
+  # macOS is the leg that catches BSD-only bugs (e.g. GNU-only sed \b); Linux the
+  # GNU leg. ~1000+ assertions, fake agent (zero tokens), ends with a shellcheck gate.
+  suite:
+    name: suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # macOS has crossed 25 minutes as the behavioral suite has grown. Keep the
+    # watchdog bounded, but leave enough headroom for hosted-runner variance.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "loop ci"
+          git config --global init.defaultBranch main
+      # The suite is zero-token: every agent invocation is redirected to the fake
+      # via LOOP_CLAUDE_CMD. But a handful of guard-refusal tests invoke `./loop.sh`
+      # bare (no override) and expect an EARLY guard (contract-swap, liveness) to
+      # fire; loop.sh's `command -v claude` preflight sits ahead of some of those,
+      # so on a runner with no `claude` the refusal reports "claude CLI not found"
+      # instead of the guard's reason. A dev machine always has `claude` on PATH;
+      # mirror that here with a fake so the preflight passes. It is never actually
+      # executed on those paths (the guard refuses first) — it only has to exist.
+      - name: Provide a fake claude on PATH (mirror a dev machine; preflight only)
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/claude" <<SHIM
+          #!/usr/bin/env bash
+          exec "$GITHUB_WORKSPACE/tests/fake_claude.sh" "\$@"
+          SHIM
+          chmod +x "$HOME/.local/bin/claude"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Tool versions
+        run: |
+          bash --version | head -1
+          sed --version 2>/dev/null | head -1 || echo "BSD sed (no --version)"
+          shellcheck --version 2>/dev/null | awk '/version:/{print "shellcheck " $2}' || echo "no shellcheck on runner"
+          command -v claude >/dev/null && echo "claude shim on PATH" || echo "no claude on PATH"
+      - name: Run full suite (includes shellcheck gate)
+        run: |
+          log="$RUNNER_TEMP/loop-suite.log"
+          set +e
+          ./tests/run_tests.sh 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            {
+              echo '## Full suite failure (last 160 lines)'
+              echo '```text'
+              tail -n 160 "$log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+
+  # Same suite with shasum removed so loop.sh's sha256() must take the coreutils
+  # sha256sum fallback. Catches any hardcoded `shasum` that would break on a
+  # coreutils-only / no-perl Linux (the class of bug CI previously couldn't see).
+  suite-coreutils-only:
+    name: suite (linux, coreutils sha256sum only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "loop ci"
+          git config --global init.defaultBranch main
+      - name: Force the coreutils sha256sum path (hide shasum)
+        run: |
+          for p in $(type -ap shasum 2>/dev/null || true); do sudo rm -f "$p"; done
+          if command -v shasum >/dev/null 2>&1; then echo "shasum still on PATH — mask failed"; exit 1; fi
+          command -v sha256sum >/dev/null 2>&1 || { echo "no sha256sum available"; exit 1; }
+          echo "OK: shasum hidden, sha256sum present at $(command -v sha256sum)"
+      - name: Provide a fake claude on PATH (mirror a dev machine; preflight only)
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/claude" <<SHIM
+          #!/usr/bin/env bash
+          exec "$GITHUB_WORKSPACE/tests/fake_claude.sh" "\$@"
+          SHIM
+          chmod +x "$HOME/.local/bin/claude"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run full suite
+        run: |
+          log="$RUNNER_TEMP/loop-suite.log"
+          set +e
+          ./tests/run_tests.sh 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            {
+              echo '## Coreutils-only suite failure (last 160 lines)'
+              echo '```text'
+              tail -n 160 "$log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+
+  # Native Windows via Git Bash. ENFORCED: the checkout/lint dimension Windows most
+  # needs — LF (not CRLF) shebangs, syntax, shellcheck. The full behavioral suite is
+  # INFORMATIONAL only: the fleet/timing legs are expected-flaky on MSYS, and the
+  # parallel fleet is WSL/Linux-only on Windows by design (see README).
+  windows-lint:
+    name: windows (Git Bash lint + syntax)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - name: Prove LF checkout (shebangs are not CRLF)
+        run: |
+          fail=0
+          for f in bin/loop.sh bin/evaluate.sh tests/run_tests.sh tests/fake_claude.sh; do
+            if head -1 "$f" | od -An -c | grep -qF '\r'; then
+              echo "CRLF in first line of $f — .gitattributes eol=lf not applied"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] && echo "OK: shebangs are LF"
+          exit "$fail"
+      - name: Syntax check
+        run: bash -n bin/loop.sh bin/evaluate.sh tests/run_tests.sh tests/fake_claude.sh
+      - name: shellcheck
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh tests/run_tests.sh
+          else
+            echo "shellcheck not on the runner; skipping"
+          fi
+      # Informational only, and MSYS fleet/timing is slow — cap it BELOW the job
+      # timeout so a slow run is swallowed by continue-on-error instead of
+      # cancelling the whole job (a job-level timeout is NOT covered by
+      # continue-on-error; a step-level one is). Fake claude mirrors a dev machine
+      # so bare guard-refusal invocations don't misreport "claude CLI not found".
+      - name: Full suite (informational — MSYS fleet/timing is best-effort)
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "loop ci"
+          git config --global init.defaultBranch main
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/claude" <<SHIM
+          #!/usr/bin/env bash
+          exec "$GITHUB_WORKSPACE/tests/fake_claude.sh" "\$@"
+          SHIM
+          chmod +x "$HOME/.local/bin/claude"
+          export PATH="$HOME/.local/bin:$PATH"
+          ./tests/run_tests.sh
