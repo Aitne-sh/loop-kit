@@ -854,8 +854,10 @@ get_model() { # $1 role var, $2 default — safe key=value parse, no code execut
 }
 
 configured_agent() { # $1 role -> effective configured agent (no one-shot state)
+  # CONTRACT resolves like any other role, but it only governs the HEADLESS
+  # definition path (contract-auto): the interactive definition session and
+  # refine launch $CLAUDE_CMD directly and never consult this resolver.
   local role="${1:-}" a=""
-  [ "$role" != CONTRACT ] || { printf 'claude'; return 0; }
   if [ "$role" = REVIEW_INTERIM ]; then
     a=$(get_model AGENT_REVIEW_INTERIM "")
     [ -n "$a" ] || a=$(get_model AGENT_REVIEW claude)
@@ -870,8 +872,6 @@ resolve_agent() { # $1 optional role -> claude|codex; one-shot wins for one call
   # A role-less legacy/future call is always Claude. In particular, it must not
   # accidentally consume an interim-review one-shot intended for the next call.
   [ -n "$role" ] || { printf 'claude'; return 0; }
-  # Definition is a hard security/product boundary, not merely a shipped default.
-  [ "$role" != CONTRACT ] || { printf 'claude'; return 0; }
   if [ -n "${LOOP_AGENT_ONESHOT:-}" ]; then
     a="$LOOP_AGENT_ONESHOT"
     case "$a" in claude|codex) printf '%s' "$a"; return 0 ;; esac
@@ -906,14 +906,14 @@ get_config_scalar() { # $1 key, $2 default — display/warning parser; never sou
 print_agent_routing() {
   local role agent model
   note "agent routing (role -> agent/model):"
-  note "  CONTRACT -> claude/$(configured_role_model CONTRACT) (pinned)"
+  note "  CONTRACT -> $(configured_agent CONTRACT)/$(configured_role_model CONTRACT) (headless definition; interactive start/refine always Claude)"
   for role in PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
     agent=$(configured_agent "$role")
     model=$(configured_role_model "$role")
     note "  $role -> $agent/$model"
   done
-  if [ -n "$(get_model AGENT_CONTRACT "")" ]; then
-    note "  warning: AGENT_CONTRACT is ignored; CONTRACT is pinned to Claude"
+  if [ "$(configured_agent CONTRACT)" = codex ]; then
+    note "  note: AGENT_CONTRACT=codex applies to headless definition only — interactive ./loop.sh start and refine still launch Claude"
   fi
   if codex_routing_enabled && [ -n "$(get_config_scalar DISALLOWED_TOOLS "")" ]; then
     note "  warning: DISALLOWED_TOOLS constrains Claude only; Codex roles use LOOP_CODEX_SANDBOX/LOOP_CODEX_NETWORK"
@@ -941,11 +941,34 @@ claude_role_required() { # does any routable role still resolve to Claude?
 }
 
 orchestration_claude_guard() { # fleet workers define per-task contracts via
-  # /loop-contract (the CONTRACT role, Claude-routed). An all-Codex single loop
-  # needs no claude CLI, but an orchestration still does — fail here, before a
-  # decompose call is spent on a fleet that could never dispatch a worker.
+  # /loop-contract (the CONTRACT role). When that role routes to codex the
+  # workers define headlessly on Codex and no claude CLI is needed; otherwise
+  # fail here, before a decompose call is spent on a fleet that could never
+  # dispatch a worker.
+  [ "$(configured_agent CONTRACT)" != codex ] || return 0
   command -v "$CLAUDE_CMD" >/dev/null 2>&1 \
-    || die_next "fleet orchestration requires the Claude CLI ('$CLAUDE_CMD'): each worker defines its task contract via the Claude-routed CONTRACT role" "install Claude Code (or set LOOP_CLAUDE_CMD), or run in place: ./loop.sh run --single"
+    || die_next "fleet orchestration requires the Claude CLI ('$CLAUDE_CMD'): each worker defines its task contract via the Claude-routed CONTRACT role" "install Claude Code (or set LOOP_CLAUDE_CMD), route AGENT_CONTRACT=codex, or run in place: ./loop.sh run --single"
+}
+
+need_contract_agent() { # start/auto preflight — require the CLI the DEFINITION
+  # will actually use. The interactive session is structurally Claude (TUI +
+  # AskUserQuestion); only the headless generator (contract-auto, run_claude
+  # CONTRACT) is routable. The predicate must mirror the dispatch below:
+  # [ -t 0 ] && AUTO_MODE != 1 -> interactive.
+  if [ -t 0 ] && [ "$AUTO_MODE" != "1" ]; then
+    need_claude
+    return 0
+  fi
+  if [ "$(configured_agent CONTRACT)" = codex ]; then
+    need_codex
+    local model; model=$(configured_role_model CONTRACT)
+    case "$model" in
+      opus|sonnet|haiku|claude-*)
+        die_next "AGENT_CONTRACT=codex but MODEL_CONTRACT='$model' is a Claude alias" "set MODEL_CONTRACT to a Codex model slug (e.g. gpt-5.5) in loop.models.sh" ;;
+    esac
+  else
+    need_claude
+  fi
 }
 
 warn_codex_cost_untracked() {
@@ -962,15 +985,22 @@ warn_codex_cost_untracked() {
 }
 
 need_agents() { # run/fleet preflight; each CLI is required only when routed-to
-  local scope="${1:-}" role agent model
-  # Claude is not unconditional: an all-Codex routing must be able to run a
-  # single loop on a machine with no claude CLI at all. Fleet keeps Claude
-  # mandatory for now — worker task definition (/loop-contract) is
-  # Claude-routed (see orchestration_claude_guard for the single-run entry).
-  if [ "$scope" = fleet ] || claude_role_required; then
+  local scope="${1:-}" role agent model roles
+  roles="IMPLEMENT PLAN REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE"
+  # Claude is not unconditional: an all-Codex routing must be able to run on a
+  # machine with no claude CLI at all. Fleet additionally covers CONTRACT —
+  # each worker defines its task contract headlessly, so a Claude-routed
+  # CONTRACT keeps Claude mandatory there (single runs never define contracts;
+  # their orchestration entry has its own guard: orchestration_claude_guard).
+  if [ "$scope" = fleet ]; then
+    roles="$roles CONTRACT"
+    if [ "$(configured_agent CONTRACT)" = claude ] || claude_role_required; then
+      need_claude "$scope"
+    fi
+  elif claude_role_required; then
     need_claude "$scope"
   fi
-  for role in IMPLEMENT PLAN REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
+  for role in $roles; do
     agent=$(configured_agent "$role")
     [ "$agent" = codex ] || continue
     need_codex "$scope"
@@ -1409,8 +1439,9 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
   # would leak the override into later calls.
   LOOP_AGENT_ONESHOT=""
   if [ "$agent" = codex ]; then
-    # Defense in depth for pre-approval REVIEW calls, which do not pass through
-    # cmd_run/cmd_fleet's broader preflight.
+    # Defense in depth for pre-approval REVIEW/CONTRACT calls (contract-review,
+    # headless contract generation), which do not pass through cmd_run/
+    # cmd_fleet's broader preflight.
     need_codex
     case "$model" in
       opus|sonnet|haiku|claude-*)
@@ -7856,7 +7887,9 @@ generate_contract_headless() { # $1 instruction — no questions asked interacti
   # assumptions recorded. With LOOP_ASK_CRITICAL=1 (ask=critical) the generator may
   # instead raise CRITICAL unknowns — those park the run for a human (never assumed).
   # Deliberately does NOT source loop.config.sh (no approval baseline exists yet);
-  # uses safe fixed defaults for this one call.
+  # uses safe fixed defaults for this one call. That also means a codex-routed
+  # CONTRACT runs under the adapter's default sandbox (workspace-write — it must
+  # write the contract and loop.config.sh), not a not-yet-approved override.
   local MAX_ITER_SECONDS="${MAX_ITER_SECONDS:-900}"
   local PERMISSION_MODE="${PERMISSION_MODE:-acceptEdits}"
   local MAX_COST_USD="${MAX_COST_USD:-}"   # no USD cap unless the caller sets one
@@ -7874,7 +7907,7 @@ generate_contract_headless() { # $1 instruction — no questions asked interacti
 reviewer. Read .loop/contract-review-feedback.md and address every must-fix
 item in the regenerated definition.)"
   fi
-  note "generating the loop definition headlessly (/loop-contract auto, $(get_model MODEL_CONTRACT opus))"
+  note "generating the loop definition headlessly (/loop-contract auto, $(configured_agent CONTRACT)/$(get_model MODEL_CONTRACT opus))"
   if [ -n "$(ask_arg)" ]; then
     note "critical unknowns park the run for a human (LOOP_ASK_CRITICAL=1); the rest become assumptions"
   else
@@ -8106,7 +8139,7 @@ cmd_start() {
   # claude-CLI check (`add` needs no model) and BEFORE guard_new_definition
   # (which would archive+reset the live run's memory)
   route_new_task_to_fleet_add "$@"
-  need_claude
+  need_contract_agent
   trap on_contract_int INT TERM   # never orphan the contract-gen model child
   # `start` DEFINES A NEW TASK: the previous task's loop memory must not leak
   # into it (stale DRs, aliased 'met' ledger rows, an inherited plan) — archive
@@ -8141,7 +8174,7 @@ cmd_auto() { # ./loop.sh with no arguments (guided) or `./loop.sh auto` (AUTO_MO
   # backstop refuses (contract missing) — a leftover loop-instruction.md must
   # never silently enqueue itself on every invocation.
   [ $# -eq 0 ] || route_new_task_to_fleet_add --auto "$@"
-  need_claude
+  need_contract_agent
   trap on_contract_int INT TERM   # never orphan the contract-gen model child
   if ! contract_is_defined; then
     # first definition = NEW task: reset any residual loop memory (a deleted or
@@ -8177,7 +8210,9 @@ cmd_contract_review() { # standalone gate: exit 0 APPROVE / 4 REVISE / 2 error.
   ensure_loop_dir
   need_awk
   need_sha
-  need_claude
+  # the reviewer call routes via AGENT_REVIEW; run_claude's own need_codex
+  # covers the codex side, so claude is required only when actually routed-to
+  [ "$(configured_agent REVIEW)" != claude ] || need_claude
   contract_is_defined || die_next "no loop definition to review (.loop/docs/product-contract.md is missing or still the template)" "define a task first: ./loop.sh start \"<what to build>\""
   trap on_contract_int INT TERM   # never orphan the reviewer model child
   run_contract_review || exit 4

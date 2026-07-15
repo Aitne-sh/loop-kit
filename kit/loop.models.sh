@@ -49,7 +49,9 @@ MODEL_REVIEW_INTERIM="sonnet"
 #AGENT_EVIDENCE=""
 #AGENT_DECOMPOSE=""
 #AGENT_SUPERVISE=""       # codex here disables supervisor session reuse (fresh calls)
-# NOTE: CONTRACT (interactive definition / refine / headless auto) is always Claude.
+#AGENT_CONTRACT=""        # HEADLESS definition only (auto / no-TTY start, incl.
+                          # fleet workers); interactive ./loop.sh start sessions
+                          # and refine always launch Claude Code.
 # Agent inheritance does not replace MODEL_REVIEW_INTERIM: if AGENT_REVIEW=codex
 # is inherited here, set MODEL_REVIEW_INTERIM to a Codex slug too (or explicitly
 # route AGENT_REVIEW_INTERIM to another agent).

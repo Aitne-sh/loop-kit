@@ -673,22 +673,44 @@ LOOP_CLAUDE_CMD="$FAKE" ./loop.sh run >"$WORK/codex-config-network.out" 2>&1 </d
 check "invalid LOOP_CODEX_NETWORK exits 2" codex-config-network 2 "$RC"
 if grep -q 'LOOP_CODEX_NETWORK must be 0 or 1' "$WORK/codex-config-network.out" && grep -q '→ next:' "$WORK/codex-config-network.out"; then ok "network enum fails closed"; else bad "network enum guard missing" codex-config-network; fi
 
-echo "== unknown AGENT value degrades to Claude; CONTRACT remains pinned =="
+echo "== unknown AGENT value degrades to Claude =="
 make_fixture codex-agent-typo
 printf 'AGENT_IMPLEMENT="codexx"\n' >> loop.models.sh
 run_loop "READY_NOW"
 check "agent typo still completes" codex-agent-typo 0 "$RC"
 if grep -qx 'fake-imp' .loop/fake-models && [ ! -e .loop/fake-codex-invocations ]; then ok "unknown agent value degraded to Claude"; else bad "agent typo did not degrade safely" codex-agent-typo; fi
 
-make_fixture codex-contract-pin nocontract
-printf 'AGENT_CONTRACT="codex"\n' >> loop.models.sh
+echo "== AGENT_CONTRACT routes the HEADLESS definition to Codex (interactive stays Claude) =="
+make_fixture codex-contract-route nocontract
+printf 'AGENT_CONTRACT="codex"\nMODEL_CONTRACT="gpt-5.5"\n' >> loop.models.sh
 RC=0
-LOOP_FAKE_CONTRACT=READY LOOP_CLAUDE_CMD="$FAKE" \
-  ./loop.sh start "fix value.txt so the check passes" >"$WORK/codex-contract-pin.out" 2>&1 </dev/null || RC=$?
-check "contract generation exits 0" codex-contract-pin 0 "$RC"
-if grep -qx 'fake-con' .loop/fake-models && [ ! -e .loop/fake-codex-invocations ]; then ok "CONTRACT stayed pinned to Claude"; else bad "AGENT_CONTRACT escaped the Claude pin" codex-contract-pin; fi
-./loop.sh approve >"$WORK/codex-contract-pin-approve.out" 2>&1
-if grep -q 'AGENT_CONTRACT is ignored' "$WORK/codex-contract-pin-approve.out"; then ok "ignored AGENT_CONTRACT is visible at approval"; else bad "contract-pin warning missing" codex-contract-pin; fi
+LOOP_FAKE_CONTRACT=READY LOOP_CLAUDE_CMD="$WORK/no-such-claude" \
+  ./loop.sh start "fix value.txt so the check passes" >"$WORK/codex-contract-route.out" 2>&1 </dev/null || RC=$?
+check "headless Codex contract generation exits 0" codex-contract-route 0 "$RC"
+if grep -q 'loop-contract/SKILL.md' .loop/fake-codex-prompts && [ ! -e .loop/fake-models ]; then
+  ok "the definition was authored on Codex with no Claude process at all"
+else
+  bad "Codex-routed contract generation failed: $(tail -3 "$WORK/codex-contract-route.out")" codex-contract-route
+fi
+./loop.sh approve >"$WORK/codex-contract-route-approve.out" 2>&1
+if grep -q 'CONTRACT -> codex/gpt-5.5' "$WORK/codex-contract-route-approve.out" \
+   && grep -q 'interactive ./loop.sh start and refine still launch Claude' "$WORK/codex-contract-route-approve.out"; then
+  ok "approval shows the Codex CONTRACT route and the interactive-Claude note"
+else
+  bad "CONTRACT routing display wrong: $(grep -i 'contract' "$WORK/codex-contract-route-approve.out" | head -3)" codex-contract-route
+fi
+
+make_fixture codex-contract-alias nocontract
+printf 'AGENT_CONTRACT="codex"\nMODEL_CONTRACT="opus"\n' >> loop.models.sh
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" ./loop.sh start "fix value.txt so the check passes" >"$WORK/codex-contract-alias.out" 2>&1 </dev/null || RC=$?
+check "Claude alias on Codex CONTRACT exits 2" codex-contract-alias 2 "$RC"
+if grep -q "MODEL_CONTRACT='opus' is a Claude alias" "$WORK/codex-contract-alias.out" \
+   && grep -q '→ next:' "$WORK/codex-contract-alias.out" && [ ! -e .loop/fake-codex-prompts ]; then
+  ok "contract model/agent mismatch failed before generation with recovery"
+else
+  bad "CONTRACT alias guard missing" codex-contract-alias
+fi
 
 echo "== DISALLOWED_TOOLS warning distinguishes Claude and Codex controls =="
 make_fixture codex-disallowed
@@ -763,6 +785,45 @@ if grep -q 'fleet orchestration requires the Claude CLI' "$WORK/codex-only-orch.
   ok "guard fired before any decompose call was spent, naming the recovery"
 else
   bad "orchestration Claude guard missing or late: $(tail -3 "$WORK/codex-only-orch.out")" codex-only-orch
+fi
+
+echo "== fully-Codex pipeline: auto -> contract -> review -> approve -> run, Claude-less =="
+make_fixture codex-only-auto nocontract
+cat >> loop.models.sh <<'EOF'
+AGENT_CONTRACT="codex"
+AGENT_IMPLEMENT="codex"
+AGENT_PLAN="codex"
+AGENT_REVIEW="codex"
+AGENT_STOP_EVAL="codex"
+AGENT_EVIDENCE="codex"
+AGENT_DECOMPOSE="codex"
+AGENT_SUPERVISE="codex"
+MODEL_CONTRACT="gpt-5.5"
+MODEL_IMPLEMENT="gpt-5.5"
+MODEL_PLAN="gpt-5.5"
+MODEL_REVIEW="gpt-5.5-review"
+MODEL_REVIEW_INTERIM="gpt-5.5-review"
+MODEL_STOP_EVAL="gpt-5.5-mini"
+MODEL_EVIDENCE="gpt-5.5"
+MODEL_DECOMPOSE="gpt-5.5"
+MODEL_SUPERVISE="gpt-5.5"
+EOF
+echo "fix value.txt so the check passes" > loop-instruction.md
+RC=0
+LOOP_CLAUDE_CMD="$WORK/no-such-claude" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh auto >"$WORK/codex-only-auto.out" 2>&1 </dev/null || RC=$?
+STATE=$(cat .loop/state 2>/dev/null || echo none)
+check "exit 0" codex-only-auto 0 "$RC"
+check "state SUCCESS" codex-only-auto SUCCESS "$STATE"
+if [ ! -e .loop/fake-models ] \
+   && grep -q 'loop-contract/SKILL.md' .loop/fake-codex-prompts \
+   && grep -q 'loop-contract-review/SKILL.md' .loop/fake-codex-prompts \
+   && grep -q 'loop-iterate/SKILL.md' .loop/fake-codex-prompts \
+   && grep -q 'loop-evidence/SKILL.md' .loop/fake-codex-prompts; then
+  ok "contract, contract review, implement and evidence all ran on Codex; zero Claude processes"
+else
+  bad "Claude leaked into the Claude-less pipeline: $(cat .loop/fake-models 2>/dev/null | tr '\n' ' ')" codex-only-auto
 fi
 
 echo "== runaway-context nudge (TURNS_NUDGE_AT) =="
@@ -3361,6 +3422,43 @@ if cmp -s .codex/config.toml "$wt/.codex/config.toml"; then
   ok "gitignored approved Codex project config propagated byte-for-byte to the worker"
 else
   bad "Codex worker lost the parent project config" fleet-codex-route
+fi
+
+echo "== fleet: an all-Codex fleet (CONTRACT included) runs Claude-less end to end =="
+make_fleet_fixture fleet-codex-only
+cat >> loop.models.sh <<'EOF'
+AGENT_CONTRACT="codex"
+AGENT_IMPLEMENT="codex"
+AGENT_PLAN="codex"
+AGENT_REVIEW="codex"
+AGENT_STOP_EVAL="codex"
+AGENT_EVIDENCE="codex"
+AGENT_DECOMPOSE="codex"
+AGENT_SUPERVISE="codex"
+MODEL_CONTRACT="gpt-5.5"
+MODEL_IMPLEMENT="gpt-5.5"
+MODEL_PLAN="gpt-5.5"
+MODEL_REVIEW="gpt-5.5-review"
+MODEL_REVIEW_INTERIM="gpt-5.5-review"
+MODEL_STOP_EVAL="gpt-5.5-mini"
+MODEL_EVIDENCE="gpt-5.5"
+MODEL_DECOMPOSE="gpt-5.5"
+MODEL_SUPERVISE="gpt-5.5"
+EOF
+RC=0
+LOOP_CLAUDE_CMD="$WORK/no-such-claude" LOOP_FAKE_CONTRACT=READY LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh fleet run task-a.md --auto --drain >"$WORK/fleet-codex-only.out" 2>&1 </dev/null &
+wait_sup $! fleet-codex-only
+check "supervisor exit 0" fleet-codex-only 0 "$RC"
+check "task done" fleet-codex-only 1 "$(qcount "done")"
+id=$(fleet_task_id alpha)
+wt=$(fleet_wt "$id")
+if grep -q 'loop-contract/SKILL.md' "$wt/.loop/fake-codex-prompts" 2>/dev/null \
+   && [ ! -e "$wt/.loop/fake-models" ] && [ ! -e .loop/fake-models ]; then
+  ok "the worker defined its contract on Codex; no Claude process in parent or worker"
+else
+  bad "Claude leaked into the Claude-less fleet (wt=$wt)" fleet-codex-only
 fi
 
 echo "== fleet: add is an atomic maildir enqueue (works without a supervisor) =="
