@@ -62,6 +62,11 @@ OBS_MANIFEST_PINNED=0
 # new process, so both streaks restart at 0 — the safe side.
 STOP_EVAL_MET_STREAK=0
 STOP_EVAL_FUTILE_STREAK=0
+# Fleet integration gate: sha256 over every merged worker's archived evidence
+# (set per gate round; empty for single-task runs). Written into the parent
+# certificate as worker_evidence_sha256 and folded into the gate's authority
+# compares — see fleet_evidence_bundle_hash / integration_authority.
+FLEET_BUNDLE_SHA=""
 # Agent subtree isolation: launch every `claude` as its OWN process-group leader
 # so an interrupt/timeout can signal the WHOLE agent subtree (claude + MCP servers
 # + tool subprocesses + sub-agents), not just the top pid. A background job of a
@@ -2070,7 +2075,10 @@ write_certification() { # $1 state $2 task base $3 run base $4 reviewed HEAD $5 
   finished=$(utcnow)
   mkdir -p .loop/docs
   tmp=".loop/docs/.certification.tmp.$$"
-  printf '{"task_id":"%s","run_id":"%s","contract_hash":"%s","harness_hash":"%s","task_start_ref":"%s","run_start_ref":"%s","reviewed_head":"%s","preflight":"%s","review_verdict":"%s","review_scope":"%s","requirements_verdict_sha256":"%s","verify_log_sha256":"%s","evidence_manifest_sha256":"%s","final_state":"%s","finished_at":"%s"}\n' \
+  # worker_evidence_sha256: fleet integration gates bind the merged workers'
+  # archived evidence bundle here (FLEET_BUNDLE_SHA); single-task runs have no
+  # worker archives and record the empty string.
+  printf '{"task_id":"%s","run_id":"%s","contract_hash":"%s","harness_hash":"%s","task_start_ref":"%s","run_start_ref":"%s","reviewed_head":"%s","preflight":"%s","review_verdict":"%s","review_scope":"%s","requirements_verdict_sha256":"%s","verify_log_sha256":"%s","evidence_manifest_sha256":"%s","worker_evidence_sha256":"%s","final_state":"%s","finished_at":"%s"}\n' \
     "$(printf '%s' "$TASK_ID" | json_escape)" \
     "$(printf '%s' "$RUN_ID" | json_escape)" \
     "$RUN_CONTRACT_HASH" "$RUN_HARNESS_HASH" \
@@ -2080,7 +2088,9 @@ write_certification() { # $1 state $2 task base $3 run base $4 reviewed HEAD $5 
     "$(printf '%s' "$preflight_status" | json_escape)" \
     "$(printf '%s' "$review_verdict" | json_escape)" \
     "$(printf '%s' "$review_scope" | json_escape)" \
-    "$req_sha" "$verify_sha" "$manifest_sha" "$final_state" "$finished" > "$tmp"
+    "$req_sha" "$verify_sha" "$manifest_sha" \
+    "$(printf '%s' "${FLEET_BUNDLE_SHA:-}" | json_escape)" \
+    "$final_state" "$finished" > "$tmp"
   mv -f "$tmp" .loop/docs/certification.json
   if [ -f .loop/docs/evidence-report.md ]; then
     {
@@ -6060,6 +6070,73 @@ check_fleet_contract_binding() { # fail closed when queued PLANNED tasks belong 
   fi
 }
 
+fleet_merged_ids() { # $1 base -> ids of the workers whose merge commits landed in
+  # base..HEAD, one per line, sorted. First-parent + merges-only is deliberate:
+  # it enumerates exactly the supervisor's own `fleet: merge <id> — <summary>`
+  # commits on the parent line, so a crafted commit subject on a worker branch
+  # can never inject (or hide) an id.
+  git log --first-parent --merges --format=%s "$1..HEAD" 2>/dev/null \
+    | sed -nE 's/^fleet: merge ([a-z0-9][a-z0-9-]*)([[:space:]].*)?$/\1/p' \
+    | LC_ALL=C sort -u || true
+}
+
+verify_fleet_archives() { # $1 "id ..." — deterministic integrity of each merged
+  # worker's evidence archive BEFORE the integration reviewer/evidence agent
+  # read it: the dir must exist, carry the worker's own certificate, and every
+  # archived manifest row must hash-match its archived observation bytes.
+  # Sets FLEET_ARCHIVE_PROBLEM on failure.
+  FLEET_ARCHIVE_PROBLEM=""
+  local id dir
+  for id in $1; do
+    dir=".loop/docs/run-archive/$id"
+    if [ ! -d "$dir" ]; then
+      FLEET_ARCHIVE_PROBLEM="$id: archive missing at $dir"; return 1
+    fi
+    if [ -L "$dir/certification.json" ] || [ ! -s "$dir/certification.json" ]; then
+      FLEET_ARCHIVE_PROBLEM="$id: archived certification.json missing or empty"; return 1
+    fi
+    verify_archived_manifest "$dir" \
+      || { FLEET_ARCHIVE_PROBLEM="$id: $ARCHIVE_MANIFEST_PROBLEM"; return 1; }
+  done
+  return 0
+}
+
+fleet_evidence_bundle_hash() { # $1 "id ..." -> one sha256 closing over every byte of
+  # the merged workers' archives (per-file path + type/content record, workers
+  # and files in sorted order). Bound into the integration authority compares
+  # and the parent certificate's worker_evidence_sha256, so the evidence base
+  # the integration reviewer judged can neither drift after the review nor be
+  # misrepresented by the certificate. pipefail propagates an inner failure
+  # through the sha256 pipe (same pattern as certification_inputs_hash).
+  local id dir files f
+  {
+    for id in $1; do
+      dir=".loop/docs/run-archive/$id"
+      printf 'task\t%s\n' "$id"
+      files=$( (cd "$dir" && find . \( -type f -o -type l \) | LC_ALL=C sort) ) || return 1
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        printf '%s/%s\t' "$id" "${f#./}"
+        authority_file_record "$dir/${f#./}" || return 1
+      done <<EOF
+$files
+EOF
+    done
+  } | sha256
+}
+
+integration_authority() { # $1 "id ..." (may be empty) -> the fleet gate's full
+  # authority token: root certification inputs + the worker evidence bundle.
+  # Compared before/after evidence AND after the final evaluator re-check —
+  # the single-task gate's discipline, extended over the archived evidence.
+  local a b=""
+  a=$(certification_inputs_hash) || return 1
+  if [ -n "$1" ]; then
+    b=$(fleet_evidence_bundle_hash "$1") || return 1
+  fi
+  printf '%s %s' "$a" "$b"
+}
+
 run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, then
   # certify the MERGED result against the MASTER contract (integration gate).
   # Runs inside cmd_run's process: the in-memory RUN_*_HASH baselines, config
@@ -6070,6 +6147,7 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
   local phase="$1" base id blocked_ticks=0 gate_i=1 fixups fixup_cap
   local human_ticks=0 stall_ticks=0 last_fp="" fp stall_cap manual manual_merged run_wall_start=$SECONDS
   local reviewed_ref evidence_diff final_line final_state evidence_logs authority_before authority_after
+  local merged_ids merged_csv mid
   ensure_fleet_dirs
   if [ "$phase" = "start" ] || [ ! -s .loop/fleet/run-id ]; then
     printf '%s\n' "$RUN_ID" > .loop/fleet/run-id
@@ -6226,6 +6304,20 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
     # ---- integration gate: the merged whole vs the MASTER contract ----
     check_harness "before the integration gate"
     verify_approval
+    # worker evidence closure (deterministic, before any reviewer is paid for):
+    # enumerate exactly the workers merged in THIS gate range, verify each
+    # archive's internal integrity, and pin the whole evidence base as one
+    # bundle hash — the reviewer and evidence agent judge from these archives,
+    # so the gate must not open over broken or unpinned ones.
+    merged_ids=$(fleet_merged_ids "$base")
+    merged_csv=$(printf '%s' "$merged_ids" | tr '\n' ',')
+    FLEET_BUNDLE_SHA=""
+    if [ -n "$merged_ids" ]; then
+      verify_fleet_archives "$merged_ids" \
+        || finish BLOCKED "worker evidence archive failed verification: ${FLEET_ARCHIVE_PROBLEM:-unknown} — inspect .loop/docs/run-archive, then ./loop.sh run"
+      FLEET_BUNDLE_SHA=$(fleet_evidence_bundle_hash "$merged_ids") \
+        || finish BLOCKED "could not hash the merged workers' evidence archives — inspect .loop/docs/run-archive, then ./loop.sh run"
+    fi
     # manual-task manifest: regenerated every gate round — merged human-queued
     # side-work is declared to the reviewer as sanctioned, never left to look
     # like unrequested scope (absent when no manual task merged)
@@ -6278,24 +6370,31 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
       check_harness "during the integration-gate review"
       canonicalize_live_manifest \
         || finish BLOCKED "could not canonicalize the observation manifest before integration evidence"
-      authority_before=$(certification_inputs_hash) \
+      authority_before=$(integration_authority "$merged_ids") \
         || finish BLOCKED "could not snapshot integration certification inputs"
       reviewed_ref=$(git rev-parse HEAD)
       evidence_logs=$(active_log_dir)
       rm -f .loop/docs/evidence-report.md
       note "generating the master evidence report (/loop-evidence, $MODEL_EVIDENCE)"
-      if ! run_claude "fleet-evidence" "/loop-evidence baseline=$base logs=$evidence_logs task=$TASK_ID$(html_arg)" "$MODEL_EVIDENCE" full EVIDENCE; then
+      if ! run_claude "fleet-evidence" "/loop-evidence baseline=$base logs=$evidence_logs task=$TASK_ID${merged_csv:+ merged=$merged_csv archives=.loop/docs/run-archive}$(html_arg)" "$MODEL_EVIDENCE" full EVIDENCE; then
         finish BLOCKED "evidence generation failed — cannot certify the merged result without evidence${AGENT_FAIL_DIAG:+ ($AGENT_FAIL_DIAG)}"
       fi
       check_harness "during integration evidence"
-      authority_after=$(certification_inputs_hash) \
+      authority_after=$(integration_authority "$merged_ids") \
         || finish BLOCKED "could not re-check integration certification inputs"
       if [ "$authority_after" != "$authority_before" ]; then
-        finish BLOCKED "integration evidence changed certification inputs after review (contract/ledger/checklist/verdicts/manifest/observations)"
+        finish BLOCKED "integration evidence changed certification inputs after review (contract/ledger/checklist/verdicts/manifest/observations/worker archives)"
       fi
       if ! validate_current_evidence_report; then
         finish BLOCKED "current integration evidence report is invalid: $EVIDENCE_REPORT_REASON"
       fi
+      # the master report must close over every merged worker's archived
+      # evidence — a report silently omitting a worker would certify SUCCESS
+      # over evidence nobody surfaced to the human
+      for mid in $merged_ids; do
+        grep -Fq "run-archive/$mid" .loop/docs/evidence-report.md \
+          || finish BLOCKED "integration evidence report omits merged task $mid — it must cover .loop/docs/run-archive/$mid"
+      done
       evidence_diff=$(post_review_product_changes "$reviewed_ref")
       if [ -n "$evidence_diff" ]; then
         finish BLOCKED "evidence step changed code after the integration review (unreviewed): $(echo "$evidence_diff" | tr '\n' ' ')"
@@ -6314,6 +6413,17 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
     fi
     journal_append "fleet" "INTEGRATION_GATE_$final_state" "$final_line"
     if [ "$final_state" = "SUCCESS" ]; then
+      # mirror of the single-task gate's post-final re-check: the --final
+      # evaluator just re-ran VERIFY_COMMANDS (arbitrary project shell), and
+      # nothing it changed may reach the certificate. Harness AND the full
+      # authority (root certification inputs + the worker evidence bundle)
+      # must be byte-identical to the reviewed state — previously the first
+      # check after --final ran only AFTER write_certification.
+      check_harness "after the integration re-check"
+      authority_after=$(integration_authority "$merged_ids") \
+        || finish BLOCKED "could not re-check integration certification inputs before certification"
+      [ "$authority_after" = "$authority_before" ] \
+        || finish BLOCKED "integration certification inputs changed after the evidence snapshot"
       # late-add rescan: a task published while the synchronous gate/evidence ran
       # would otherwise be stranded with a dead dispatcher. A fresh round re-gates
       # the merged whole INCLUDING the late task — certification is never partial.

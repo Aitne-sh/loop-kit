@@ -18,6 +18,19 @@ The skill argument contains `baseline=<ref>` — the first commit for this task 
 `task=<task-id>`, and an `html=` token (`on`, `off`, or `auto`), which controls
 whether you ALSO write the HTML view (see "Write the HTML view" below).
 
+At the **fleet integration gate** the argument additionally carries
+`merged=<id,id,...>` (the worker tasks merged into this result) and
+`archives=.loop/docs/run-archive`. Then the report MUST cover every merged
+task: for each id, read its archived evidence under
+`.loop/docs/run-archive/<id>/` (acceptance-checklist.md,
+observations-manifest.jsonl + observations/, certification.json,
+evidence-report.md) and cite the archive path (`run-archive/<id>/...`) for the
+evidence you summarize — the harness deterministically refuses a master report
+that omits any merged task's archive. Resolve an archived manifest's
+`.loop/observations/<file>` rows against that task's archive root
+(`run-archive/<id>/observations/<file>`), never against the live store or a
+sibling archive.
+
 ## Authority boundary
 
 This report is a **non-authoritative view**, not a certification input and not
