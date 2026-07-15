@@ -702,6 +702,69 @@ else
   bad "Codex DISALLOWED_TOOLS warning/routing missing" codex-disallowed
 fi
 
+echo "== all-Codex routing runs a single loop with NO claude CLI at all =="
+make_fixture codex-only
+cat >> loop.models.sh <<'EOF'
+AGENT_IMPLEMENT="codex"
+AGENT_PLAN="codex"
+AGENT_REVIEW="codex"
+AGENT_STOP_EVAL="codex"
+AGENT_EVIDENCE="codex"
+AGENT_DECOMPOSE="codex"
+AGENT_SUPERVISE="codex"
+MODEL_IMPLEMENT="gpt-5.5"
+MODEL_PLAN="gpt-5.5"
+MODEL_REVIEW="gpt-5.5-review"
+MODEL_REVIEW_INTERIM="gpt-5.5-review"
+MODEL_STOP_EVAL="gpt-5.5-mini"
+MODEL_EVIDENCE="gpt-5.5"
+MODEL_DECOMPOSE="gpt-5.5"
+MODEL_SUPERVISE="gpt-5.5"
+EOF
+RC=0
+LOOP_CLAUDE_CMD="$WORK/no-such-claude" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/codex-only.out" 2>&1 </dev/null || RC=$?
+check "exit 0 without any claude CLI" codex-only 0 "$RC"
+check "state SUCCESS" codex-only SUCCESS "$(cat .loop/state 2>/dev/null || echo none)"
+if [ ! -e .loop/fake-models ] && [ -s .loop/fake-codex-args ]; then
+  ok "every routable role ran on Codex; no Claude process was ever started"
+else
+  bad "claude was invoked in an all-Codex run: $(cat .loop/fake-models 2>/dev/null | tr '\n' ' ')" codex-only
+fi
+
+echo "== all-Codex orchestration still fails closed on the Claude-routed CONTRACT =="
+make_fixture codex-only-orch
+cat >> loop.models.sh <<'EOF'
+AGENT_IMPLEMENT="codex"
+AGENT_PLAN="codex"
+AGENT_REVIEW="codex"
+AGENT_STOP_EVAL="codex"
+AGENT_EVIDENCE="codex"
+AGENT_DECOMPOSE="codex"
+AGENT_SUPERVISE="codex"
+MODEL_IMPLEMENT="gpt-5.5"
+MODEL_PLAN="gpt-5.5"
+MODEL_REVIEW="gpt-5.5-review"
+MODEL_REVIEW_INTERIM="gpt-5.5-review"
+MODEL_STOP_EVAL="gpt-5.5-mini"
+MODEL_EVIDENCE="gpt-5.5"
+MODEL_DECOMPOSE="gpt-5.5"
+MODEL_SUPERVISE="gpt-5.5"
+EOF
+printf 'FLEET_DECOMPOSE=1\n' >> fleet.config.sh
+RC=0
+LOOP_CLAUDE_CMD="$WORK/no-such-claude" ./loop.sh run >"$WORK/codex-only-orch.out" 2>&1 </dev/null || RC=$?
+check "orchestration without claude exits 2" codex-only-orch 2 "$RC"
+if grep -q 'fleet orchestration requires the Claude CLI' "$WORK/codex-only-orch.out" \
+   && grep -q 'run --single' "$WORK/codex-only-orch.out" \
+   && grep -q '→ next:' "$WORK/codex-only-orch.out" \
+   && [ ! -e .loop/fake-codex-prompts ]; then
+  ok "guard fired before any decompose call was spent, naming the recovery"
+else
+  bad "orchestration Claude guard missing or late: $(tail -3 "$WORK/codex-only-orch.out")" codex-only-orch
+fi
+
 echo "== runaway-context nudge (TURNS_NUDGE_AT) =="
 make_fixture ctxnudge
 printf 'TURNS_NUDGE_AT="50"\n' >> loop.models.sh

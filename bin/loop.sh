@@ -928,6 +928,26 @@ codex_routing_enabled() {
   return 1
 }
 
+claude_role_required() { # does any routable role still resolve to Claude?
+  # CONTRACT is deliberately not scanned: run/decompose preflights never define
+  # contracts (one must already be approved), and the orchestration entry
+  # guards its own CONTRACT dependency explicitly (fleet workers define
+  # per-task contracts headlessly).
+  local role
+  for role in IMPLEMENT PLAN REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
+    [ "$(configured_agent "$role")" != claude ] || return 0
+  done
+  return 1
+}
+
+orchestration_claude_guard() { # fleet workers define per-task contracts via
+  # /loop-contract (the CONTRACT role, Claude-routed). An all-Codex single loop
+  # needs no claude CLI, but an orchestration still does — fail here, before a
+  # decompose call is spent on a fleet that could never dispatch a worker.
+  command -v "$CLAUDE_CMD" >/dev/null 2>&1 \
+    || die_next "fleet orchestration requires the Claude CLI ('$CLAUDE_CMD'): each worker defines its task contract via the Claude-routed CONTRACT role" "install Claude Code (or set LOOP_CLAUDE_CMD), or run in place: ./loop.sh run --single"
+}
+
 warn_codex_cost_untracked() {
   [ "$CODEX_COST_WARNING_EMITTED" = 0 ] || return 0
   [ -n "${MAX_COST_USD:-}" ] || return 0
@@ -941,9 +961,15 @@ warn_codex_cost_untracked() {
   journal_append "preflight" "CODEX_COST_UNTRACKED" "Codex-routed roles report no USD cost; MAX_COST_USD covers Claude calls only"
 }
 
-need_agents() { # run/fleet preflight; Claude is mandatory, Codex remains lazy
+need_agents() { # run/fleet preflight; each CLI is required only when routed-to
   local scope="${1:-}" role agent model
-  need_claude "$scope"
+  # Claude is not unconditional: an all-Codex routing must be able to run a
+  # single loop on a machine with no claude CLI at all. Fleet keeps Claude
+  # mandatory for now — worker task definition (/loop-contract) is
+  # Claude-routed (see orchestration_claude_guard for the single-run entry).
+  if [ "$scope" = fleet ] || claude_role_required; then
+    need_claude "$scope"
+  fi
   for role in IMPLEMENT PLAN REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
     agent=$(configured_agent "$role")
     [ "$agent" = codex ] || continue
@@ -8611,12 +8637,14 @@ cmd_run() {
       # orchestration start dispatches the parked tasks alongside the planned ones.
       # (run_fleet_orchestration releases the claim itself, AFTER its supervisor
       # lock is held — no window where neither is.)
+      orchestration_claude_guard
       run_fleet_orchestration resume
     fi
     if [ "$(fcfg FLEET_DECOMPOSE 1)" != "0" ]; then
       local route_mode
       route_mode=$(decide_run_mode "$force_fresh" "$require_resume" "$prefer_resume")
       if [ "$route_mode" = "fresh" ]; then
+        orchestration_claude_guard
         # --fresh restarts the LOOP fresh but still reuses an approved plan that
         # matches the contract; regenerating the plan is `./loop.sh decompose --force`
         if cmd_decompose_flow 0 1; then
