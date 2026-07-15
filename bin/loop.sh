@@ -544,6 +544,21 @@ clear_task_start_ref() { # NEW task boundary; amendments deliberately keep it
   [ -z "$path" ] || rm -f "$path"
 }
 
+discard_worktree_slot() { # $1 worktree — remove its off-tree approval slot.
+  # MUST run BEFORE `git worktree remove` (the slot id derives from the
+  # worktree's git dir, unresolvable afterwards). Fleet worktrees are
+  # recreated at a DETERMINISTIC path, so a surviving slot silently binds the
+  # successor: record_task_start_ref is write-once, and a redo/requeue would
+  # inherit the OLD task baseline instead of recording the merged HEAD.
+  # Best-effort removal; approval_home=repo keeps no off-tree slots.
+  local slot=""
+  [ "$(approval_home)" != "repo" ] || return 0
+  [ -n "$1" ] && [ -d "$1" ] || return 0
+  slot=$(cd "$1" 2>/dev/null && approval_slot) || slot=""
+  [ -z "$slot" ] || rm -rf "$slot" 2>/dev/null || true
+  return 0
+}
+
 verify_approval() { # dies unless both hashes match the approved ones
   [ -f .loop/approved ] || die "contract not approved — review .loop/docs/product-contract.md + loop.config.sh, then: ./loop.sh approve"
   if [ "$(cat .loop/approved)" != "$(contract_hash)" ]; then
@@ -2926,6 +2941,7 @@ claim_task() { # $1 id — new/ -> claimed/ (atomic), then bootstrap + contract 
   if bootstrap_worktree "$id"; then
     start_contract_gen "$id"
   else
+    discard_worktree_slot "$(wt_path "$id")"
     git worktree remove --force "$(wt_path "$id")" >/dev/null 2>&1 || true
     git branch -D "loop/$id" >/dev/null 2>&1 || true
     task_fail "$id" BOOTSTRAP_FAILED "worktree/setup failed — see $RUNS_DIR/$id/plan.log"
@@ -4120,6 +4136,8 @@ EOF
       # would lose the work, keeping the name would block the re-claim's
       # `git worktree add -b`. A second conflict goes to a human, same as any
       # manual task.
+      discard_worktree_slot "$wt"   # the redo's fresh worktree (same path) must
+                                    # record its OWN task baseline (merged HEAD)
       git worktree remove --force "$wt" >/dev/null 2>&1 || true
       git worktree prune 2>/dev/null || true
       git branch -m "$branch" "$branch-conflict-1" 2>/dev/null || true
@@ -4419,6 +4437,7 @@ recover_claimed() { # supervisor (re)start: adopt whatever the previous one left
         # requeue class, and stays defensive against any future claimed:queued path.
         # NOTE: a claim that crashed mid-bootstrap carries NO phase (enqueue never
         # sets one), so it correctly falls to the STALE_BOOTSTRAP catch-all below.
+        discard_worktree_slot "$(wt_path "$id")"
         git worktree remove --force "$(wt_path "$id")" >/dev/null 2>&1 || true
         git branch -D "loop/$id" >/dev/null 2>&1 || true
         git worktree prune 2>/dev/null || true
@@ -4428,6 +4447,7 @@ recover_claimed() { # supervisor (re)start: adopt whatever the previous one left
       *)
         # no/unknown phase = the previous supervisor died mid-bootstrap; the
         # worktree may be half-built — fail it cleanly so it can be re-added
+        discard_worktree_slot "$(wt_path "$id")"
         git worktree remove --force "$(wt_path "$id")" >/dev/null 2>&1 || true
         git branch -D "loop/$id" >/dev/null 2>&1 || true
         task_fail "$id" STALE_BOOTSTRAP "supervisor died mid-bootstrap — re-queue with: ./loop.sh fleet add $QUEUE_DIR/failed/$id.md" ;;
@@ -4984,6 +5004,7 @@ fleet_resume_flip() { # $1 id, [$2 internal: "recursed" bounds the stale-running
       # nothing runnable exists yet (no contract / broken worktree) — a
       # relaunch would die at verify_approval. Scrap the artifacts and
       # re-queue the task for a completely fresh claim instead.
+      discard_worktree_slot "$(renv_get "$id" WT "")"
       git worktree remove --force "$(renv_get "$id" WT "")" >/dev/null 2>&1 || true
       git branch -D "loop/$id" >/dev/null 2>&1 || true
       git worktree prune 2>/dev/null || true
@@ -5200,6 +5221,7 @@ clean_orphans() { # gc: worktrees under $WT_ROOT and loop/* branches whose task 
       fnote "[$id] a live process (pid $pid) holds .loop/run.pid in this worktree — not cleaning; stop it first"
       continue
     fi
+    discard_worktree_slot "$wt"
     [ ! -d "$wt" ] || git worktree remove --force "$wt" >/dev/null 2>&1 || true
     git branch -D "loop/$id" >/dev/null 2>&1 || true
     if git rev-parse -q --verify "loop/$id" >/dev/null 2>&1; then
@@ -5214,7 +5236,7 @@ clean_orphans() { # gc: worktrees under $WT_ROOT and loop/* branches whose task 
 }
 
 clean_one() { # $1 id, $2 force
-  local id="$1" force="$2" qd wt branch slot=""
+  local id="$1" force="$2" qd wt branch
   qd=$(task_qdir "$id")
   [ -n "$qd" ] || { fnote "unknown task: $id"; return 0; }
   if [ "$qd" != "done" ] && [ "$force" != "1" ]; then
@@ -5231,14 +5253,10 @@ clean_one() { # $1 id, $2 force
   esac
   wt=$(renv_get "$id" WT "")
   branch=$(renv_get "$id" BRANCH "")
-  # approval-store hygiene: compute the worktree's slot BEFORE the worktree is
-  # removed (its git dir is unresolvable afterwards). Removal is best-effort —
-  # a leftover slot is ~130 bytes of garbage, swept wholesale by `uninstall`.
-  if [ "$(approval_home)" != "repo" ] && [ -n "$wt" ] && [ -d "$wt" ]; then
-    slot=$(cd "$wt" 2>/dev/null && approval_slot) || slot=""
-  fi
+  # approval-store hygiene: discard_worktree_slot resolves the slot from the
+  # live worktree BEFORE removal (its git dir is unresolvable afterwards)
+  discard_worktree_slot "$wt"
   if [ -n "$wt" ]; then git worktree remove --force "$wt" >/dev/null 2>&1 || true; fi
-  [ -z "$slot" ] || rm -rf "$slot" 2>/dev/null || true
   if [ -n "$branch" ]; then git branch -D "$branch" >/dev/null 2>&1 || true; fi
   if [ -n "$branch" ] && git rev-parse -q --verify "$branch" >/dev/null 2>&1; then
     # never silently leave an orphan branch behind (git busy — e.g. a supervisor merging)
