@@ -1705,6 +1705,12 @@ run_stop_eval() { # $1 iter, $2 pre-ref -> updates futility + MET counters; may 
     # just-finished iteration still has a green verify log and closed ledger,
     # checklist and observation obligations. A failed preflight breaks the
     # streak: the streak means consecutive *deterministically eligible* METs.
+    # Pin discipline: the manifest must be UNCHANGED going in (the stop-eval
+    # reader call sits between the last check and here), because the re-pin
+    # after the trusted preflight stamper below would otherwise adopt — and
+    # so launder — a manifest replaced outside the evaluator.
+    observation_manifest_intact \
+      || finish RISK_REQUIRES_APPROVAL "observations-manifest changed before the stop-eval preflight — outside the trusted evaluator; review the change, restore the manifest, or start a new approved task"
     if ! preflight_line=$("$evaluator" --pre-ref "$pre_ref" --preflight \
           --approved-hash "$RUN_CONTRACT_HASH"); then
       preflight_line="CONTINUE deterministic preflight crashed"
@@ -2106,6 +2112,11 @@ run_success_gate() { # $1 iter, $2 run-start-ref, $3 pre-ref, $4 forced (0|1)
   # preflight result into certification. This catches a task-tree/observation
   # change made between candidate evaluation and the gate without paying for a
   # reviewer first.
+  # Same pin discipline as run_stop_eval: an unchanged manifest is a
+  # precondition for entering the trusted preflight stamper — the re-pin
+  # below must only ever adopt the stamper's own writes.
+  observation_manifest_intact \
+    || finish RISK_REQUIRES_APPROVAL "observations-manifest changed before the success-gate preflight — outside the trusted evaluator; review the change, restore the manifest, or start a new approved task"
   if ! preflight_line=$("$evaluator" --pre-ref "$pre" --preflight \
         --approved-hash "$RUN_CONTRACT_HASH"); then
     preflight_line="CONTINUE deterministic preflight crashed"
@@ -8019,6 +8030,14 @@ run_iteration_loop() { # $1 i $2 run_start_ref $3 agent_failures $4 gate_revise 
     if ! state_line=$("$evaluator" --pre-ref "$pre_ref" --approved-hash "$RUN_CONTRACT_HASH"); then
       state_line="BLOCKED external evaluator crashed"
     fi
+    # The normal evaluator validates but never writes the observations
+    # manifest; its VERIFY_COMMANDS are arbitrary project shell, so any
+    # manifest change across this call is tampering, not a stamp. Catch it
+    # HERE — the stop-eval/gate paths re-pin after their trusted --preflight
+    # stamper, and a check only at the next iteration head would let a
+    # MET/candidate path launder the replaced manifest through that re-pin.
+    observation_manifest_intact \
+      || finish RISK_REQUIRES_APPROVAL "observations-manifest changed during iteration $i's verification commands — only the evaluator's preflight stamper may write it; review the change, restore the manifest, or start a new approved task"
     state=${state_line%% *}
     reason=${state_line#* }
     if [ "$reason" = "$state_line" ]; then reason=""; fi
