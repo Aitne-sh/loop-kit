@@ -358,6 +358,7 @@ run_id=$(json_scalar "$CERT" run_id)
 check "certificate final_state" success SUCCESS "$(json_scalar "$CERT" final_state)"
 check "certificate review verdict" success APPROVE "$(json_scalar "$CERT" review_verdict)"
 check "certificate records the actual single-task preflight" success PASS "$(json_scalar "$CERT" preflight)"
+check "single-task certificate has no worker evidence bundle" success "" "$(json_scalar "$CERT" worker_evidence_sha256)"
 check "certificate task id matches live task" success "$(cat .loop/task-id)" "$task_id"
 if [ -d ".loop/logs/$task_id/$run_id" ] && [ -s ".loop/logs/$task_id/$run_id/iter-1-review-gate.json" ]; then
   ok "agent logs namespaced by task/run"
@@ -1857,6 +1858,171 @@ make_fixture met-clear
 run_loop "BAD_FIX,BAD_FIX" "APPROVE" "MET,CONTINUE"
 if [ ! -f .loop/stop-nudge.md ]; then ok "nudge removed on non-MET"; else bad "stale nudge left" met-clear; fi
 check "met streak reset" met-clear 0 "$(cat .loop/met-count 2>/dev/null || echo missing)"
+
+echo "== near-miss verdict tokens are not verdicts (boundary-enforced parser) =="
+# STOP-EVAL: METHOD must read as CONTINUE (a prefix match would count it as MET
+# and force the gate after two of them)
+make_fixture verdict-nearmiss-stopeval
+seed_ledger_met
+run_loop "CONTINUE_FIX,NO_DIFF,NO_DIFF" "APPROVE" "METHOD,METHOD,METHOD"
+check "exit code 4 (stalls, never forced)" verdict-nearmiss-stopeval 4 "$RC"
+check "state STALLED" verdict-nearmiss-stopeval STALLED "$STATE"
+if ! grep -q '"state": "FORCED_GATE"' .loop/journal.jsonl; then ok "METHOD never counted as MET"; else bad "forced gate fired on STOP-EVAL: METHOD" verdict-nearmiss-stopeval; fi
+if grep -q '"state": "STOP_EVAL_CONTINUE"' .loop/journal.jsonl; then ok "near-miss stop verdict journaled as CONTINUE"; else bad "STOP_EVAL_CONTINUE missing" verdict-nearmiss-stopeval; fi
+
+echo "== gate reviewer saying VERDICT: APPROVED is not an APPROVE =="
+make_fixture verdict-nearmiss-gate
+run_loop "READY_NOW,READY_NOW,READY_NOW" "APPROVED_TYPO"
+check "exit code 4" verdict-nearmiss-gate 4 "$RC"
+check "state BLOCKED (never certified)" verdict-nearmiss-gate BLOCKED "$STATE"
+if ! grep -q '"state": "SUCCESS"' .loop/journal.jsonl; then ok "APPROVED never certified success"; else bad "near-miss APPROVED reached SUCCESS" verdict-nearmiss-gate; fi
+if grep -q 'unparseable' .loop/journal.jsonl; then ok "near-miss verdict recorded as unparseable"; else bad "unparseable telemetry missing" verdict-nearmiss-gate; fi
+
+echo "== gate per-REQ verdict REQ-001: METICULOUS is not MET (downgrade) =="
+make_fixture verdict-nearmiss-req
+run_loop "READY_NOW,READY_NOW" "APPROVE_NEARMISS_REQ,APPROVE"
+check "exit code 0 (clean table on retry passes)" verdict-nearmiss-req 0 "$RC"
+if grep -q 'harness downgrade' .loop/journal.jsonl; then ok "near-miss per-REQ verdict downgraded the APPROVE"; else bad "no downgrade on METICULOUS" verdict-nearmiss-req; fi
+
+echo "== forged .loop/met-count cannot force the gate after a single MET =="
+# the file is a display mirror; the authoritative streak lives in process
+# memory. A verify command forges 999999 into the file every evaluator pass.
+make_fixture met-forge
+seed_ledger_met
+printf '#!/bin/sh\necho 999999 > .loop/met-count\ngrep -q fixed value.txt\n' > check.sh
+git add -A && git commit -q -m "forging verify"
+run_loop "CONTINUE_FIX,NO_DIFF,NO_DIFF" "APPROVE" "MET,CONTINUE,CONTINUE"
+check "exit code 4 (stalls, not forced)" met-forge 4 "$RC"
+check "state STALLED" met-forge STALLED "$STATE"
+if ! grep -q '"state": "FORCED_GATE"' .loop/journal.jsonl; then ok "one MET + forged count never forced the gate"; else bad "forged met-count forced the gate" met-forge; fi
+
+echo "== garbage .loop/met-count neither crashes the run nor blocks a real streak =="
+make_fixture met-garbage
+seed_ledger_met
+printf '#!/bin/sh\necho abc > .loop/met-count\ngrep -q fixed value.txt\n' > check.sh
+git add -A && git commit -q -m "garbage-writing verify"
+run_loop "CONTINUE_FIX,NO_DIFF" "APPROVE" "MET,MET"
+check "exit code 0 (in-memory streak still forces at 2)" met-garbage 0 "$RC"
+check "state SUCCESS" met-garbage SUCCESS "$STATE"
+if grep -q '"state": "FORCED_GATE"' .loop/journal.jsonl; then ok "real MET x2 forced the gate despite file garbage"; else bad "FORCED_GATE missing with garbage mirror" met-garbage; fi
+
+echo "== duplicate ledger rows (met + regressed) are a contradiction, not met =="
+for order in met-first regressed-first; do
+  make_fixture "ledger-dup-$order"
+  printf 'REVIEW_MODE="off"\n' >> loop.config.sh
+  if [ "$order" = met-first ]; then
+    cat > .loop/docs/requirements-ledger.md <<'EOF'
+# Requirements Ledger
+
+| REQ | Status | Evidence | Iter |
+|---|---|---|---|
+| REQ-001 | met | value.txt fixed | 1 |
+| REQ-001 | regressed | broke again | 2 |
+EOF
+  else
+    cat > .loop/docs/requirements-ledger.md <<'EOF'
+# Requirements Ledger
+
+| REQ | Status | Evidence | Iter |
+|---|---|---|---|
+| REQ-001 | regressed | broke again | 2 |
+| REQ-001 | met | value.txt fixed | 1 |
+EOF
+  fi
+  git add -A && git commit -q -m "contradictory ledger ($order)"
+  ./loop.sh approve >/dev/null
+  run_loop "CONTINUE_GREEN,NO_DIFF,NO_DIFF" "APPROVE" "MET"
+  if [ "$RC" -ne 0 ] && ! grep -q '"state": "SUCCESS"' .loop/journal.jsonl; then
+    ok "contradictory ledger never reached SUCCESS ($order)"
+  else
+    bad "duplicate REQ rows promoted to SUCCESS ($order)" "ledger-dup-$order"
+  fi
+  if grep -q 'duplicate rows' .loop/journal.jsonl; then ok "refusal names the duplicate rows ($order)"; else bad "duplicate-row reason missing ($order)" "ledger-dup-$order"; fi
+done
+
+echo "== verify command replacing the observations manifest is caught immediately =="
+make_fixture manifest-verify-tamper
+printf '{"ac_id":"AC-OLD","artifact_path":".loop/observations/old.log","artifact_sha256":"deadbeef"}\n' > .loop/observations-manifest.jsonl
+# tamper only once the agent fixed value.txt: the baseline pass must stay clean
+# so the run pins the seeded manifest, and the FIRST post-fix evaluator pass
+# (which runs this file) swaps it — the old code laundered that swap through
+# the stop-eval/gate re-pin
+printf '#!/bin/sh\nif grep -q fixed value.txt; then echo evil > .loop/observations-manifest.jsonl; fi\ngrep -q fixed value.txt\n' > check.sh
+git add -A && git commit -q -m "manifest-replacing verify"
+run_loop "READY_NOW"
+check "exit code 3" manifest-verify-tamper 3 "$RC"
+check "state RISK_REQUIRES_APPROVAL" manifest-verify-tamper RISK_REQUIRES_APPROVAL "$STATE"
+if grep -q "verification commands" "$WORK/last-run.out"; then ok "reason names the verification commands"; else bad "tamper reason missing" manifest-verify-tamper; fi
+if ! grep -q '"state": "SUCCESS"' .loop/journal.jsonl; then ok "manifest swap never certified"; else bad "manifest swap reached SUCCESS" manifest-verify-tamper; fi
+
+echo "== report citing observations only through a /tmp alias is invalid =="
+make_fixture report-alias
+mkdir -p .loop/observations
+printf 'screenshot bytes\n' > .loop/observations/shot.png
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the page visibly renders | run | verified | .loop/observations/shot.png |
+EOF
+git add -A && git commit -q -m "verified run row with real observation"
+./loop.sh approve >/dev/null
+export LOOP_FAKE_EVIDENCE=PREFIX_ALIAS
+run_loop "READY_NOW"
+unset LOOP_FAKE_EVIDENCE
+check "exit code 4" report-alias 4 "$RC"
+check "state BLOCKED" report-alias BLOCKED "$STATE"
+if grep -q "report omits checklist observation" "$WORK/last-run.out"; then ok "prefix-aliased citation rejected as an omission"; else bad "alias citation accepted" report-alias; fi
+
+echo "== same-second fresh restarts get distinct run ids and prevrun archives =="
+make_fixture same-second
+mkdir -p fakebin
+cat > fakebin/date <<'EOF'
+#!/bin/sh
+# frozen clock: every format renders the same instant (BSD -r / GNU -d @)
+if /bin/date -u -r 1700000000 +%s >/dev/null 2>&1; then
+  exec /bin/date -u -r 1700000000 "$@"
+fi
+exec /bin/date -u -d @1700000000 "$@"
+EOF
+chmod +x fakebin/date
+for i in 1 2 3; do
+  RC=0
+  PATH="$PWD/fakebin:$PATH" LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+    LOOP_FAKE_REVIEW="APPROVE" LOOP_FAKE_STOPEVAL="CONTINUE" \
+    ./loop.sh run >"$WORK/same-second-$i.out" 2>&1 </dev/null || RC=$?
+  check "frozen-clock run $i completes" same-second 0 "$RC"
+done
+tid=$(cat .loop/task-id)
+n_runs=$(find ".loop/logs/$tid" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+check "three distinct run log dirs under one frozen second" same-second 3 "$n_runs"
+n_prev=$(find .loop/docs/run-archive -mindepth 1 -maxdepth 1 -type d -name '*-prevrun*' | wc -l | tr -d ' ')
+check "two distinct prevrun archives (no hybrid dir)" same-second 2 "$n_prev"
+for d in .loop/docs/run-archive/*-prevrun*; do
+  if [ -f "$d/evidence-report.md" ]; then ok "prevrun archive intact: $(basename "$d")"; else bad "prevrun archive missing report: $(basename "$d")" same-second; fi
+done
+
+echo "== a second run cannot enter the cold-start window (atomic claim) =="
+make_fixture coldstart-claim
+printf '#!/bin/sh\nsleep 1\ngrep -q fixed value.txt\n' > check.sh
+git add -A && git commit -q -m "slow verify"
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" LOOP_FAKE_REVIEW="APPROVE" LOOP_FAKE_STOPEVAL="CONTINUE" \
+  ./loop.sh run >"$WORK/coldstart-a.out" 2>&1 </dev/null &
+CS=$!
+# deterministic entry into the window: wait for A's claim, then race B while
+# A is still inside its (deliberately slowed) baseline verify
+n=0
+while [ "$n" -lt 100 ] && [ ! -d .loop/run-claim.lock.d ]; do sleep 0.05; n=$((n + 1)); done
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" LOOP_FAKE_REVIEW="APPROVE" LOOP_FAKE_STOPEVAL="CONTINUE" \
+  ./loop.sh run >"$WORK/coldstart-b.out" 2>&1 </dev/null || RC=$?
+check "second run refused during the cold-start window" coldstart-claim 2 "$RC"
+if grep -q "already starting" "$WORK/coldstart-b.out"; then ok "claim refusal names the starting run"; else bad "no claim refusal message: $(head -2 "$WORK/coldstart-b.out")" coldstart-claim; fi
+wait_sup "$CS" coldstart-claim
+check "first run still completes" coldstart-claim 0 "$RC"
+check "state SUCCESS" coldstart-claim SUCCESS "$(cat .loop/state)"
+if [ ! -d .loop/run-claim.lock.d ]; then ok "cold-start claim released"; else bad "claim dir left behind" coldstart-claim; fi
 
 echo "== a stop-evaluator outage breaks the qualified MET streak =="
 make_fixture met-error-reset
@@ -4426,11 +4592,63 @@ if [ -f "$wa/.loop/master-contract.md" ]; then ok "master contract injected into
 if [ -f .loop/docs/evidence-report.md ] && ! grep -q '<!-- TEMPLATE -->' .loop/docs/evidence-report.md; then ok "master evidence report written"; else bad "master evidence missing" orch-par; fi
 if [ -s .loop/docs/certification.json ]; then
   check "integration certificate marks per-task preflight N/A" orch-par NOT_APPLICABLE "$(json_scalar .loop/docs/certification.json preflight)"
+  bundle=$(json_scalar .loop/docs/certification.json worker_evidence_sha256)
+  if printf '%s' "$bundle" | grep -qE '^[0-9a-f]{64}$'; then
+    ok "integration certificate binds the worker evidence bundle"
+  else
+    bad "worker_evidence_sha256 missing/malformed: '$bundle'" orch-par
+  fi
 else
   bad "integration certification.json missing" orch-par
 fi
+if grep -q 'run-archive/part-a' .loop/docs/evidence-report.md \
+   && grep -q 'run-archive/part-b' .loop/docs/evidence-report.md; then
+  ok "master evidence report covers both merged task archives"
+else
+  bad "master report missing merged-task archive coverage" orch-par
+fi
 merges=$(git log --format=%s | grep -c '^fleet: merge' || true)
 if [ "$merges" -ge 1 ]; then ok "serial merge(s) landed ($merges)"; else bad "no merge commits" orch-par; fi
+
+echo "== orch: final-verify tampering with the contract is caught before certification =="
+make_orch_fixture orch-tamper-final 2
+# the tamper arms only at the parent's integration gate: workers have no
+# .loop/fleet, and the parent runs no evaluator before the gate's --final
+cat > check.sh <<'EOF'
+#!/bin/sh
+if [ -f .loop/fleet/base-ref ] && [ -n "$(ls .loop/docs/run-archive 2>/dev/null)" ]; then
+  echo "<!-- gate tamper -->" >> .loop/docs/product-contract.md
+fi
+grep -q fixed value.txt
+EOF
+git add -A && git commit -q -m "gate-tampering verify"
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_DECOMPOSE=TWO_PAR LOOP_FAKE_SCENARIO=READY_NOW \
+  ./loop.sh run >"$WORK/orch-tamper-final.out" 2>&1 </dev/null || RC=$?
+check "exit 4" orch-tamper-final 4 "$RC"
+check "state BLOCKED" orch-tamper-final BLOCKED "$(cat .loop/state)"
+if grep -q "integration certification inputs changed after the evidence snapshot" "$WORK/orch-tamper-final.out"; then
+  ok "post-final authority re-check caught the tamper"
+else
+  bad "post-final tamper not named" orch-tamper-final
+fi
+if [ ! -s .loop/docs/certification.json ]; then ok "tampered gate was never certified"; else bad "certificate written over a tampered contract" orch-tamper-final; fi
+
+echo "== orch: master report omitting a merged worker's archive is refused; stale archives are superseded =="
+make_orch_fixture orch-omit 2
+mkdir -p .loop/docs/run-archive/part-a
+echo stale > .loop/docs/run-archive/part-a/stale-marker.txt
+git add -A && git commit -q -m "stale archive from a previous orchestration"
+RC=0
+LOOP_FAKE_EVIDENCE=OMIT_MERGED LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_DECOMPOSE=TWO_PAR LOOP_FAKE_SCENARIO=READY_NOW \
+  ./loop.sh run >"$WORK/orch-omit.out" 2>&1 </dev/null || RC=$?
+check "exit 4" orch-omit 4 "$RC"
+check "state BLOCKED" orch-omit BLOCKED "$(cat .loop/state)"
+if grep -q "evidence report omits merged task" "$WORK/orch-omit.out"; then ok "omitted worker coverage refused"; else bad "omission not named" orch-omit; fi
+set -- .loop/docs/run-archive/part-a-superseded-*/stale-marker.txt
+if [ -f "$1" ]; then ok "stale same-id archive retired to a superseded dir"; else bad "stale archive not superseded" orch-omit; fi
+if [ ! -e .loop/docs/run-archive/part-a/stale-marker.txt ]; then ok "fresh archive is pure (no hybrid)"; else bad "hybrid archive: stale marker inside the new archive" orch-omit; fi
+if [ -s .loop/docs/run-archive/part-a/certification.json ]; then ok "fresh archive carries the worker certificate"; else bad "worker certificate missing from fresh archive" orch-omit; fi
 
 echo "== orch: chained decomposition serializes (dependent branches from the merge) =="
 make_orch_fixture orch-chain 2
@@ -5100,6 +5318,7 @@ LOOP_CLAUDE_CMD="$FAKE" ./loop.sh fleet add task-b.md >/dev/null 2>&1
 idb=$(fleet_task_id bravo)
 printf 'PLANNED=1\nREQS=REQ-001\n' >> ".loop/fleet/runs/$ida.env"
 printf 'PLANNED=1\nREQS=REQ-001\n' >> ".loop/fleet/runs/$idb.env"
+base0=$(git rev-parse HEAD)   # pre-fleet base: the redo must NOT keep this as its task baseline
 RC=0
 LOOP_CLAUDE_CMD="$FAKE" ./loop.sh fleet run --drain --max-parallel 2 > "$WORK/fleet-credo.out" 2>&1 </dev/null &
 SUP=$!
@@ -5134,6 +5353,23 @@ check "failed queue empty" fleet-credo 0 "$(qcount failed)"
 if grep -q '"event": "MERGE_CONFLICT_REDO"' .loop/fleet/journal.jsonl; then ok "redo journaled"; else bad "MERGE_CONFLICT_REDO missing" fleet-credo; fi
 check "conflicting branch archived for autopsy" fleet-credo 1 "$(git branch --list 'loop/*-conflict-1' | wc -l | tr -d ' ')"
 check "parent value converged" fleet-credo fixed "$(cat value.txt)"
+# the redo removed the old worktree; its off-tree slot must have gone with it,
+# so the redo's fresh run records a NEW task baseline (the merged HEAD) instead
+# of inheriting the stale write-once ref recorded before the sibling merged
+rwt=$(fleet_wt "$rid")
+if [ -n "$rid" ] && [ -d "$rwt" ]; then
+  rcommon=$(cd "$rwt" && git rev-parse --git-common-dir)
+  case "$rcommon" in /*) ;; *) rcommon="$rwt/$rcommon" ;; esac
+  rgitdir=$(cd "$rwt" && git rev-parse --absolute-git-dir)
+  tref=$(cat "$LOOP_APPROVAL_HOME/$(printf '%s' "$rcommon" | sha256)/$(printf '%s' "$rgitdir" | sha256)/task-start-ref" 2>/dev/null || echo missing)
+  if [ "$tref" != "$base0" ] && [ "$tref" != missing ]; then
+    ok "redo re-recorded its task baseline from the merged HEAD"
+  else
+    bad "redo kept the stale pre-fleet task baseline ($tref)" fleet-credo
+  fi
+else
+  bad "redo worktree missing for the slot assertion" fleet-credo
+fi
 
 echo "== update: fleet.config.sh self-heals a missing key (append), idempotently =="
 make_fixture drift-note

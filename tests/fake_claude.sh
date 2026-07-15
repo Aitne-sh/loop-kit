@@ -787,12 +787,31 @@ EOF
         {
           echo
           echo "## 4. Observation artifacts"
-          printf '%s\n' "$obs_paths" | sed 's/^/- /'
+          if [ "${LOOP_FAKE_EVIDENCE:-}" = "PREFIX_ALIAS" ]; then
+            # cite every observation through a /tmp/ prefix alias: the harness's
+            # boundary-anchored parser must NOT normalize these to the canonical
+            # tokens, so the report reads as omitting its checklist observations
+            printf '%s\n' "$obs_paths" | sed 's|^|- /tmp/|'
+          else
+            printf '%s\n' "$obs_paths" | sed 's/^/- /'
+          fi
         } >> .loop/docs/evidence-report.md
       fi
     fi
     if [ "${LOOP_FAKE_EVIDENCE:-}" = "BAD_REPORT_REF" ]; then
       echo '- .loop/observations/not-in-checklist.log' >> .loop/docs/evidence-report.md
+    fi
+    # fleet integration gate: the harness passes merged=<id,...> and refuses a
+    # master report that omits any merged task's archive — mirror the real
+    # skill's per-task coverage unless a test opts into the omission
+    # (LOOP_FAKE_EVIDENCE=OMIT_MERGED)
+    merged_arg=$(printf '%s\n' "$PROMPT" | grep -oE 'merged=[a-z0-9,-]+' | head -1 | sed 's/^merged=//' || true)
+    if [ -n "$merged_arg" ] && [ "${LOOP_FAKE_EVIDENCE:-}" != "OMIT_MERGED" ]; then
+      {
+        echo
+        echo "## 5. Merged task evidence"
+        printf '%s\n' "$merged_arg" | tr ',' '\n' | sed '/^$/d; s|^|- .loop/docs/run-archive/|; s|$|/acceptance-checklist.md|'
+      } >> .loop/docs/evidence-report.md
     fi
     # the harness passes html=on|auto|off; `on` forces authoring, `auto` applies
     # the skill rubric (this fake plays a trivial run -> skipped), `off` stays
@@ -872,6 +891,14 @@ EOF
       APPROVE_UNMET)
         # holistic APPROVE contradicting its own analytic table — must downgrade
         emit_json "$cost" "$(req_verdict_lines UNMET)VERDICT: APPROVE change is sound (but one REQ is UNMET)" ;;
+      APPROVED_TYPO)
+        # near-miss verdict token: the boundary-enforced parser must NOT read
+        # APPROVED as APPROVE — expect the format retry, then the REVISE fallback
+        emit_json "$cost" "${reqlines}VERDICT: APPROVED change is sound (near-miss token)" ;;
+      APPROVE_NEARMISS_REQ)
+        # per-REQ near-miss: the first REQ's verdict word extends MET — the
+        # analytic table check must treat it as missing and downgrade APPROVE
+        emit_json "$cost" "$(req_verdict_lines METICULOUS)VERDICT: APPROVE change is sound (per-REQ near-miss)" ;;
       ESCALATE)
         emit_json "$cost" "AS-1: human-required - the contract cannot adjudicate this default.\n\nVERDICT: ESCALATE should the export include archived records?" ;;
       APPROVE_DECORATED)
