@@ -1737,15 +1737,25 @@ EOF
   fi
 }
 
-unmet_ledger_reqs() { # -> space-prefixed list of contract REQ ids (headings) with
-  # no `met` row in the requirements ledger; empty when all met (or no REQ
-  # headings). Mirror of evaluate.sh's 6.5 rule — keep the grep in sync.
-  local rid req_ids out=""
+unmet_ledger_reqs() { # -> space-prefixed list of contract REQ ids (headings) that
+  # do NOT have exactly one ledger row with status exactly `met`; empty when all
+  # met (or no REQ headings). Mirror of evaluate.sh's 6.5 rule — keep the awk in
+  # sync: duplicate rows for one REQ (e.g. met + regressed) are a contradiction
+  # and count as unmet, matching the evaluator's strict parse.
+  local rid req_ids out="" ledger_rows row
   req_ids=$(req_ids_from_contract)
   [ -n "$req_ids" ] || { printf ''; return 0; }
+  ledger_rows=$(awk -F'|' '
+    /^\|[[:space:]]*REQ-[0-9]+[[:space:]]*\|/ {
+      id=$2; st=$3
+      gsub(/^[ \t]+/,"",id); gsub(/[ \t]+$/,"",id)
+      gsub(/^[ \t]+/,"",st); gsub(/[ \t]+$/,"",st)
+      n[id]++; s[id]=st
+    }
+    END { for (id in n) if (n[id] == 1 && s[id] == "met") print id }
+  ' .loop/docs/requirements-ledger.md 2>/dev/null || true)
   while IFS= read -r rid; do
-    grep -qE "^\|[[:space:]]*${rid}[[:space:]]*\|[[:space:]]*met[[:space:]]*\|" \
-      .loop/docs/requirements-ledger.md 2>/dev/null || out="$out $rid"
+    printf '%s\n' "$ledger_rows" | grep -qx "$rid" || out="$out $rid"
   done <<EOF
 $req_ids
 EOF

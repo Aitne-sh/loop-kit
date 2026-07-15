@@ -528,10 +528,31 @@ if { [ "$PREFLIGHT" -eq 1 ] \
   req_ids=$(grep -E '^#{1,6}[[:space:]]*REQ-[0-9]+' .loop/docs/product-contract.md 2>/dev/null \
             | grep -oE 'REQ-[0-9]+' | sort -u || true)
   if [ -n "$req_ids" ]; then
+    # One awk pass over the ledger: per REQ, its row COUNT and last status.
+    # A REQ is satisfied only by EXACTLY ONE row whose status is exactly
+    # `met` — a duplicate row pair (e.g. `met` + `regressed`, either order)
+    # is a contradiction, not evidence, and a bare met-row grep would accept
+    # it. Row grammar: `| REQ-nnn | status | evidence | iter |` (cells never
+    # contain `|`, field 3 is the status; same trim style as 6.6).
+    ledger_rows=$(awk -F'|' '
+      /^\|[[:space:]]*REQ-[0-9]+[[:space:]]*\|/ {
+        id=$2; st=$3
+        gsub(/^[ \t]+/,"",id); gsub(/[ \t]+$/,"",id)
+        gsub(/^[ \t]+/,"",st); gsub(/[ \t]+$/,"",st)
+        n[id]++; s[id]=st
+      }
+      END { for (id in n) print id "\t" n[id] "\t" s[id] }
+    ' .loop/docs/requirements-ledger.md 2>/dev/null || true)
     unmet=""
     while IFS= read -r rid; do
-      grep -qE "^\|[[:space:]]*${rid}[[:space:]]*\|[[:space:]]*met[[:space:]]*\|" \
-        .loop/docs/requirements-ledger.md 2>/dev/null || unmet="$unmet $rid"
+      row=$(printf '%s\n' "$ledger_rows" | awk -F'\t' -v want="$rid" '$1 == want { print; exit }')
+      if [ -z "$row" ]; then
+        unmet="$unmet $rid(no row)"
+      elif [ "$(printf '%s' "$row" | awk -F'\t' '{print $2}')" != "1" ]; then
+        unmet="$unmet $rid(duplicate rows)"
+      elif [ "$(printf '%s' "$row" | awk -F'\t' '{print $3}')" != "met" ]; then
+        unmet="$unmet $rid($(printf '%s' "$row" | awk -F'\t' '{print ($3 == "" ? "?" : $3)}'))"
+      fi
     done <<EOF
 $req_ids
 EOF
