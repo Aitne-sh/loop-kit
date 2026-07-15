@@ -729,6 +729,21 @@ run_loop "BAD_FIX,BAD_FIX" "APPROVE" "FUTILE,FUTILE"
 check "exit code 4" futile 4 "$RC"
 check "state STALLED" futile STALLED "$STATE"
 
+echo "== a stop-evaluator outage breaks the FUTILE streak (crash is not a verdict) =="
+make_fixture futile-crash
+# CONTINUE_GREEN keeps verify green with fresh progress each iteration: the
+# repeat-failure/stagnation stops stay quiet, so all three stop-eval verdicts
+# actually run (BAD_FIX would trip REPEAT_FAIL_N=3 before the third one)
+run_loop "CONTINUE_GREEN,CONTINUE_GREEN,CONTINUE_GREEN" "APPROVE" "FUTILE,CRASH,FUTILE,CONTINUE"
+if ! grep -q 'judged the loop futile' .loop/journal.jsonl "$WORK/last-run.out"; then
+  ok "FUTILE -> crash -> FUTILE never counted as futile-twice"
+else
+  bad "futility STALLED fired across a stop-eval outage" futile-crash
+fi
+if grep -q '"state": "STOP_EVAL_ERROR"' .loop/journal.jsonl; then ok "outage journaled"; else bad "STOP_EVAL_ERROR missing" futile-crash; fi
+n=$(grep -c '"state": "STOP_EVAL_FUTILE"' .loop/journal.jsonl || true)
+check "both FUTILE verdicts still recorded" futile-crash 2 "$n"
+
 echo "== no_op (already green, no changes needed) =="
 make_fixture noop
 echo fixed > value.txt
@@ -2002,10 +2017,13 @@ check "two distinct prevrun archives (no hybrid dir)" same-second 2 "$n_prev"
 for d in .loop/docs/run-archive/*-prevrun*; do
   if [ -f "$d/evidence-report.md" ]; then ok "prevrun archive intact: $(basename "$d")"; else bad "prevrun archive missing report: $(basename "$d")" same-second; fi
 done
+if [ -z "$(ls -d .loop/docs/run-archive/.tmp-* 2>/dev/null)" ]; then ok "no archive staging residue after repeated resets"; else bad "staging residue left under run-archive: $(ls -d .loop/docs/run-archive/.tmp-*)" same-second; fi
 
 echo "== a second run cannot enter the cold-start window (atomic claim) =="
 make_fixture coldstart-claim
-printf '#!/bin/sh\nsleep 1\ngrep -q fixed value.txt\n' > check.sh
+# 3s window: THREE probes (run/start/fleet run) must all land inside A's
+# deliberately-slowed baseline verify
+printf '#!/bin/sh\nsleep 3\ngrep -q fixed value.txt\n' > check.sh
 git add -A && git commit -q -m "slow verify"
 LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" LOOP_FAKE_REVIEW="APPROVE" LOOP_FAKE_STOPEVAL="CONTINUE" \
   ./loop.sh run >"$WORK/coldstart-a.out" 2>&1 </dev/null &
@@ -2013,16 +2031,51 @@ CS=$!
 # deterministic entry into the window: wait for A's claim, then race B while
 # A is still inside its (deliberately slowed) baseline verify
 n=0
-while [ "$n" -lt 100 ] && [ ! -d .loop/run-claim.lock.d ]; do sleep 0.05; n=$((n + 1)); done
+while [ "$n" -lt 100 ] && [ ! -f .loop/run-claim.pid ]; do sleep 0.05; n=$((n + 1)); done
 RC=0
 LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" LOOP_FAKE_REVIEW="APPROVE" LOOP_FAKE_STOPEVAL="CONTINUE" \
   ./loop.sh run >"$WORK/coldstart-b.out" 2>&1 </dev/null || RC=$?
 check "second run refused during the cold-start window" coldstart-claim 2 "$RC"
 if grep -q "already starting" "$WORK/coldstart-b.out"; then ok "claim refusal names the starting run"; else bad "no claim refusal message: $(head -2 "$WORK/coldstart-b.out")" coldstart-claim; fi
+# the published claim record is never observable without its owner pid: the
+# ln-publish closes the mkdir-then-write init window two acquirers could split
+if [ -s .loop/run-claim.pid ] && grep -qE '^[0-9]+$' .loop/run-claim.pid; then
+  ok "claim record is complete the instant it exists (atomic ln publish)"
+else
+  bad "claim record observable without a complete owner pid" coldstart-claim
+fi
+# a NEW-task definition and a manual fleet run must also refuse the window:
+# neither sees .loop/run.pid yet, and both would mutate docs/HEAD under the
+# booting run's baseline verify
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" ./loop.sh start "another task" >"$WORK/coldstart-start.out" 2>&1 </dev/null || RC=$?
+check "start refused during the cold-start window" coldstart-claim 2 "$RC"
+if grep -q "run is starting" "$WORK/coldstart-start.out"; then ok "start refusal names the booting run"; else bad "start refusal message missing: $(head -3 "$WORK/coldstart-start.out")" coldstart-claim; fi
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" ./loop.sh fleet run --drain >"$WORK/coldstart-fleet.out" 2>&1 </dev/null || RC=$?
+check "manual fleet run refused during the cold-start window" coldstart-claim 2 "$RC"
+if grep -q "must not run together" "$WORK/coldstart-fleet.out"; then ok "fleet refusal names the split-brain rule"; else bad "fleet refusal message missing: $(head -3 "$WORK/coldstart-fleet.out")" coldstart-claim; fi
 wait_sup "$CS" coldstart-claim
 check "first run still completes" coldstart-claim 0 "$RC"
 check "state SUCCESS" coldstart-claim SUCCESS "$(cat .loop/state)"
-if [ ! -d .loop/run-claim.lock.d ]; then ok "cold-start claim released"; else bad "claim dir left behind" coldstart-claim; fi
+if [ ! -e .loop/run-claim.pid ]; then ok "cold-start claim released"; else bad "claim record left behind" coldstart-claim; fi
+printf '#!/bin/sh\ngrep -q fixed value.txt\n' > check.sh   # fast verify again for the claim-record probes
+git add -A && git commit -q -m "fast verify restored"
+# fail-closed on an unattributable record: garbage must block, never be reclaimed
+echo garbage > .loop/run-claim.pid
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" LOOP_FAKE_REVIEW="APPROVE" LOOP_FAKE_STOPEVAL="CONTINUE" \
+  ./loop.sh run --fresh >"$WORK/coldstart-garbage.out" 2>&1 </dev/null || RC=$?
+check "garbage claim record refuses the run (fail closed)" coldstart-claim 2 "$RC"
+if grep -q "already starting" "$WORK/coldstart-garbage.out"; then ok "garbage record refusal reported"; else bad "garbage record not refused: $(head -2 "$WORK/coldstart-garbage.out")" coldstart-claim; fi
+rm -f .loop/run-claim.pid
+# a DEAD holder is reclaimed automatically (the claim can never brick a repo)
+sh -c 'echo $$ > .loop/run-claim.pid'
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" LOOP_FAKE_REVIEW="APPROVE" LOOP_FAKE_STOPEVAL="CONTINUE" \
+  ./loop.sh run --fresh >"$WORK/coldstart-dead.out" 2>&1 </dev/null || RC=$?
+check "dead claim holder reclaimed" coldstart-claim 0 "$RC"
+check "state SUCCESS after reclaim" coldstart-claim SUCCESS "$(cat .loop/state)"
 
 echo "== a stop-evaluator outage breaks the qualified MET streak =="
 make_fixture met-error-reset
@@ -4650,6 +4703,39 @@ if [ -f "$1" ]; then ok "stale same-id archive retired to a superseded dir"; els
 if [ ! -e .loop/docs/run-archive/part-a/stale-marker.txt ]; then ok "fresh archive is pure (no hybrid)"; else bad "hybrid archive: stale marker inside the new archive" orch-omit; fi
 if [ -s .loop/docs/run-archive/part-a/certification.json ]; then ok "fresh archive carries the worker certificate"; else bad "worker certificate missing from fresh archive" orch-omit; fi
 
+echo "== orch: an archived worker certificate must semantically match its archive (gate refuses a forgery) =="
+# interrupt at the gate-review window (orch-gate-int's pattern), rewrite the
+# archived certificate's final_state, then resume: the gate's deterministic
+# archive verification must refuse BEFORE any reviewer/evidence agent reads it
+make_orch_fixture orch-certswap 2
+echo 3 > .loop/fake-sleep
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_DECOMPOSE=TWO_PAR LOOP_FAKE_SCENARIO=READY_NOW \
+  ./loop.sh run >"$WORK/orch-certswap1.out" 2>&1 </dev/null &
+ORCH=$!
+n=0
+while [ "$n" -lt 600 ]; do
+  grep -q 'mode=gate' .loop/fake-review-prompts 2>/dev/null && break
+  sleep 0.1; n=$((n + 1))
+done
+kill -TERM "$ORCH" 2>/dev/null || true
+wait_sup "$ORCH" orch-certswap
+rm -f .loop/fake-sleep
+check "both workers merged before the interrupt" orch-certswap 2 "$(qcount "done")"
+sed 's/"final_state":"SUCCESS"/"final_state":"NO_OP"/' .loop/docs/run-archive/part-a/certification.json > cert.tmp \
+  && mv cert.tmp .loop/docs/run-archive/part-a/certification.json
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_DECOMPOSE=TWO_PAR LOOP_FAKE_SCENARIO=READY_NOW \
+  ./loop.sh run >"$WORK/orch-certswap2.out" 2>&1 </dev/null || RC=$?
+check "exit 4" orch-certswap 4 "$RC"
+check "state BLOCKED" orch-certswap BLOCKED "$(cat .loop/state)"
+if grep -q "archived certificate records final_state" "$WORK/orch-certswap2.out"; then
+  ok "certificate/archive mismatch named deterministically"
+else
+  bad "forged certificate not refused: $(grep -o 'BLOCKED.*' "$WORK/orch-certswap2.out" | head -1)" orch-certswap
+fi
+if [ ! -s .loop/docs/certification.json ]; then ok "no integration certificate over a forged worker cert"; else bad "certified over a forged worker certificate" orch-certswap; fi
+
 echo "== orch: chained decomposition serializes (dependent branches from the merge) =="
 make_orch_fixture orch-chain 2
 RC=0
@@ -4660,6 +4746,31 @@ check "state SUCCESS" orch-chain SUCCESS "$(cat .loop/state)"
 base_b=$(grep -E '^BASE_REF=' ".loop/fleet/runs/part-b.env" | tail -1 | cut -d= -f2-)
 merge_in_base=$(git log --format=%s "$base_b" 2>/dev/null | grep -c "^fleet: merge part-a" || true)
 if [ "$merge_in_base" -ge 1 ]; then ok "part-b branched from part-a's merged result"; else bad "chain not serialized" orch-chain; fi
+# part-a already satisfied the shared gate, so part-b legitimately finishes
+# NO_OP — its determination must STILL reach the parent's evidence closure:
+# archive + `fleet: no-op` commit + report coverage + the certificate bundle
+if [ "$(git log --first-parent --no-merges --format=%s | grep -c '^fleet: no-op part-b' || true)" -ge 1 ]; then
+  ok "NO_OP worker published its evidence on the parent line"
+else
+  bad "no 'fleet: no-op part-b' commit — NO_OP worker dropped from the evidence set" orch-chain
+fi
+if [ -s .loop/docs/run-archive/part-b/certification.json ]; then
+  check "archived NO_OP certificate records its state" orch-chain NO_OP "$(json_scalar .loop/docs/run-archive/part-b/certification.json final_state)"
+else
+  bad "run-archive/part-b/certification.json missing" orch-chain
+fi
+if grep -q 'run-archive/part-b' .loop/docs/evidence-report.md; then
+  ok "master evidence report covers the NO_OP worker's archive"
+else
+  bad "master report omits the NO_OP worker" orch-chain
+fi
+bundle=$(json_scalar .loop/docs/certification.json worker_evidence_sha256)
+if printf '%s' "$bundle" | grep -qE '^[0-9a-f]{64}$'; then
+  ok "integration certificate binds a bundle including the NO_OP archive"
+else
+  bad "worker_evidence_sha256 missing/malformed with a NO_OP worker: '$bundle'" orch-chain
+fi
+if grep -q '"event": "NOOP_ARCHIVED"' .loop/fleet/journal.jsonl; then ok "NO_OP publish journaled"; else bad "NOOP_ARCHIVED missing" orch-chain; fi
 
 echo "== orch: phased chain sharing a REQ runs its phases serially to SUCCESS =="
 # CHAIN_SHARED: phase-a -> phase-b -> phase-c all own REQ-001 (the tail also
@@ -5354,18 +5465,24 @@ if grep -q '"event": "MERGE_CONFLICT_REDO"' .loop/fleet/journal.jsonl; then ok "
 check "conflicting branch archived for autopsy" fleet-credo 1 "$(git branch --list 'loop/*-conflict-1' | wc -l | tr -d ' ')"
 check "parent value converged" fleet-credo fixed "$(cat value.txt)"
 # the redo removed the old worktree; its off-tree slot must have gone with it,
-# so the redo's fresh run records a NEW task baseline (the merged HEAD) instead
-# of inheriting the stale write-once ref recorded before the sibling merged
+# so the redo's fresh run records a NEW task baseline that CONTAINS the
+# winner's merged work (the recorded ref is a worktree-local descendant of the
+# merge commit — contract-gen commits sit on top — so assert ancestry, which
+# is still strictly stronger than "differs from the stale pre-fleet ref")
 rwt=$(fleet_wt "$rid")
 if [ -n "$rid" ] && [ -d "$rwt" ]; then
+  winner=$([ "$rid" = "$ida" ] && echo "$idb" || echo "$ida")
+  expect=$(git log --first-parent --merges --format='%H %s' \
+    | awk -v pat="fleet: merge $winner " 'found { next } index($0, pat) { split($0, a, " "); print a[1]; found=1 }')
   rcommon=$(cd "$rwt" && git rev-parse --git-common-dir)
   case "$rcommon" in /*) ;; *) rcommon="$rwt/$rcommon" ;; esac
   rgitdir=$(cd "$rwt" && git rev-parse --absolute-git-dir)
   tref=$(cat "$LOOP_APPROVAL_HOME/$(printf '%s' "$rcommon" | sha256)/$(printf '%s' "$rgitdir" | sha256)/task-start-ref" 2>/dev/null || echo missing)
-  if [ "$tref" != "$base0" ] && [ "$tref" != missing ]; then
-    ok "redo re-recorded its task baseline from the merged HEAD"
+  if [ -n "$expect" ] && [ "$tref" != missing ] \
+     && git merge-base --is-ancestor "$expect" "$tref" 2>/dev/null; then
+    ok "redo task baseline contains the winner's merge commit"
   else
-    bad "redo kept the stale pre-fleet task baseline ($tref)" fleet-credo
+    bad "redo task baseline '$tref' does not descend from the winner's merge commit '$expect' (pre-fleet base was $base0)" fleet-credo
   fi
 else
   bad "redo worktree missing for the slot assertion" fleet-credo

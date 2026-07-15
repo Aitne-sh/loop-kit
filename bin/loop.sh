@@ -545,17 +545,33 @@ clear_task_start_ref() { # NEW task boundary; amendments deliberately keep it
 }
 
 discard_worktree_slot() { # $1 worktree — remove its off-tree approval slot.
-  # MUST run BEFORE `git worktree remove` (the slot id derives from the
-  # worktree's git dir, unresolvable afterwards). Fleet worktrees are
-  # recreated at a DETERMINISTIC path, so a surviving slot silently binds the
-  # successor: record_task_start_ref is write-once, and a redo/requeue would
-  # inherit the OLD task baseline instead of recording the merged HEAD.
-  # Best-effort removal; approval_home=repo keeps no off-tree slots.
-  local slot=""
+  # Prefer running BEFORE `git worktree remove` (the live resolution hashes the
+  # worktree's git dir). Fleet worktrees are recreated at a DETERMINISTIC path,
+  # so a surviving slot silently binds the successor: record_task_start_ref is
+  # write-once, and a redo/requeue/re-add would inherit the OLD task baseline
+  # instead of recording its own. Fail CLOSED: nonzero when a slot may have
+  # survived — the caller must abort the redo/requeue (or refuse the clean)
+  # instead of seating a successor over a stale baseline.
+  # Two candidates are removed: the live resolution (exactly what the worker
+  # recorded), and the admin-git-dir derivation <common>/worktrees/<basename> —
+  # which covers a worktree already deleted (or git-broken) whose slot was
+  # recorded while it was healthy, since `git worktree add` names the admin
+  # dir after the path's basename (approval_slot's hash input).
+  local live="" derived="" common
   [ "$(approval_home)" != "repo" ] || return 0
-  [ -n "$1" ] && [ -d "$1" ] || return 0
-  slot=$(cd "$1" 2>/dev/null && approval_slot) || slot=""
-  [ -z "$slot" ] || rm -rf "$slot" 2>/dev/null || true
+  [ -n "$1" ] || return 0
+  if [ -d "$1" ]; then
+    live=$(cd "$1" 2>/dev/null && approval_slot) || live=""
+    [ -n "$live" ] || return 1
+  fi
+  if common=$(git rev-parse --git-common-dir 2>/dev/null) && [ -n "$common" ]; then
+    case "$common" in /*) ;; *) common="$PWD/$common" ;; esac
+    derived="$(approval_home)/$(printf '%s' "$common" | sha256)/$(printf '%s' "$common/worktrees/$(basename "$1")" | sha256)"
+  fi
+  [ -z "$live" ] || rm -rf "$live" 2>/dev/null || true
+  [ -z "$derived" ] || rm -rf "$derived" 2>/dev/null || true
+  [ -z "$live" ] || [ ! -e "$live" ] || return 1
+  [ -z "$derived" ] || [ ! -e "$derived" ] || return 1
   return 0
 }
 
@@ -1722,8 +1738,12 @@ run_stop_eval() { # $1 iter, $2 pre-ref -> updates futility + MET counters; may 
   [ "$STOP_EVAL" = "true" ] || return 0
   local res line sv pre_ref="${2:-HEAD}" preflight_line preflight_state
   if ! run_claude "iter-$1-stopeval" "/loop-stop-eval" "$MODEL_STOP_EVAL" reader STOP_EVAL; then
+    # a crashed evaluator breaks BOTH streaks: each one means N *consecutive
+    # judged* verdicts, and FUTILE->crash->FUTILE is not "futile twice in a row"
     STOP_EVAL_MET_STREAK=0
     echo 0 > .loop/met-count
+    STOP_EVAL_FUTILE_STREAK=0
+    echo 0 > .loop/futile-count
     rm -f .loop/stop-nudge.md
     journal_append "$1" "STOP_EVAL_ERROR" "stop evaluator call failed (advisory — ignored)${AGENT_FAIL_DIAG:+ — $AGENT_FAIL_DIAG}"
     return 0
@@ -2557,7 +2577,10 @@ gen_task_id() { # $1 content -> unique id <YYYYmmdd-HHMMSS>-<slug>
   ts=$(date +%Y%m%d-%H%M%S)
   id="$ts-$slug"
   n=2
-  while [ -n "$(task_qdir "$id")" ] || [ -f "$RUNS_DIR/$id.env" ]; do
+  # .loop/logs/<id> is the PERSISTENT record of past tasks (never reset): ids
+  # are second-resolution, and without this probe a same-second new root task
+  # would reuse the previous task's id and alias its log namespace/journal rows
+  while [ -n "$(task_qdir "$id")" ] || [ -f "$RUNS_DIR/$id.env" ] || [ -d ".loop/logs/$id" ]; do
     id="$ts-$slug-$n"
     n=$((n + 1))
   done
@@ -2916,31 +2939,53 @@ acquire_run_claim() { # atomic cold-start claim for `run` — closes the TOCTOU
   # window between the split-brain guard (a plain state read) and the first
   # .loop/run.pid write, which spans config loads, the fresh-clear, and the
   # full baseline verify (VERIFY_COMMANDS — minutes): two runs could pass the
-  # guard together and race the run-scoped artifacts. mkdir is the atomic
-  # primitive (acquire_lock's pattern); a dead holder is reclaimed via
-  # kill -0, never ps parsing alone. Released by release_run_claim once
-  # run.pid + heartbeat own liveness; a holder that die()d leaves a dead pid
-  # the next run reclaims — the claim can never brick a repo.
-  local d=.loop/run-claim.lock.d holder
-  if mkdir "$d" 2>/dev/null; then
-    echo $$ > "$d/pid"
-    return 0
-  fi
-  holder=$(cat "$d/pid" 2>/dev/null || echo "")
-  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+  # guard together and race the run-scoped artifacts. The owner record is
+  # written to a private temp file FIRST and published with ln (atomic, and it
+  # refuses an existing target — enqueue_task's publish pattern): a reader can
+  # never observe a claim without its pid, so "claim exists but no owner yet"
+  # can never be mistaken for stale. A dead holder is reclaimed via kill -0
+  # (never ps parsing alone) by atomically renaming the stale record aside and
+  # re-racing the publish — of N concurrent reclaimers exactly one wins.
+  # Unreadable/non-numeric records fail CLOSED (refuse; a crash always leaves
+  # a complete record, so garbage means tampering or a foreign writer).
+  # Released by release_run_claim once run.pid + heartbeat own liveness; a
+  # holder that die()d leaves a dead pid the next run reclaims — the claim can
+  # never brick a repo.
+  local f=.loop/run-claim.pid tmp=".loop/.run-claim.tmp.$$" holder
+  printf '%s\n' "$$" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  if ln "$tmp" "$f" 2>/dev/null; then rm -f "$tmp"; return 0; fi
+  holder=$(cat "$f" 2>/dev/null || echo "")
+  case "$holder" in
+    ''|*[!0-9]*) rm -f "$tmp"; return 1 ;;   # fail closed on an unattributable record
+  esac
+  if kill -0 "$holder" 2>/dev/null; then
+    rm -f "$tmp"
     return 1
   fi
-  rm -rf "$d" 2>/dev/null || true
-  mkdir "$d" 2>/dev/null || return 1
-  echo $$ > "$d/pid"
-  return 0
+  mv "$f" "$f.stale.$$" 2>/dev/null && rm -f "$f.stale.$$"
+  if ln "$tmp" "$f" 2>/dev/null; then rm -f "$tmp"; return 0; fi
+  rm -f "$tmp"
+  return 1
 }
 
 release_run_claim() { # owner-only: a successor's claim must never be removed
-  local d=.loop/run-claim.lock.d
-  [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ] || return 0
-  rm -rf "$d" 2>/dev/null || true
+  local f=.loop/run-claim.pid
+  [ "$(cat "$f" 2>/dev/null)" = "$$" ] || return 0
+  rm -f "$f" 2>/dev/null || true
   return 0
+}
+
+run_claim_alive() { # TRUE iff a `run` is mid-cold-start (claim held by a live
+  # pid). Mutating entry points (start/auto's definition reset, a manual fleet
+  # run's snapshot commit, decompose) must treat this window exactly like a
+  # verified-live run: the booting run has no .loop/run.pid yet, so the
+  # state==RUNNING guards cannot see it. Unreadable/non-numeric records fail
+  # CLOSED (treated as live — same posture as acquire_run_claim).
+  local f=.loop/run-claim.pid pid
+  [ -e "$f" ] || return 1
+  pid=$(cat "$f" 2>/dev/null || echo "")
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  kill -0 "$pid" 2>/dev/null
 }
 
 task_done() { # $1 id, $2 detail
@@ -2972,10 +3017,12 @@ claim_task() { # $1 id — new/ -> claimed/ (atomic), then bootstrap + contract 
   if bootstrap_worktree "$id"; then
     start_contract_gen "$id"
   else
-    discard_worktree_slot "$(wt_path "$id")"
+    local slot_note=""
+    discard_worktree_slot "$(wt_path "$id")" \
+      || slot_note="; WARNING: its approval slot could not be removed — remove it by hand (under $(approval_home)) before re-adding a task at this path"
     git worktree remove --force "$(wt_path "$id")" >/dev/null 2>&1 || true
     git branch -D "loop/$id" >/dev/null 2>&1 || true
-    task_fail "$id" BOOTSTRAP_FAILED "worktree/setup failed — see $RUNS_DIR/$id/plan.log"
+    task_fail "$id" BOOTSTRAP_FAILED "worktree/setup failed — see $RUNS_DIR/$id/plan.log$slot_note"
   fi
 }
 
@@ -3060,7 +3107,14 @@ reap_task() { # $1 id — its process died; derive the outcome from the worktree
           fnote "[$id] SUCCESS — queued for serial merge"
           ;;
         NO_OP)
-          task_done "$id" "NO_OP: verification passes with no changes needed"
+          # NOT completed inline: a NO_OP worker merged nothing, but its
+          # determination (certificate, checklist, observations) is still gate
+          # evidence — merge_noop_task publishes the archive on the parent line
+          # so the integration closure (fleet_noop_ids, the bundle hash, the
+          # master evidence report) covers it like any merged worker
+          renv_set "$id" PHASE MERGE_PENDING
+          journal "$id" EXIT_NO_OP ""
+          fnote "[$id] NO_OP — queued to publish its evidence archive"
           ;;
         NEEDS_SPEC_DECISION|NEEDS_ARCHITECTURE_DECISION|NEEDS_DECOMPOSITION)
           if [ "$(renv_get "$id" PLANNED 0)" = "1" ] && [ "$(fcfg FLEET_SUPERVISE 1)" != "0" ]; then
@@ -4058,8 +4112,14 @@ archive_worker_docs() { # $1 id, $2 worktree — build, verify, atomically publi
   local id="$1" wt="$2" dst tmp f ts
   dst=".loop/docs/run-archive/$id"
   tmp=".loop/docs/run-archive/.tmp-$id.$$"
+  # staging must start EMPTY and VERIFIED so (fail closed, not mkdir -p onto
+  # leftovers): a stale staging dir surviving a failed rm would silently mix a
+  # previous attempt's files into this archive — and from there into the
+  # evidence bundle hash the certificate binds
   rm -rf "$tmp" 2>/dev/null || true
-  mkdir -p "$tmp" || { ARCHIVE_PROBLEM="cannot create staging dir $tmp"; return 1; }
+  [ ! -e "$tmp" ] || { ARCHIVE_PROBLEM="stale staging dir $tmp could not be removed"; return 1; }
+  mkdir -p .loop/docs/run-archive 2>/dev/null || true   # leaf mkdir below reports failure
+  mkdir "$tmp" || { ARCHIVE_PROBLEM="cannot create staging dir $tmp"; return 1; }
   # the worker's assumptions ledger + drift report: parent .loop/docs is reset to
   # the master's every merge, so these per-phase records survive ONLY here. The
   # integration-gate reviewer reads the archived assumptions to catch cross-task
@@ -4096,12 +4156,70 @@ archive_worker_docs() { # $1 id, $2 worktree — build, verify, atomically publi
     mv "$dst" "$ARCHIVE_SUPERSEDED" \
       || { ARCHIVE_PROBLEM="cannot retire the previous archive at $dst"; ARCHIVE_SUPERSEDED=""; rm -rf "$tmp"; return 1; }
   fi
-  mv "$tmp" "$dst" || { ARCHIVE_PROBLEM="cannot publish $dst"; rm -rf "$tmp"; return 1; }
+  if ! mv "$tmp" "$dst"; then
+    ARCHIVE_PROBLEM="cannot publish $dst"
+    rm -rf "$tmp"
+    # restore the canonical path we just retired: readers of run-archive/<id>
+    # must never find it empty because the publish half of the swap failed
+    if [ -n "$ARCHIVE_SUPERSEDED" ]; then
+      mv "$ARCHIVE_SUPERSEDED" "$dst" 2>/dev/null && ARCHIVE_SUPERSEDED=""
+    fi
+    return 1
+  fi
   return 0
+}
+
+merge_noop_task() { # $1 id — a worker that finished NO_OP has no product merge,
+  # but its determination ("verification passes with no changes needed") is
+  # still evidence the integration gate certifies against: publish its archive
+  # on the parent line under a `fleet: no-op <id>` commit so fleet_noop_ids /
+  # the evidence bundle hash / the master evidence report close over it.
+  # Same defer/fail discipline as merge_task (parent tracked tree must be
+  # clean; rc 1 defers to the next tick; runs in a `||` list, so every step is
+  # explicitly checked).
+  local id="$1" wt summary mlog
+  wt=$(renv_get "$id" WT)
+  summary=$(renv_get "$id" SUMMARY "$id")
+  mlog="$RUNS_DIR/$id/merge.log"
+  if [ -n "$(git status --porcelain -uno)" ]; then
+    if [ "$LAST_DEFER_NOTE" != "$id" ]; then
+      fnote "[$id] evidence publish deferred — parent has uncommitted changes (commit or stash first)"
+      LAST_DEFER_NOTE="$id"
+    fi
+    return 1
+  fi
+  LAST_DEFER_NOTE=""
+  # phase-boundary plan-review marker: a NO_OP completion is still a phase
+  # boundary its queued dependents build on — same arming rule as merge_task
+  if [ "$(fcfg FLEET_PLAN_REVIEW 1)" != "0" ] && [ "$(fcfg FLEET_SUPERVISE 1)" != "0" ] \
+     && [ "$(renv_get "$id" PLANNED 0)" = "1" ] \
+     && task_has_queued_dependents "$id"; then
+    renv_set "$id" PLAN_REVIEW PENDING
+  fi
+  mkdir -p "$RUNS_DIR/$id"
+  if ! archive_worker_docs "$id" "$wt"; then
+    task_fail "$id" MERGE_FAILED "worker evidence archive failed: ${ARCHIVE_PROBLEM:-unknown} (worktree kept — fix the cause, then ./loop.sh fleet merge $id, or rework the task)"
+    return 0
+  fi
+  # shellcheck disable=SC2086  # ARCHIVE_SUPERSEDED is a single path or empty
+  if ! git add -- ".loop/docs/run-archive/$id" ${ARCHIVE_SUPERSEDED:+"$ARCHIVE_SUPERSEDED"} 2>>"$mlog" \
+     || ! git commit -q -m "fleet: no-op $id — $summary" >> "$mlog" 2>&1; then
+    git reset -q HEAD -- .loop/docs/run-archive >/dev/null 2>&1 || true
+    task_fail "$id" MERGE_FAILED "could not commit the worker evidence archive: $(tail -2 "$mlog" | tr '\n' ' ')(worktree kept)"
+    return 0
+  fi
+  journal "$id" NOOP_ARCHIVED "evidence archive published (no product changes)"
+  task_done "$id" "NO_OP: verification passes with no changes needed (evidence archived)"
 }
 
 merge_task() { # $1 id — parent tracked tree must be clean; defers (rc 1) if not
   local id="$1" branch wt summary added conflicts f merge_rc=0 mlog
+  if [ "$(renv_get "$id" RESULT "")" = "NO_OP" ]; then
+    # every MERGE_PENDING dispatcher (tick, drain, fleet merge, recovery
+    # adoption) inherits the routing by branching HERE, not at the call sites
+    merge_noop_task "$id"
+    return $?
+  fi
   branch=$(renv_get "$id" BRANCH)
   wt=$(renv_get "$id" WT)
   summary=$(renv_get "$id" SUMMARY "$id")
@@ -4167,8 +4285,13 @@ EOF
       # would lose the work, keeping the name would block the re-claim's
       # `git worktree add -b`. A second conflict goes to a human, same as any
       # manual task.
-      discard_worktree_slot "$wt"   # the redo's fresh worktree (same path) must
-                                    # record its OWN task baseline (merged HEAD)
+      # the redo's fresh worktree (same path) must record its OWN task baseline
+      # (the merged HEAD) — fail CLOSED if the old slot cannot be removed: a
+      # redo seated over it would inherit the stale write-once baseline
+      if ! discard_worktree_slot "$wt"; then
+        task_fail "$id" MERGE_CONFLICT "conflicts: $(echo "$conflicts" | tr '\n' ' ')and the automatic redo was aborted — the worktree's approval slot could not be removed (a redo would inherit the stale task baseline); remove it by hand (under $(approval_home)), then ./loop.sh resume $id"
+        return 0
+      fi
       git worktree remove --force "$wt" >/dev/null 2>&1 || true
       git worktree prune 2>/dev/null || true
       git branch -m "$branch" "$branch-conflict-1" 2>/dev/null || true
@@ -4468,20 +4591,30 @@ recover_claimed() { # supervisor (re)start: adopt whatever the previous one left
         # requeue class, and stays defensive against any future claimed:queued path.
         # NOTE: a claim that crashed mid-bootstrap carries NO phase (enqueue never
         # sets one), so it correctly falls to the STALE_BOOTSTRAP catch-all below.
-        discard_worktree_slot "$(wt_path "$id")"
-        git worktree remove --force "$(wt_path "$id")" >/dev/null 2>&1 || true
-        git branch -D "loop/$id" >/dev/null 2>&1 || true
-        git worktree prune 2>/dev/null || true
-        mv -f "$QUEUE_DIR/claimed/$id.md" "$QUEUE_DIR/new/$id.md" 2>/dev/null || true
-        journal "$id" ADOPTED_REQUEUE "completed an interrupted requeue (claimed:queued -> new/)"
-        fnote "[$id] re-queued (an interrupted requeue was completed)" ;;
+        # Fail CLOSED on a surviving approval slot: the requeued task's fresh
+        # worktree (same path) would inherit the stale write-once baseline.
+        if ! discard_worktree_slot "$(wt_path "$id")"; then
+          task_fail "$id" STALE_BOOTSTRAP "cannot complete the interrupted requeue — the worktree's approval slot could not be removed (a fresh claim would inherit the stale task baseline); remove it by hand (under $(approval_home)), then ./loop.sh resume $id"
+        else
+          git worktree remove --force "$(wt_path "$id")" >/dev/null 2>&1 || true
+          git branch -D "loop/$id" >/dev/null 2>&1 || true
+          git worktree prune 2>/dev/null || true
+          mv -f "$QUEUE_DIR/claimed/$id.md" "$QUEUE_DIR/new/$id.md" 2>/dev/null || true
+          journal "$id" ADOPTED_REQUEUE "completed an interrupted requeue (claimed:queued -> new/)"
+          fnote "[$id] re-queued (an interrupted requeue was completed)"
+        fi ;;
       *)
         # no/unknown phase = the previous supervisor died mid-bootstrap; the
-        # worktree may be half-built — fail it cleanly so it can be re-added
-        discard_worktree_slot "$(wt_path "$id")"
-        git worktree remove --force "$(wt_path "$id")" >/dev/null 2>&1 || true
-        git branch -D "loop/$id" >/dev/null 2>&1 || true
-        task_fail "$id" STALE_BOOTSTRAP "supervisor died mid-bootstrap — re-queue with: ./loop.sh fleet add $QUEUE_DIR/failed/$id.md" ;;
+        # worktree may be half-built — fail it cleanly so it can be re-added.
+        # A surviving approval slot blocks the worktree removal too (fail
+        # CLOSED): a successor at this path would inherit the stale baseline.
+        if ! discard_worktree_slot "$(wt_path "$id")"; then
+          task_fail "$id" STALE_BOOTSTRAP "supervisor died mid-bootstrap AND the worktree's approval slot could not be removed — remove it by hand (under $(approval_home)), then ./loop.sh fleet clean $id --force before re-adding"
+        else
+          git worktree remove --force "$(wt_path "$id")" >/dev/null 2>&1 || true
+          git branch -D "loop/$id" >/dev/null 2>&1 || true
+          task_fail "$id" STALE_BOOTSTRAP "supervisor died mid-bootstrap — re-queue with: ./loop.sh fleet add $QUEUE_DIR/failed/$id.md"
+        fi ;;
     esac
   done
 }
@@ -4589,6 +4722,13 @@ cmd_fleet_add() {
 
 cmd_fleet_run() {
   need_project
+  # a BOOTING run (cold-start claim held, .loop/run.pid not yet written) must
+  # be refused BEFORE any side effect: even briefly holding the supervisor
+  # lock below would flip fleet_inflight for the booting run's own routing
+  # and misdirect it into an orchestration resume
+  if run_claim_alive; then
+    fdie_next "a ./loop.sh run is starting in this repo (pid $(cat .loop/run-claim.pid 2>/dev/null)) — a root loop and the fleet must not run together" "wait for it to appear in ./loop.sh status (or stop it), then ./loop.sh fleet run"
+  fi
   ensure_fleet_dirs
   MAX_PARALLEL=$(fcfg FLEET_MAX_PARALLEL 3)
   local drain=0 args=() a auto_flag=""
@@ -5034,8 +5174,10 @@ fleet_resume_flip() { # $1 id, [$2 internal: "recursed" bounds the stale-running
     requeue)
       # nothing runnable exists yet (no contract / broken worktree) — a
       # relaunch would die at verify_approval. Scrap the artifacts and
-      # re-queue the task for a completely fresh claim instead.
-      discard_worktree_slot "$(renv_get "$id" WT "")"
+      # re-queue the task for a completely fresh claim instead. Fail CLOSED on
+      # a surviving approval slot (the fresh claim would inherit its baseline).
+      discard_worktree_slot "$(renv_get "$id" WT "")" \
+        || fdie_next "could not remove $id's approval slot — a fresh claim would inherit the stale task baseline" "remove it by hand (under $(approval_home)), then retry: ./loop.sh resume $id"
       git worktree remove --force "$(renv_get "$id" WT "")" >/dev/null 2>&1 || true
       git branch -D "loop/$id" >/dev/null 2>&1 || true
       git worktree prune 2>/dev/null || true
@@ -5252,7 +5394,10 @@ clean_orphans() { # gc: worktrees under $WT_ROOT and loop/* branches whose task 
       fnote "[$id] a live process (pid $pid) holds .loop/run.pid in this worktree — not cleaning; stop it first"
       continue
     fi
-    discard_worktree_slot "$wt"
+    if ! discard_worktree_slot "$wt"; then
+      fnote "[$id] could not remove its approval slot — not cleaning (a successor at this path would inherit the stale task baseline); remove it by hand (under $(approval_home)), then retry"
+      continue
+    fi
     [ ! -d "$wt" ] || git worktree remove --force "$wt" >/dev/null 2>&1 || true
     git branch -D "loop/$id" >/dev/null 2>&1 || true
     if git rev-parse -q --verify "loop/$id" >/dev/null 2>&1; then
@@ -5285,8 +5430,12 @@ clean_one() { # $1 id, $2 force
   wt=$(renv_get "$id" WT "")
   branch=$(renv_get "$id" BRANCH "")
   # approval-store hygiene: discard_worktree_slot resolves the slot from the
-  # live worktree BEFORE removal (its git dir is unresolvable afterwards)
-  discard_worktree_slot "$wt"
+  # live worktree BEFORE removal (its git dir is unresolvable afterwards).
+  # Fail CLOSED: a surviving slot would bind a future task at this path.
+  if ! discard_worktree_slot "$wt"; then
+    fnote "[$id] could not remove its approval slot — not cleaning (a successor at this path would inherit the stale task baseline); remove it by hand (under $(approval_home)), then retry"
+    return 0
+  fi
   if [ -n "$wt" ]; then git worktree remove --force "$wt" >/dev/null 2>&1 || true; fi
   if [ -n "$branch" ]; then git branch -D "$branch" >/dev/null 2>&1 || true; fi
   if [ -n "$branch" ] && git rev-parse -q --verify "$branch" >/dev/null 2>&1; then
@@ -6148,13 +6297,30 @@ fleet_merged_ids() { # $1 base -> ids of the workers whose merge commits landed 
     | LC_ALL=C sort -u || true
 }
 
-verify_fleet_archives() { # $1 "id ..." — deterministic integrity of each merged
-  # worker's evidence archive BEFORE the integration reviewer/evidence agent
-  # read it: the dir must exist, carry the worker's own certificate, and every
-  # archived manifest row must hash-match its archived observation bytes.
-  # Sets FLEET_ARCHIVE_PROBLEM on failure.
+fleet_noop_ids() { # $1 base -> ids of the workers whose NO_OP evidence commits
+  # (merge_noop_task's own `fleet: no-op <id> — <summary>`) landed on the
+  # parent line in base..HEAD. --first-parent keeps worker-branch forgeries
+  # out exactly as in fleet_merged_ids; a forged subject planted on the parent
+  # line by gate VERIFY_COMMANDS can only ADD an id, which then fails the
+  # archive verification below (fail closed), never hide one.
+  git log --first-parent --no-merges --format=%s "$1..HEAD" 2>/dev/null \
+    | sed -nE 's/^fleet: no-op ([a-z0-9][a-z0-9-]*)([[:space:]].*)?$/\1/p' \
+    | LC_ALL=C sort -u || true
+}
+
+verify_fleet_archives() { # $1 "id ...", $2 expected certificate final_state —
+  # deterministic integrity of each worker's evidence archive BEFORE the
+  # integration reviewer/evidence agent read it: the dir must exist, carry the
+  # worker's own certificate, and every archived manifest row must hash-match
+  # its archived observation bytes. The certificate is also semantically bound
+  # to the archive around it — its task_id must be the queue id the bootstrap
+  # stamped into the worktree, its final_state must match how this id reached
+  # the parent line ($2), and its evidence_manifest_sha256 must equal the
+  # archived manifest's actual hash (sha-of-empty when absent: a worker with
+  # zero observations certifies exactly that, so a deleted manifest can no
+  # longer alias "nothing to verify"). Sets FLEET_ARCHIVE_PROBLEM on failure.
   FLEET_ARCHIVE_PROBLEM=""
-  local id dir
+  local id dir expected="$2" cert_task cert_state cert_msha msha
   for id in $1; do
     dir=".loop/docs/run-archive/$id"
     if [ ! -d "$dir" ]; then
@@ -6162,6 +6328,19 @@ verify_fleet_archives() { # $1 "id ..." — deterministic integrity of each merg
     fi
     if [ -L "$dir/certification.json" ] || [ ! -s "$dir/certification.json" ]; then
       FLEET_ARCHIVE_PROBLEM="$id: archived certification.json missing or empty"; return 1
+    fi
+    cert_task=$(json_field "$dir/certification.json" task_id "")
+    if [ "$cert_task" != "$id" ]; then
+      FLEET_ARCHIVE_PROBLEM="$id: archived certificate belongs to task '${cert_task:-?}'"; return 1
+    fi
+    cert_state=$(json_field "$dir/certification.json" final_state "")
+    if [ "$cert_state" != "$expected" ]; then
+      FLEET_ARCHIVE_PROBLEM="$id: archived certificate records final_state '${cert_state:-?}' (expected $expected)"; return 1
+    fi
+    cert_msha=$(json_field "$dir/certification.json" evidence_manifest_sha256 "")
+    msha=$(sha_file_or_empty "$dir/observations-manifest.jsonl")
+    if [ "$cert_msha" != "$msha" ]; then
+      FLEET_ARCHIVE_PROBLEM="$id: archived manifest does not match the certificate's evidence_manifest_sha256"; return 1
     fi
     verify_archived_manifest "$dir" \
       || { FLEET_ARCHIVE_PROBLEM="$id: $ARCHIVE_MANIFEST_PROBLEM"; return 1; }
@@ -6194,15 +6373,22 @@ EOF
 }
 
 integration_authority() { # $1 "id ..." (may be empty) -> the fleet gate's full
-  # authority token: root certification inputs + the worker evidence bundle.
+  # authority token: root certification inputs + the worker evidence bundle +
+  # the manual-task manifest the reviewer was shown (its CONTENT is appended
+  # to the evidence report after the --final evaluator ran, so it must be
+  # byte-identical to what the reviewer judged — VERIFY_COMMANDS or the
+  # evidence agent editing it must trip the compare, not ride into the report).
   # Compared before/after evidence AND after the final evaluator re-check —
   # the single-task gate's discipline, extended over the archived evidence.
-  local a b=""
+  local a b="" m=""
   a=$(certification_inputs_hash) || return 1
   if [ -n "$1" ]; then
     b=$(fleet_evidence_bundle_hash "$1") || return 1
   fi
-  printf '%s %s' "$a" "$b"
+  if [ -e .loop/fleet/manual-manifest.md ]; then
+    m=$(authority_file_record .loop/fleet/manual-manifest.md) || return 1
+  fi
+  printf '%s %s %s' "$a" "$b" "$m"
 }
 
 run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, then
@@ -6215,7 +6401,7 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
   local phase="$1" base id blocked_ticks=0 gate_i=1 fixups fixup_cap
   local human_ticks=0 stall_ticks=0 last_fp="" fp stall_cap manual manual_merged run_wall_start=$SECONDS
   local reviewed_ref evidence_diff final_line final_state evidence_logs authority_before authority_after
-  local merged_ids merged_csv mid
+  local merged_ids noop_ids evidence_ids merged_csv mid
   ensure_fleet_dirs
   if [ "$phase" = "start" ] || [ ! -s .loop/fleet/run-id ]; then
     printf '%s\n' "$RUN_ID" > .loop/fleet/run-id
@@ -6234,6 +6420,9 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
   acquire_lock
   trap release_lock EXIT
   trap on_orch_int INT TERM
+  # the supervisor lock is held: hand over liveness from cmd_run's cold-start
+  # claim with no window where neither is held (owner-only no-op otherwise)
+  release_run_claim
   # supervisor restart = session rotation: a recorded conversation from a prior
   # process may be stale or gone — every restart begins with a fresh session
   supervisor_session_drop
@@ -6373,18 +6562,31 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
     check_harness "before the integration gate"
     verify_approval
     # worker evidence closure (deterministic, before any reviewer is paid for):
-    # enumerate exactly the workers merged in THIS gate range, verify each
-    # archive's internal integrity, and pin the whole evidence base as one
-    # bundle hash — the reviewer and evidence agent judge from these archives,
-    # so the gate must not open over broken or unpinned ones.
+    # enumerate exactly the workers that completed in THIS gate range — merged
+    # ones from their merge commits, NO_OP ones from their evidence commits —
+    # verify each archive's internal integrity AND its certificate's semantic
+    # binding, and pin the whole evidence base as one bundle hash: the
+    # reviewer and evidence agent judge from these archives, so the gate must
+    # not open over broken, misattributed or unpinned ones.
     merged_ids=$(fleet_merged_ids "$base")
-    merged_csv=$(printf '%s' "$merged_ids" | tr '\n' ',')
+    noop_ids=$(fleet_noop_ids "$base")
+    if [ -n "$(printf '%s\n%s\n' "$merged_ids" "$noop_ids" | grep -v '^$' | LC_ALL=C sort | uniq -d)" ]; then
+      finish BLOCKED "worker id appears both merged and no-op in $base..HEAD — forged or duplicated fleet commit subjects; inspect git log --first-parent, then ./loop.sh run"
+    fi
+    evidence_ids=$(printf '%s\n%s\n' "$merged_ids" "$noop_ids" | grep -v '^$' | LC_ALL=C sort -u)
+    merged_csv=$(printf '%s' "$evidence_ids" | tr '\n' ',')
     FLEET_BUNDLE_SHA=""
     if [ -n "$merged_ids" ]; then
-      verify_fleet_archives "$merged_ids" \
+      verify_fleet_archives "$merged_ids" SUCCESS \
         || finish BLOCKED "worker evidence archive failed verification: ${FLEET_ARCHIVE_PROBLEM:-unknown} — inspect .loop/docs/run-archive, then ./loop.sh run"
-      FLEET_BUNDLE_SHA=$(fleet_evidence_bundle_hash "$merged_ids") \
-        || finish BLOCKED "could not hash the merged workers' evidence archives — inspect .loop/docs/run-archive, then ./loop.sh run"
+    fi
+    if [ -n "$noop_ids" ]; then
+      verify_fleet_archives "$noop_ids" NO_OP \
+        || finish BLOCKED "worker evidence archive failed verification: ${FLEET_ARCHIVE_PROBLEM:-unknown} — inspect .loop/docs/run-archive, then ./loop.sh run"
+    fi
+    if [ -n "$evidence_ids" ]; then
+      FLEET_BUNDLE_SHA=$(fleet_evidence_bundle_hash "$evidence_ids") \
+        || finish BLOCKED "could not hash the workers' evidence archives — inspect .loop/docs/run-archive, then ./loop.sh run"
     fi
     # manual-task manifest: regenerated every gate round — merged human-queued
     # side-work is declared to the reviewer as sanctioned, never left to look
@@ -6438,7 +6640,7 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
       check_harness "during the integration-gate review"
       canonicalize_live_manifest \
         || finish BLOCKED "could not canonicalize the observation manifest before integration evidence"
-      authority_before=$(integration_authority "$merged_ids") \
+      authority_before=$(integration_authority "$evidence_ids") \
         || finish BLOCKED "could not snapshot integration certification inputs"
       reviewed_ref=$(git rev-parse HEAD)
       evidence_logs=$(active_log_dir)
@@ -6448,7 +6650,7 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
         finish BLOCKED "evidence generation failed — cannot certify the merged result without evidence${AGENT_FAIL_DIAG:+ ($AGENT_FAIL_DIAG)}"
       fi
       check_harness "during integration evidence"
-      authority_after=$(integration_authority "$merged_ids") \
+      authority_after=$(integration_authority "$evidence_ids") \
         || finish BLOCKED "could not re-check integration certification inputs"
       if [ "$authority_after" != "$authority_before" ]; then
         finish BLOCKED "integration evidence changed certification inputs after review (contract/ledger/checklist/verdicts/manifest/observations/worker archives)"
@@ -6459,7 +6661,7 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
       # the master report must close over every merged worker's archived
       # evidence — a report silently omitting a worker would certify SUCCESS
       # over evidence nobody surfaced to the human
-      for mid in $merged_ids; do
+      for mid in $evidence_ids; do
         grep -Fq "run-archive/$mid" .loop/docs/evidence-report.md \
           || finish BLOCKED "integration evidence report omits merged task $mid — it must cover .loop/docs/run-archive/$mid"
       done
@@ -6488,7 +6690,7 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
       # must be byte-identical to the reviewed state — previously the first
       # check after --final ran only AFTER write_certification.
       check_harness "after the integration re-check"
-      authority_after=$(integration_authority "$merged_ids") \
+      authority_after=$(integration_authority "$evidence_ids") \
         || finish BLOCKED "could not re-check integration certification inputs before certification"
       [ "$authority_after" = "$authority_before" ] \
         || finish BLOCKED "integration certification inputs changed after the evidence snapshot"
@@ -6584,6 +6786,11 @@ cmd_decompose() { # preview/refresh the task plan without enqueueing or running
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "not a git repository — run: git init && git add -A && git commit -m init"
   verify_approval
+  # a BOOTING run (cold-start claim held) may be about to decompose this same
+  # plan itself — a concurrent manual decompose would race .loop/docs/task-plan.md
+  if run_claim_alive; then
+    die_next "a ./loop.sh run is starting in this repo (pid $(cat .loop/run-claim.pid 2>/dev/null)) — decomposing beside it would race the task plan" "wait for it to appear in ./loop.sh status (or stop it), then ./loop.sh decompose"
+  fi
   load_config
   load_models
   RUN_CONTRACT_HASH=$(contract_hash)
@@ -7077,8 +7284,12 @@ assign_new_task_id() { # NEW root-task boundary; fleet workers receive queue id 
   printf '%s\n' "$id" > .loop/task-id
 }
 
-retire_previous_evidence_report() { # fresh run: archive stale view/certificate
-  local report=.loop/docs/evidence-report.md cert=.loop/docs/certification.json ts dst live=0
+retire_previous_evidence_report() { # fresh run: archive stale view/certificate.
+  # Transactional: every copy lands in a staging dir first and the archive is
+  # published with ONE atomic rename BEFORE any live file is reset — a failure
+  # anywhere leaves both the live docs and run-archive/ exactly as they were
+  # (a direct-copy would strand a half-filled archive dir at its final name).
+  local report=.loop/docs/evidence-report.md cert=.loop/docs/certification.json ts dst tmp live=0
   if [ -f "$report" ] && doc_differs_from_template "$report"; then live=1; fi
   [ -s "$cert" ] && live=1
   if [ "$live" -ne 1 ]; then
@@ -7087,22 +7298,28 @@ retire_previous_evidence_report() { # fresh run: archive stale view/certificate
     return 0
   fi
   ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || echo archive)
-  dst=$(unique_archive_dir ".loop/docs/run-archive/$ts-prevrun")
+  tmp=".loop/docs/run-archive/.tmp-prevrun.$$"
+  rm -rf "$tmp" 2>/dev/null || true
+  [ ! -e "$tmp" ] \
+    || die_next "cannot clear the archive staging dir $tmp" "fix permissions/disk space, then ./loop.sh run"
   mkdir -p .loop/docs/run-archive 2>/dev/null || true   # leaf mkdir below reports failure
-  mkdir "$dst" \
-    || die_next "cannot create the archive dir $dst" "fix permissions/disk space, then ./loop.sh run"
+  mkdir "$tmp" 2>/dev/null \
+    || die_next "cannot create the archive staging dir $tmp" "fix permissions/disk space, then ./loop.sh run"
   if [ -f "$report" ] && doc_differs_from_template "$report"; then
-    cp "$report" "$dst/evidence-report.md" \
-      || die_next "could not archive the previous evidence report to $dst (nothing was reset)" "fix permissions/disk space, then ./loop.sh run"
+    cp "$report" "$tmp/evidence-report.md" \
+      || die_next "could not archive the previous evidence report (nothing was reset)" "fix permissions/disk space, then ./loop.sh run"
   fi
+  if [ -s "$cert" ]; then
+    cp "$cert" "$tmp/certification.json" \
+      || die_next "could not archive the previous certification.json (nothing was reset)" "fix permissions/disk space, then ./loop.sh run"
+  fi
+  dst=$(unique_archive_dir ".loop/docs/run-archive/$ts-prevrun")
+  mv "$tmp" "$dst" \
+    || die_next "could not publish the archive $dst (nothing was reset)" "fix permissions/disk space, then ./loop.sh run"
   if [ -f .loop/templates/evidence-report.md ]; then
     cp .loop/templates/evidence-report.md "$report"
   else
     : > "$report"
-  fi
-  if [ -s "$cert" ]; then
-    cp "$cert" "$dst/certification.json" \
-      || die_next "could not archive the previous certification.json to $dst (certificate not deleted)" "fix permissions/disk space, then ./loop.sh run"
   fi
   rm -f "$cert"
 }
@@ -7112,42 +7329,55 @@ reset_contract_scoped_docs() { # [--keep-contract] — archive + reset the loop 
   # merge_task uses for fleet tasks and the place the loop-contract skill already
   # reads as intake context, so past traps stay discoverable without any skill
   # change. Commits are PATHSPEC-SCOPED to .loop/docs: user WIP is never swept.
-  local keep_contract=0 ts dst f
+  local keep_contract=0 ts dst tmp f
   [ "${1:-}" = "--keep-contract" ] && keep_contract=1
-  clear_task_start_ref
   [ -d .loop/templates ] && [ -n "$(ls .loop/templates/*.md 2>/dev/null)" ] \
     || die "this deployment has no .loop/templates (pristine doc templates) — run: ./loop.sh update"
   # 1. archive every filled-in doc (tracked -> the commit is the audit trail).
-  # Every copy is fail-CLOSED with an explicit die_next: step 3 below DELETES
-  # the originals (rm -rf .loop/observations, rm -f the manifest), so a failed
-  # copy that fell through would destroy the only remaining evidence.
+  # Transactional: every copy is fail-CLOSED with an explicit die_next AND
+  # lands in a staging dir published by ONE atomic rename — step 3 below
+  # DELETES the originals (rm -rf .loop/observations, rm -f the manifest), so
+  # a failure anywhere must leave the live docs untouched and never strand a
+  # half-filled archive dir at its final name.
   ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || echo archive)
-  dst=$(unique_archive_dir ".loop/docs/run-archive/$ts-root")
+  tmp=".loop/docs/run-archive/.tmp-root.$$"
+  rm -rf "$tmp" 2>/dev/null || true
+  [ ! -e "$tmp" ] \
+    || die_next "cannot clear the archive staging dir $tmp" "fix permissions/disk space, then retry the new task definition"
   mkdir -p .loop/docs/run-archive 2>/dev/null || true   # leaf mkdir below reports failure
-  mkdir "$dst" \
-    || die_next "cannot create the archive dir $dst" "fix permissions/disk space, then retry the new task definition"
+  mkdir "$tmp" 2>/dev/null \
+    || die_next "cannot create the archive staging dir $tmp" "fix permissions/disk space, then retry the new task definition"
   for f in .loop/docs/*.md; do
     [ -f "$f" ] || continue
-    doc_differs_from_template "$f" && { cp "$f" "$dst/" \
-      || die_next "could not archive $f to $dst — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"; }
+    doc_differs_from_template "$f" && { cp "$f" "$tmp/" \
+      || die_next "could not archive $f — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"; }
   done
   if [ -s .loop/docs/certification.json ]; then
-    cp .loop/docs/certification.json "$dst/" \
-      || die_next "could not archive certification.json to $dst — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"
+    cp .loop/docs/certification.json "$tmp/" \
+      || die_next "could not archive certification.json — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"
   fi
   if [ -s .loop/task-id ]; then
-    cp .loop/task-id "$dst/task-id" \
-      || die_next "could not archive .loop/task-id to $dst — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"
+    cp .loop/task-id "$tmp/task-id" \
+      || die_next "could not archive .loop/task-id — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"
   fi
   if [ -d .loop/observations ]; then
-    cp -R .loop/observations "$dst/observations" \
-      || die_next "could not archive .loop/observations to $dst — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"
+    cp -R .loop/observations "$tmp/observations" \
+      || die_next "could not archive .loop/observations — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"
   fi
   if [ -s .loop/observations-manifest.jsonl ]; then
-    compact_observations_manifest .loop/observations-manifest.jsonl "$dst/observations-manifest.jsonl" \
-      || die_next "could not archive the observations manifest to $dst — task reset aborted (nothing was deleted)" "inspect .loop/observations-manifest.jsonl, then retry the new task definition"
+    compact_observations_manifest .loop/observations-manifest.jsonl "$tmp/observations-manifest.jsonl" \
+      || die_next "could not archive the observations manifest — task reset aborted (nothing was deleted)" "inspect .loop/observations-manifest.jsonl, then retry the new task definition"
   fi
-  rmdir "$dst" 2>/dev/null || true   # nothing was live -> no empty archive dir
+  if [ -n "$(ls -A "$tmp" 2>/dev/null)" ]; then
+    dst=$(unique_archive_dir ".loop/docs/run-archive/$ts-root")
+    mv "$tmp" "$dst" \
+      || die_next "could not publish the archive $dst — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"
+  else
+    rmdir "$tmp" 2>/dev/null || true   # nothing was live -> no empty archive dir
+  fi
+  # the archive is published: only NOW may the NEW-task boundary drop the old
+  # task's baseline anchor (dying earlier must leave the live task fully intact)
+  clear_task_start_ref
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git add -- .loop/docs 2>/dev/null || true
     git diff --cached --quiet -- .loop/docs 2>/dev/null \
@@ -7198,6 +7428,12 @@ guard_new_definition() { # refuse/reset before a NEW-task definition session.
   # (dead pid) must not block a new definition forever.
   if [ "$(cat .loop/state 2>/dev/null)" = "RUNNING" ] && single_loop_alive; then
     die "a run is already active in this repo (pid $(cat .loop/run.pid 2>/dev/null)) — wait for it or stop it (Ctrl-C / kill $(cat .loop/run.pid 2>/dev/null)); queue a follow-up task instead: ./loop.sh add \"<instruction>\""
+  fi
+  # a BOOTING run (cold-start claim held, .loop/run.pid not yet written — its
+  # baseline verify can run for minutes) needs the current docs exactly as a
+  # live run does: never archive+reset them under it
+  if run_claim_alive; then
+    die_next "a ./loop.sh run is starting in this repo (pid $(cat .loop/run-claim.pid 2>/dev/null)) — a new task definition would archive the docs under it" "wait for it to appear in ./loop.sh status (or stop it), then retry"
   fi
   if [ -n "$(tasks_in "done")$(tasks_in failed)" ]; then
     note "warning: finished/failed fleet tasks remain (./loop.sh fleet status) — a new plan cannot enqueue over them"
@@ -7944,7 +8180,7 @@ cmd_run() {
   # atomically so a second `run` launched before this one seeds .loop/run.pid
   # cannot enter beside it. Released once the liveness pidfile takes over.
   acquire_run_claim \
-    || die_next "another ./loop.sh run is already starting in this repo (pid $(cat .loop/run-claim.lock.d/pid 2>/dev/null))" "wait for it to appear in ./loop.sh status, or stop it, then ./loop.sh run"
+    || die_next "another ./loop.sh run is already starting in this repo (pid $(cat .loop/run-claim.pid 2>/dev/null)); a dead holder is reclaimed automatically" "wait for it to appear in ./loop.sh status, or stop it, then ./loop.sh run"
   # SECURITY: verify hashes BEFORE sourcing any config shell code
   verify_approval
   load_config
@@ -8040,7 +8276,8 @@ cmd_run() {
       # A PARKED pre-start queue (manual adds only, nothing ever started) is NOT
       # in flight: it falls through so the contract still decomposes, and the
       # orchestration start dispatches the parked tasks alongside the planned ones.
-      release_run_claim   # the supervisor's own atomic lock takes over from here
+      # (run_fleet_orchestration releases the claim itself, AFTER its supervisor
+      # lock is held — no window where neither is.)
       run_fleet_orchestration resume
     fi
     if [ "$(fcfg FLEET_DECOMPOSE 1)" != "0" ]; then
@@ -8050,7 +8287,6 @@ cmd_run() {
         # --fresh restarts the LOOP fresh but still reuses an approved plan that
         # matches the contract; regenerating the plan is `./loop.sh decompose --force`
         if cmd_decompose_flow 0 1; then
-          release_run_claim   # the supervisor's own atomic lock takes over from here
           run_fleet_orchestration start
         fi
       fi

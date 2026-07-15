@@ -19,8 +19,10 @@ The skill argument contains `baseline=<ref>` — the first commit for this task 
 whether you ALSO write the HTML view (see "Write the HTML view" below).
 
 At the **fleet integration gate** the argument additionally carries
-`merged=<id,id,...>` (the worker tasks merged into this result) and
-`archives=.loop/docs/run-archive`. Then the report MUST cover every merged
+`merged=<id,id,...>` (every worker task that completed into this result —
+merged ones AND NO_OP ones, whose determination "verification passes with no
+changes needed" is evidence too) and
+`archives=.loop/docs/run-archive`. Then the report MUST cover every listed
 task: for each id, read its archived evidence under
 `.loop/docs/run-archive/<id>/` (acceptance-checklist.md,
 observations-manifest.jsonl + observations/, certification.json,
