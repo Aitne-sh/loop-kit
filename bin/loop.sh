@@ -1413,11 +1413,15 @@ extract_verdict() { # $1 response text, $2 verdict pattern (e.g. 'VERDICT: (APPR
   # like '> - `VERDICT: ...' shed one layer per pass — every verdict pattern
   # starts with an uppercase token, so iteration can never eat into the verdict
   # itself. The trailing strip stays single-pass.
+  # The pattern must end at a token boundary (whitespace or end of line):
+  # every caller's pattern ends in an enum alternation, and a bare prefix
+  # grep would accept near-miss tokens ("VERDICT: APPROVED", "STOP-EVAL:
+  # METHOD", "REQ-001: METICULOUS") as valid verdicts.
   # shellcheck disable=SC2016  # the backtick in the sed class is a literal markdown character
   printf '%s\n' "$1" \
     | sed -E -e ':a' -e 's/^[[:space:]]*[*_`>#-]+[[:space:]]*//; ta' \
              -e 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]*[*_`]+$//' \
-    | grep -E "^$2" | tail -1 || true
+    | grep -E "^$2([[:space:]]|\$)" | tail -1 || true
 }
 
 html_lint() { # $1 authored page -> one finding per line (empty output = clean)
@@ -1884,7 +1888,13 @@ sha_file_or_empty() { # deterministic content hash even when an optional file is
 }
 
 observation_tokens() { # stdin -> supported observation path tokens
-  grep -oE '\.loop/observations/[A-Za-z0-9_./-]*[A-Za-z0-9_-]' 2>/dev/null \
+  # Path-boundary anchored (start of line, whitespace, '(', '[' or a markdown
+  # backtick): '/tmp/.loop/observations/x' or '../.loop/observations/x' must
+  # NOT normalize to the canonical token — a report could then display one
+  # path while validation binds a different file. Keep this boundary set in
+  # sync with evaluate.sh's 6.6(e) evidence-cell parser.
+  grep -oE '(^|[[:space:]([`])\.loop/observations/[A-Za-z0-9_./-]*[A-Za-z0-9_-]' 2>/dev/null \
+    | sed -E 's/^[[:space:]([`]//' \
     | LC_ALL=C sort -u || true
 }
 

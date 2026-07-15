@@ -668,9 +668,12 @@ EOF
         *.loop/observations/*)
           # First relative observations token at a path boundary; absolute or
           # prefixed aliases do not match. Trailing prose punctuation is stripped.
+          # Boundary set (start, whitespace, '(', '[', markdown backtick) is
+          # shared with loop.sh's observation_tokens() — both sides must parse
+          # a citation identically.
           obs=$(printf '%s\n' "$ev" \
-                | grep -oE '(^|[[:space:]([])\.loop/observations/[^[:space:]|]+' | head -1 \
-                | sed -E 's/^[[:space:]([]//' \
+                | grep -oE '(^|[[:space:]([`])\.loop/observations/[^[:space:]|]+' | head -1 \
+                | sed -E 's/^[[:space:]([`]//' \
                 | sed -E 's|[^A-Za-z0-9_./-]+$||' || true)
           if ! validate_observation "$aid" "$obs" "$expectation"; then
             bad_runs="$bad_runs $aid($OBS_REASON)"
