@@ -188,9 +188,10 @@ and the evaluator's own re-run in `.loop/last-verify.log` (command-shaped
 no task's archived checklist closed and no probe covers is a coverage gap —
 flag it, do not paper over it.
 For archived `run` evidence, read that task's
-`run-archive/<id>/observations-manifest.jsonl`. Manifest artifact paths written
-live as `.loop/observations/<file>` are rebased during archive to
-`observations/<file>`; resolve them relative to the same
+`run-archive/<id>/observations-manifest.jsonl`. Manifest bytes are preserved
+verbatim on archive (rewriting rows would break the certificate hashes bound
+to them), so artifact paths still read `.loop/observations/<file>`: resolve
+each one YOURSELF to `observations/<file>` relative to the same
 `.loop/docs/run-archive/<id>/` root. Never resolve an archived citation against
 the live `.loop/observations/` store or a sibling task archive.
 When the task plan shares a REQ across phases (a sequential chain or a
