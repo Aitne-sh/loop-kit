@@ -58,9 +58,11 @@ Columns:
             product tree. A later product/AC change makes unchanged evidence
             stale; re-run and recapture it after the code stabilizes. Per-file
             and total size caps come from LOOP_OBS_MAX_FILE_KB / _TOTAL_MB.
-            In an archived task, the manifest rebases these paths to
-            observations/<file>; resolve them relative to that task's
-            .loop/docs/run-archive/<id>/ root, never the live observation store.
+            An archived task's manifest keeps these rows byte-identical
+            (rewriting them would break the certificate hashes bound to them);
+            resolve each .loop/observations/<file> to observations/<file>
+            under that task's .loop/docs/run-archive/<id>/ root yourself,
+            never against the live observation store.
 -->
 
 | AC | REQ | Expectation | Method | Status | Evidence |
