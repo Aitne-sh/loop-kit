@@ -634,7 +634,7 @@ ckpt_write() { # $1 iter $2 agent_failures $3 gate_revise $4 iter_revise $5 resu
 new_run_id() { date -u '+run-%Y%m%d-%H%M%S' 2>/dev/null || echo "run-unknown-$$"; }
 
 initialize_run_identity() { # $1 fresh|resume; before any run/decompose model call
-  local mode="$1" saved=""
+  local mode="$1" saved="" base n
   TASK_ID=$(cat .loop/task-id 2>/dev/null || true)
   if ! valid_log_segment "$TASK_ID"; then
     assign_new_task_id
@@ -647,6 +647,25 @@ initialize_run_identity() { # $1 fresh|resume; before any run/decompose model ca
   fi
   valid_log_segment "$saved" || saved=""
   RUN_ID="${saved:-$(new_run_id)}"
+  # A NEW run id must be RESERVED, not just named: ids are second-resolution,
+  # a fresh restart in the same second would reuse the previous run's log dir,
+  # and that exact dir is later handed to the evidence agent as its only
+  # permitted log namespace — stale iteration logs would ride along as if they
+  # were this run's. The non -p mkdir is the atomic claim (gen_task_id's
+  # uniqueness-loop pattern); a resume reuses its saved id, whose dir
+  # legitimately exists.
+  if [ -z "$saved" ]; then
+    base="$RUN_ID" n=2
+    mkdir -p ".loop/logs/$TASK_ID" 2>/dev/null || true
+    while ! mkdir ".loop/logs/$TASK_ID/$RUN_ID" 2>/dev/null; do
+      [ -d ".loop/logs/$TASK_ID/$RUN_ID" ] \
+        || die_next "cannot create the run log directory .loop/logs/$TASK_ID/$RUN_ID" "fix permissions/disk space, then ./loop.sh run"
+      RUN_ID="$base-$n"
+      n=$((n + 1))
+      [ "$n" -le 99 ] \
+        || die_next "cannot reserve a unique run id under .loop/logs/$TASK_ID ($base and 97 suffixes taken)" "inspect .loop/logs/$TASK_ID for runaway restarts, then ./loop.sh run"
+    done
+  fi
 }
 
 ckpt_rebind_decision() { # $1 the decision state being answered — atomic field rewrite.
