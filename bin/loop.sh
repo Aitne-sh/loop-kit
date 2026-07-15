@@ -55,6 +55,13 @@ TASK_START_REF_PATH=""
 TASK_START_REF_PINNED=0
 OBS_MANIFEST_EXPECTED=""
 OBS_MANIFEST_PINNED=0
+# Stop-heuristic streaks are PROCESS MEMORY (like TOTAL_COST): the .loop/met-count
+# and .loop/futile-count files are display mirrors only — a file value is never
+# read back into arithmetic (a forged "999999" would force the gate after one
+# MET; a non-numeric value would kill the run under set -u). A resume starts a
+# new process, so both streaks restart at 0 — the safe side.
+STOP_EVAL_MET_STREAK=0
+STOP_EVAL_FUTILE_STREAK=0
 # Agent subtree isolation: launch every `claude` as its OWN process-group leader
 # so an interrupt/timeout can signal the WHOLE agent subtree (claude + MCP servers
 # + tool subprocesses + sub-agents), not just the top pid. A background job of a
@@ -1670,14 +1677,14 @@ $res"
 }
 
 run_stop_eval() { # $1 iter, $2 pre-ref -> updates futility + MET counters; may finish STALLED.
-  # Sets STOP_EVAL_MET_STREAK (consecutive MET verdicts) for the forced-gate check
-  # and maintains .loop/stop-nudge.md, which the next /loop-iterate reads.
-  STOP_EVAL_MET_STREAK=0
+  # Maintains STOP_EVAL_MET_STREAK / STOP_EVAL_FUTILE_STREAK (in-memory, the
+  # authoritative streaks — see their declarations) plus their display-mirror
+  # files, and .loop/stop-nudge.md, which the next /loop-iterate reads.
   [ "$STOP_EVAL" = "true" ] || return 0
-  local res line sv n pre_ref="${2:-HEAD}" preflight_line preflight_state
+  local res line sv pre_ref="${2:-HEAD}" preflight_line preflight_state
   if ! run_claude "iter-$1-stopeval" "/loop-stop-eval" "$MODEL_STOP_EVAL" reader STOP_EVAL; then
-    echo 0 > .loop/met-count
     STOP_EVAL_MET_STREAK=0
+    echo 0 > .loop/met-count
     rm -f .loop/stop-nudge.md
     journal_append "$1" "STOP_EVAL_ERROR" "stop evaluator call failed (advisory — ignored)${AGENT_FAIL_DIAG:+ — $AGENT_FAIL_DIAG}"
     return 0
@@ -1692,12 +1699,13 @@ run_stop_eval() { # $1 iter, $2 pre-ref -> updates futility + MET counters; may 
   esac
   journal_append "$1" "STOP_EVAL_$sv" "$line"
   if [ "$sv" = "FUTILE" ]; then
-    n=$(($(cat .loop/futile-count 2>/dev/null || echo 0) + 1))
-    echo "$n" > .loop/futile-count
-    if [ "$n" -ge "$FUTILE_N" ]; then
-      finish STALLED "stop evaluator judged the loop futile $n times in a row: ${line#STOP-EVAL: FUTILE}"
+    STOP_EVAL_FUTILE_STREAK=$((STOP_EVAL_FUTILE_STREAK + 1))
+    echo "$STOP_EVAL_FUTILE_STREAK" > .loop/futile-count   # display mirror
+    if [ "$STOP_EVAL_FUTILE_STREAK" -ge "$FUTILE_N" ]; then
+      finish STALLED "stop evaluator judged the loop futile $STOP_EVAL_FUTILE_STREAK times in a row: ${line#STOP-EVAL: FUTILE}"
     fi
   else
+    STOP_EVAL_FUTILE_STREAK=0
     echo 0 > .loop/futile-count
   fi
   if [ "$sv" = "MET" ]; then
@@ -1719,16 +1727,15 @@ run_stop_eval() { # $1 iter, $2 pre-ref -> updates futility + MET counters; may 
       || finish BLOCKED "deterministic preflight left an unreadable or invalid observations manifest"
     preflight_state=${preflight_line%% *}
     if [ "$preflight_state" != "SUCCESS_CANDIDATE" ]; then
-      echo 0 > .loop/met-count
       STOP_EVAL_MET_STREAK=0
+      echo 0 > .loop/met-count
       rm -f .loop/stop-nudge.md
       journal_append "$1" "FORCED_GATE_REFUSED" "MET but deterministic preflight failed: ${preflight_line#* }"
       note "forced gate refused: deterministic preflight failed (${preflight_line#* })"
       return 0
     fi
-    n=$(($(cat .loop/met-count 2>/dev/null || echo 0) + 1))
-    echo "$n" > .loop/met-count
-    STOP_EVAL_MET_STREAK=$n
+    STOP_EVAL_MET_STREAK=$((STOP_EVAL_MET_STREAK + 1))
+    echo "$STOP_EVAL_MET_STREAK" > .loop/met-count   # display mirror
     cat > .loop/stop-nudge.md <<'EOF'
 # Stop evaluator: acceptance criteria appear MET
 
@@ -1738,6 +1745,7 @@ passes, and no reviewer must-fix items remain: do NOT start new work — declare
 `READY_FOR_REVIEW` in .loop/agent-state. If real work remains, ignore this note.
 EOF
   else
+    STOP_EVAL_MET_STREAK=0
     echo 0 > .loop/met-count
     rm -f .loop/stop-nudge.md
   fi
@@ -2125,6 +2133,7 @@ run_success_gate() { # $1 iter, $2 run-start-ref, $3 pre-ref, $4 forced (0|1)
     || finish BLOCKED "success-gate preflight left an unreadable or invalid observations manifest"
   preflight_state=${preflight_line%% *}
   if [ "$preflight_state" != "SUCCESS_CANDIDATE" ]; then
+    STOP_EVAL_MET_STREAK=0
     echo 0 > .loop/met-count
     rm -f .loop/stop-nudge.md
     journal_append "$i" "GATE_PREFLIGHT_REFUSED" "${preflight_line#* }"
@@ -2160,12 +2169,15 @@ run_success_gate() { # $1 iter, $2 run-start-ref, $3 pre-ref, $4 forced (0|1)
       finish NEEDS_SPEC_DECISION "gate reviewer escalated to the human — see .loop/docs/decision-requests.md"
     fi
     if [ "$REVIEW_VERDICT" = "REVISE" ]; then
+      # reset the MET streak AND drop the wrap-up nudge on EVERY gate REVISE
+      # (forced or agent-declared): the reviewer just said work remains, so a
+      # leftover streak would re-force the gate on the next MET and a stale
+      # "declare READY" note would hand the next iteration two contradictory
+      # instructions
+      STOP_EVAL_MET_STREAK=0
+      echo 0 > .loop/met-count
+      rm -f .loop/stop-nudge.md
       if [ "$forced" -eq 1 ]; then
-        # reset the MET streak AND drop the wrap-up nudge: the reviewer just
-        # said work remains, so a leftover "declare READY" note would hand the
-        # next iteration two contradictory instructions
-        echo 0 > .loop/met-count
-        rm -f .loop/stop-nudge.md
         note "forced gate: reviewer requested revisions — continuing (not counted toward MAX_REVISIONS)"
         return 0
       fi
@@ -6138,6 +6150,10 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
     fi
     if [ "$REVIEW_VERDICT" = "REVISE" ]; then
       fixups=$(cat .loop/fleet/fixup-count 2>/dev/null || echo 0)
+      # sanitize before arithmetic (ckpt_int convention): the parent-repo gate's
+      # VERIFY_COMMANDS could corrupt this counter; garbage must read as 0, not
+      # kill the supervisor mid-gate
+      case "$fixups" in ''|*[!0-9]*) fixups=0 ;; esac
       if [ "$fixups" -ge "$fixup_cap" ]; then
         finish BLOCKED "integration review rejected the merged result after $fixups fix-up round(s) (.loop/review-feedback.md) — branches and feedback kept; fix per that file, then ./loop.sh fleet run"
       fi
