@@ -3917,6 +3917,113 @@ plan_review_task() { # $1 merged id — ONE plan-review decision at a phase boun
 
 # ---------- serial merge (Refinery pattern: one landing at a time, in-process) ----------
 
+unique_archive_dir() { # $1 wanted path -> echoes $1, or $1-2/-3... if already taken.
+  # Second-resolution archive names collide (two resets in one second, a fleet
+  # slug reused across runs) and `mkdir -p` + conditional copies would silently
+  # merge old and new evidence into one hybrid dir — always publish to a name
+  # nobody holds.
+  local d="$1" n=2
+  while [ -e "$d" ]; do d="$1-$n"; n=$((n + 1)); done
+  printf '%s' "$d"
+}
+
+verify_archived_manifest() { # $1 archive dir -> 0 when every manifest row's artifact
+  # bytes exist under <dir>/observations/ and hash-match its artifact_sha256.
+  # Manifest bytes are preserved verbatim on archive (rows keep the live
+  # `.loop/observations/<rel>` paths; rewriting them would break certificate
+  # hashes) — consumers resolve rows against the archive root, and this check
+  # applies that same resolution as an integrity gate. Absent/empty manifest =
+  # nothing to verify. Sets ARCHIVE_MANIFEST_PROBLEM on failure.
+  ARCHIVE_MANIFEST_PROBLEM=""
+  local dir="$1" pairs path sha rel actual
+  [ -s "$dir/observations-manifest.jsonl" ] || return 0
+  pairs=$(awk '
+    index($0, "\"artifact_path\":\"") && index($0, "\"artifact_sha256\":\"") {
+      p=$0; sub(/^.*"artifact_path":"/, "", p); sub(/".*/, "", p)
+      s=$0; sub(/^.*"artifact_sha256":"/, "", s); sub(/".*/, "", s)
+      if (p != "" && s != "") print p "\t" s
+    }' "$dir/observations-manifest.jsonl" 2>/dev/null) \
+    || { ARCHIVE_MANIFEST_PROBLEM="unreadable archived manifest"; return 1; }
+  while IFS=$'\t' read -r path sha; do
+    [ -n "$path" ] || continue
+    rel="${path#.loop/observations/}"
+    if [ "$rel" = "$path" ] || [ -z "$rel" ]; then
+      ARCHIVE_MANIFEST_PROBLEM="non-canonical manifest artifact path: $path"; return 1
+    fi
+    case "/$rel/" in
+      *"/../"*|*"//"*) ARCHIVE_MANIFEST_PROBLEM="unsafe manifest artifact path: $path"; return 1 ;;
+    esac
+    if [ -L "$dir/observations/$rel" ] || [ ! -f "$dir/observations/$rel" ] \
+       || [ ! -r "$dir/observations/$rel" ]; then
+      ARCHIVE_MANIFEST_PROBLEM="archived observation missing, unreadable, or a symlink: $rel"; return 1
+    fi
+    actual=$(sha256 < "$dir/observations/$rel") || actual=""
+    if [ -z "$actual" ] || [ "$actual" != "$sha" ]; then
+      ARCHIVE_MANIFEST_PROBLEM="archived observation does not match its manifest hash: $rel"; return 1
+    fi
+  done <<EOF
+$pairs
+EOF
+  return 0
+}
+
+archive_worker_docs() { # $1 id, $2 worktree — build, verify, atomically publish
+  # .loop/docs/run-archive/<id>/, fail CLOSED (any I/O failure returns 1; the
+  # caller must abort the merge — the integration gate certifies against this
+  # evidence, so an incomplete archive must never ride a merge into done/).
+  # merge_task runs in a `||` list, so set -e is inert here: every step is
+  # explicitly checked. A pre-existing archive under this reusable fleet id
+  # (an earlier orchestration's part-a) is retired to <id>-superseded-<ts>
+  # first: readers of run-archive/<id> (plan review, the integration-gate
+  # reviewer, the evidence bundle) must only ever see THIS run's evidence,
+  # never a hybrid — retired copies stay browsable for lesson carryover.
+  ARCHIVE_PROBLEM=""
+  ARCHIVE_SUPERSEDED=""
+  local id="$1" wt="$2" dst tmp f ts
+  dst=".loop/docs/run-archive/$id"
+  tmp=".loop/docs/run-archive/.tmp-$id.$$"
+  rm -rf "$tmp" 2>/dev/null || true
+  mkdir -p "$tmp" || { ARCHIVE_PROBLEM="cannot create staging dir $tmp"; return 1; }
+  # the worker's assumptions ledger + drift report: parent .loop/docs is reset to
+  # the master's every merge, so these per-phase records survive ONLY here. The
+  # integration-gate reviewer reads the archived assumptions to catch cross-task
+  # conflicts (loop-review gate mode); the drift report is the audit trail behind
+  # a drift-triggered plan-review. The per-task checklist is archived because the
+  # ROOT checklist's statuses are never maintained during a fleet run.
+  for f in product-contract.md evidence-report.md assumptions.md \
+           spec-drift-report.md acceptance-checklist.md certification.json; do
+    [ -f "$wt/.loop/docs/$f" ] || continue
+    cp "$wt/.loop/docs/$f" "$tmp/$f" \
+      || { ARCHIVE_PROBLEM="cannot copy $f"; rm -rf "$tmp"; return 1; }
+  done
+  if [ -f "$wt/.loop/task-id" ]; then
+    cp "$wt/.loop/task-id" "$tmp/task-id" \
+      || { ARCHIVE_PROBLEM="cannot copy task-id"; rm -rf "$tmp"; return 1; }
+  fi
+  if [ -d "$wt/.loop/observations" ]; then
+    cp -R "$wt/.loop/observations" "$tmp/observations" \
+      || { ARCHIVE_PROBLEM="cannot copy observations"; rm -rf "$tmp"; return 1; }
+    if [ -n "$(find "$tmp/observations" -type l 2>/dev/null | head -1)" ]; then
+      ARCHIVE_PROBLEM="observations contain symlinks"; rm -rf "$tmp"; return 1
+    fi
+  fi
+  if [ -s "$wt/.loop/observations-manifest.jsonl" ]; then
+    compact_observations_manifest "$wt/.loop/observations-manifest.jsonl" \
+        "$tmp/observations-manifest.jsonl" \
+      || { ARCHIVE_PROBLEM="cannot compact the observations manifest"; rm -rf "$tmp"; return 1; }
+    verify_archived_manifest "$tmp" \
+      || { ARCHIVE_PROBLEM="$ARCHIVE_MANIFEST_PROBLEM"; rm -rf "$tmp"; return 1; }
+  fi
+  if [ -e "$dst" ]; then
+    ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || echo archive)
+    ARCHIVE_SUPERSEDED=$(unique_archive_dir "$dst-superseded-$ts")
+    mv "$dst" "$ARCHIVE_SUPERSEDED" \
+      || { ARCHIVE_PROBLEM="cannot retire the previous archive at $dst"; ARCHIVE_SUPERSEDED=""; rm -rf "$tmp"; return 1; }
+  fi
+  mv "$tmp" "$dst" || { ARCHIVE_PROBLEM="cannot publish $dst"; rm -rf "$tmp"; return 1; }
+  return 0
+}
+
 merge_task() { # $1 id — parent tracked tree must be clean; defers (rc 1) if not
   local id="$1" branch wt summary added conflicts f merge_rc=0 mlog
   branch=$(renv_get "$id" BRANCH)
@@ -4004,28 +4111,20 @@ EOF
     return 0
   fi
 
-  mkdir -p ".loop/docs/run-archive/$id"
-  [ ! -f "$wt/.loop/docs/product-contract.md" ] || cp "$wt/.loop/docs/product-contract.md" ".loop/docs/run-archive/$id/"
-  [ ! -f "$wt/.loop/docs/evidence-report.md" ]  || cp "$wt/.loop/docs/evidence-report.md"  ".loop/docs/run-archive/$id/"
-  # the worker's assumptions ledger + drift report: parent .loop/docs is reset to
-  # the master's every merge, so these per-phase records survive ONLY here. The
-  # integration-gate reviewer reads the archived assumptions to catch cross-task
-  # conflicts (loop-review gate mode); the drift report is the audit trail behind
-  # a drift-triggered plan-review.
-  [ ! -f "$wt/.loop/docs/assumptions.md" ]        || cp "$wt/.loop/docs/assumptions.md"        ".loop/docs/run-archive/$id/"
-  [ ! -f "$wt/.loop/docs/spec-drift-report.md" ]  || cp "$wt/.loop/docs/spec-drift-report.md"  ".loop/docs/run-archive/$id/"
-  # the worker's acceptance checklist: the ROOT checklist's statuses are never
-  # maintained during a fleet run, so the integration-gate reviewer judges
-  # expectation closure from these archived per-task copies instead
-  [ ! -f "$wt/.loop/docs/acceptance-checklist.md" ] || cp "$wt/.loop/docs/acceptance-checklist.md" ".loop/docs/run-archive/$id/"
-  [ ! -f "$wt/.loop/docs/certification.json" ] || cp "$wt/.loop/docs/certification.json" ".loop/docs/run-archive/$id/"
-  [ ! -f "$wt/.loop/task-id" ] || cp "$wt/.loop/task-id" ".loop/docs/run-archive/$id/task-id"
-  [ ! -d "$wt/.loop/observations" ] || cp -R "$wt/.loop/observations" ".loop/docs/run-archive/$id/observations"
-  if [ -s "$wt/.loop/observations-manifest.jsonl" ]; then
-    compact_observations_manifest "$wt/.loop/observations-manifest.jsonl" \
-      ".loop/docs/run-archive/$id/observations-manifest.jsonl"
+  if ! archive_worker_docs "$id" "$wt"; then
+    # fail CLOSED: an incomplete or unverifiable evidence archive must never
+    # ride a merge into done/ — the integration gate certifies against it
+    # (same unwind as the commit-failure path below; the branch is kept)
+    git merge --abort 2>/dev/null || git reset --hard HEAD >/dev/null 2>&1
+    task_fail "$id" MERGE_FAILED "worker evidence archive failed: ${ARCHIVE_PROBLEM:-unknown} (branch $branch kept — fix the cause, then ./loop.sh fleet merge $id, or rework the task)"
+    return 0
   fi
-  git add ".loop/docs/run-archive/$id" 2>/dev/null || true
+  # shellcheck disable=SC2086  # ARCHIVE_SUPERSEDED is a single path or empty
+  if ! git add -- ".loop/docs/run-archive/$id" ${ARCHIVE_SUPERSEDED:+"$ARCHIVE_SUPERSEDED"} 2>>"$mlog"; then
+    git merge --abort 2>/dev/null || git reset --hard HEAD >/dev/null 2>&1
+    task_fail "$id" MERGE_FAILED "could not stage the worker evidence archive: $(tail -1 "$mlog" | tr '\n' ' ')(branch $branch kept)"
+    return 0
+  fi
 
   if git diff --cached --quiet 2>/dev/null; then
     git merge --abort 2>/dev/null || true
@@ -6810,17 +6909,23 @@ retire_previous_evidence_report() { # fresh run: archive stale view/certificate
     return 0
   fi
   ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || echo archive)
-  dst=".loop/docs/run-archive/$ts-prevrun"
-  mkdir -p "$dst"
+  dst=$(unique_archive_dir ".loop/docs/run-archive/$ts-prevrun")
+  mkdir -p .loop/docs/run-archive 2>/dev/null || true   # leaf mkdir below reports failure
+  mkdir "$dst" \
+    || die_next "cannot create the archive dir $dst" "fix permissions/disk space, then ./loop.sh run"
   if [ -f "$report" ] && doc_differs_from_template "$report"; then
-    cp "$report" "$dst/evidence-report.md"
+    cp "$report" "$dst/evidence-report.md" \
+      || die_next "could not archive the previous evidence report to $dst (nothing was reset)" "fix permissions/disk space, then ./loop.sh run"
   fi
   if [ -f .loop/templates/evidence-report.md ]; then
     cp .loop/templates/evidence-report.md "$report"
   else
     : > "$report"
   fi
-  [ ! -s "$cert" ] || cp "$cert" "$dst/certification.json"
+  if [ -s "$cert" ]; then
+    cp "$cert" "$dst/certification.json" \
+      || die_next "could not archive the previous certification.json to $dst (certificate not deleted)" "fix permissions/disk space, then ./loop.sh run"
+  fi
   rm -f "$cert"
 }
 
@@ -6834,21 +6939,35 @@ reset_contract_scoped_docs() { # [--keep-contract] — archive + reset the loop 
   clear_task_start_ref
   [ -d .loop/templates ] && [ -n "$(ls .loop/templates/*.md 2>/dev/null)" ] \
     || die "this deployment has no .loop/templates (pristine doc templates) — run: ./loop.sh update"
-  # 1. archive every filled-in doc (tracked -> the commit is the audit trail)
+  # 1. archive every filled-in doc (tracked -> the commit is the audit trail).
+  # Every copy is fail-CLOSED with an explicit die_next: step 3 below DELETES
+  # the originals (rm -rf .loop/observations, rm -f the manifest), so a failed
+  # copy that fell through would destroy the only remaining evidence.
   ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || echo archive)
-  dst=".loop/docs/run-archive/$ts-root"
-  mkdir -p "$dst"
+  dst=$(unique_archive_dir ".loop/docs/run-archive/$ts-root")
+  mkdir -p .loop/docs/run-archive 2>/dev/null || true   # leaf mkdir below reports failure
+  mkdir "$dst" \
+    || die_next "cannot create the archive dir $dst" "fix permissions/disk space, then retry the new task definition"
   for f in .loop/docs/*.md; do
     [ -f "$f" ] || continue
-    doc_differs_from_template "$f" && cp "$f" "$dst/"
+    doc_differs_from_template "$f" && { cp "$f" "$dst/" \
+      || die_next "could not archive $f to $dst — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"; }
   done
-  [ ! -s .loop/docs/certification.json ] || cp .loop/docs/certification.json "$dst/"
-  [ ! -s .loop/task-id ] || cp .loop/task-id "$dst/task-id"
+  if [ -s .loop/docs/certification.json ]; then
+    cp .loop/docs/certification.json "$dst/" \
+      || die_next "could not archive certification.json to $dst — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"
+  fi
+  if [ -s .loop/task-id ]; then
+    cp .loop/task-id "$dst/task-id" \
+      || die_next "could not archive .loop/task-id to $dst — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"
+  fi
   if [ -d .loop/observations ]; then
-    cp -R .loop/observations "$dst/observations"
+    cp -R .loop/observations "$dst/observations" \
+      || die_next "could not archive .loop/observations to $dst — task reset aborted (nothing was deleted)" "fix permissions/disk space, then retry the new task definition"
   fi
   if [ -s .loop/observations-manifest.jsonl ]; then
-    compact_observations_manifest .loop/observations-manifest.jsonl "$dst/observations-manifest.jsonl"
+    compact_observations_manifest .loop/observations-manifest.jsonl "$dst/observations-manifest.jsonl" \
+      || die_next "could not archive the observations manifest to $dst — task reset aborted (nothing was deleted)" "inspect .loop/observations-manifest.jsonl, then retry the new task definition"
   fi
   rmdir "$dst" 2>/dev/null || true   # nothing was live -> no empty archive dir
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
