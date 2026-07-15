@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# loop.sh — loop-kit: contract-based loop engineering harness for Claude Code.
+# loop.sh — loop-kit: contract-based loop engineering harness for Claude Code and Codex.
 #
 # Deployed layout (inside the target project; only this file + conf files are visible):
 #   loop.sh              main entry (this file, copied by `loop.sh init`)
 #   loop.config.sh       contract stop conditions (hash-approved, never sourced unverified)
-#   loop.models.sh       model roles per process (safe-parsed, never sourced)
+#   loop.models.sh       agent/model routing per role (safe-parsed, never sourced)
 #   loop-instruction.md  optional: your task instruction for `./loop.sh` auto flow
 #   .claude/skills/      loop-* skills (the encoded process)
 #   .loop/               everything else: bin/evaluate.sh, docs/ (contract, plan,
@@ -43,6 +43,9 @@ set -euo pipefail
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 SCRIPT_DIR="$(dirname "$SELF")"
 CLAUDE_CMD="${LOOP_CLAUDE_CMD:-claude}"
+CODEX_CMD="${LOOP_CODEX_CMD:-codex}"
+CODEX_PROBE_DONE=0
+CODEX_COST_WARNING_EMITTED=0
 TOTAL_COST=0
 CHILD_PID=""
 AGENT_PID=""
@@ -163,7 +166,7 @@ KIT (deploy / upgrade)
                         Remove the deployed kit from a project (asks to confirm)
 
 REVIEW   .loop/docs/product-contract.md   .loop/docs/evidence-report.md
-CONFIG   loop.config.sh (stop conditions)   loop.models.sh (models per process)
+CONFIG   loop.config.sh (stop conditions)   loop.models.sh (agents/models per role)
 HTML     authored only when a rubric warrants it; LOOP_HTML=1/0 forces on/off,
          LOOP_BROWSER_CMD overrides the opener
 EOF
@@ -272,7 +275,7 @@ print_next_actions() {
       echo
       echo " ▸ If it keeps failing it may not be a limit — check:"
       echo "     .loop/logs/failed/     the raw error from the last call"
-      echo "     your Claude auth / plan, or the LOOP_CLAUDE_CMD you pointed at"
+      echo "     the routed agent's auth / plan, or LOOP_CLAUDE_CMD / LOOP_CODEX_CMD"
       ;;
   esac
   echo "────────────────────────────────────────────────────────────"
@@ -391,6 +394,48 @@ need_claude() {
   fi
 }
 
+# Codex is optional and is probed lazily: a pure-Claude configuration must not
+# start even a help/auth subprocess. The installed CLI currently exposes the
+# approval policy as a GLOBAL option (`codex --ask-for-approval never exec`),
+# while JSONL/output flags are exec options, so both help surfaces are checked.
+need_codex() {
+  if ! command -v "$CODEX_CMD" >/dev/null 2>&1; then
+    if [ "${1:-}" = fleet ]; then
+      fdie_next "codex CLI not found ('$CODEX_CMD')" "install Codex CLI (npm i -g @openai/codex), or point LOOP_CODEX_CMD at its path"
+    else
+      die_next "codex CLI not found ('$CODEX_CMD')" "install Codex CLI (npm i -g @openai/codex), or point LOOP_CODEX_CMD at its path"
+    fi
+  fi
+  [ "$CODEX_PROBE_DONE" = 0 ] || return 0
+
+  local exec_help="" top_help="" login_help=""
+  exec_help=$("$CODEX_CMD" exec --help 2>&1 || true)
+  top_help=$("$CODEX_CMD" --help 2>&1 || true)
+  local capability_ok=1
+  case "$exec_help" in *--json*) ;; *) capability_ok=0 ;; esac
+  case "$exec_help" in *--output-last-message*) ;; *) capability_ok=0 ;; esac
+  case "$top_help" in *--ask-for-approval*) ;; *) capability_ok=0 ;; esac
+  if [ "$capability_ok" = 0 ]; then
+    if [ "${1:-}" = fleet ]; then
+      fdie_next "codex CLI too old (needs exec --json / --output-last-message and global --ask-for-approval)" "upgrade Codex CLI"
+    else
+      die_next "codex CLI too old (needs exec --json / --output-last-message and global --ask-for-approval)" "upgrade Codex CLI"
+    fi
+  fi
+
+  # login status is advisory only: environment-based auth may not be reflected
+  # by every CLI release, so the real exec failure remains the authoritative
+  # error path. Silently skip this probe if the subcommand is unavailable.
+  login_help=$("$CODEX_CMD" login --help 2>&1 || true)
+  case "$login_help" in
+    *status*)
+      if ! "$CODEX_CMD" login status >/dev/null 2>&1; then
+        note "warning: codex login status failed — a configured OPENAI_API_KEY may still work; otherwise run: codex login"
+      fi ;;
+  esac
+  CODEX_PROBE_DONE=1
+}
+
 # ---------- config / models (verify-then-load; models are parsed, never sourced) ----------
 
 need_kit() {
@@ -408,7 +453,7 @@ harness_hash() {
     # session config that changes what FUTURE agent sessions may do (permission
     # allowlists, MCP servers). These are often gitignored by the project, so
     # the evaluator's diff policy cannot see them — only this hash can.
-    cat .claude/settings.json .claude/settings.local.json .mcp.json 2>/dev/null || true
+    cat .claude/settings.json .claude/settings.local.json .mcp.json .codex/config.toml 2>/dev/null || true
   } | sha256
 }
 
@@ -586,7 +631,7 @@ verify_approval() { # dies unless both hashes match the approved ones
   [ -f .loop/approved-harness ] \
     || die "harness approval record missing (.loop/approved-harness) — re-approve: ./loop.sh approve"
   if [ "$(cat .loop/approved-harness)" != "$(harness_hash)" ]; then
-    die "harness or session config changed since approval (loop.sh / evaluate.sh / skills / .claude settings / .mcp.json) — if intentional, re-run: ./loop.sh approve"
+    die "harness or session config changed since approval (loop.sh / evaluate.sh / skills / .claude settings / .mcp.json / .codex/config.toml) — if intentional, re-run: ./loop.sh approve"
   fi
   # off-tree approval store: the trust anchor BEHIND the (agent-writable) repo
   # mirrors above. The mirrors keep their checks and messages for honest, fast
@@ -760,6 +805,16 @@ load_config() {
   case "$SPLIT_NUDGE_AT" in
     *[!0-9]*) die_next "SPLIT_NUDGE_AT must be an integer percent (0 disables)" "fix SPLIT_NUDGE_AT in loop.config.sh" ;;
   esac
+  : "${LOOP_CODEX_SANDBOX:=workspace-write}"
+  : "${LOOP_CODEX_NETWORK:=1}"
+  case "$LOOP_CODEX_SANDBOX" in
+    read-only|workspace-write|danger-full-access) ;;
+    *) die_next "LOOP_CODEX_SANDBOX must be read-only, workspace-write, or danger-full-access" "fix LOOP_CODEX_SANDBOX in loop.config.sh, then ./loop.sh approve" ;;
+  esac
+  case "$LOOP_CODEX_NETWORK" in
+    0|1) ;;
+    *) die_next "LOOP_CODEX_NETWORK must be 0 or 1" "fix LOOP_CODEX_NETWORK in loop.config.sh, then ./loop.sh approve" ;;
+  esac
   : "${PERMISSION_MODE:=acceptEdits}"   # deny-enforcing; bypassPermissions would IGNORE DISALLOWED_TOOLS
   : "${ALLOWED_TOOLS:=Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite,NotebookEdit}"
   : "${DISALLOWED_TOOLS:=}"             # opt-in tool deny-list (primary control); empty = deny nothing
@@ -798,6 +853,113 @@ get_model() { # $1 role var, $2 default — safe key=value parse, no code execut
   echo "${v:-$2}"
 }
 
+configured_agent() { # $1 role -> effective configured agent (no one-shot state)
+  local role="${1:-}" a=""
+  [ "$role" != CONTRACT ] || { printf 'claude'; return 0; }
+  if [ "$role" = REVIEW_INTERIM ]; then
+    a=$(get_model AGENT_REVIEW_INTERIM "")
+    [ -n "$a" ] || a=$(get_model AGENT_REVIEW claude)
+  elif [ -n "$role" ]; then
+    a=$(get_model "AGENT_$role" "")
+  fi
+  case "$a" in codex) printf 'codex' ;; *) printf 'claude' ;; esac
+}
+
+resolve_agent() { # $1 optional role -> claude|codex; one-shot wins for one call
+  local role="${1:-}" a=""
+  # A role-less legacy/future call is always Claude. In particular, it must not
+  # accidentally consume an interim-review one-shot intended for the next call.
+  [ -n "$role" ] || { printf 'claude'; return 0; }
+  # Definition is a hard security/product boundary, not merely a shipped default.
+  [ "$role" != CONTRACT ] || { printf 'claude'; return 0; }
+  if [ -n "${LOOP_AGENT_ONESHOT:-}" ]; then
+    a="$LOOP_AGENT_ONESHOT"
+    case "$a" in claude|codex) printf '%s' "$a"; return 0 ;; esac
+  fi
+  configured_agent "$role"
+}
+
+configured_role_model() { # $1 role -> effective model including interim inheritance
+  case "${1:-}" in
+    IMPLEMENT)      get_model MODEL_IMPLEMENT opus ;;
+    PLAN)           get_model MODEL_PLAN opus ;;
+    REVIEW)         get_model MODEL_REVIEW opus ;;
+    REVIEW_INTERIM) get_model MODEL_REVIEW_INTERIM "$(get_model MODEL_REVIEW opus)" ;;
+    STOP_EVAL)      get_model MODEL_STOP_EVAL haiku ;;
+    EVIDENCE)       get_model MODEL_EVIDENCE sonnet ;;
+    DECOMPOSE)      get_model MODEL_DECOMPOSE opus ;;
+    SUPERVISE)      get_model MODEL_SUPERVISE opus ;;
+    CONTRACT)       get_model MODEL_CONTRACT opus ;;
+    *)              printf '%s' "" ;;
+  esac
+}
+
+get_config_scalar() { # $1 key, $2 default — display/warning parser; never source
+  local v=""
+  if [ -f loop.config.sh ]; then
+    v=$(grep -E "^[[:space:]]*$1=" loop.config.sh | tail -1 \
+        | sed -E 's/^[^=]+=//; s/#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//') || v=""
+  fi
+  printf '%s' "${v:-$2}"
+}
+
+print_agent_routing() {
+  local role agent model
+  note "agent routing (role -> agent/model):"
+  note "  CONTRACT -> claude/$(configured_role_model CONTRACT) (pinned)"
+  for role in PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
+    agent=$(configured_agent "$role")
+    model=$(configured_role_model "$role")
+    note "  $role -> $agent/$model"
+  done
+  if [ -n "$(get_model AGENT_CONTRACT "")" ]; then
+    note "  warning: AGENT_CONTRACT is ignored; CONTRACT is pinned to Claude"
+  fi
+  if codex_routing_enabled && [ -n "$(get_config_scalar DISALLOWED_TOOLS "")" ]; then
+    note "  warning: DISALLOWED_TOOLS constrains Claude only; Codex roles use LOOP_CODEX_SANDBOX/LOOP_CODEX_NETWORK"
+  fi
+}
+
+codex_routing_enabled() {
+  local role
+  for role in IMPLEMENT PLAN REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
+    [ "$(configured_agent "$role")" != codex ] || return 0
+  done
+  return 1
+}
+
+warn_codex_cost_untracked() {
+  [ "$CODEX_COST_WARNING_EMITTED" = 0 ] || return 0
+  [ -n "${MAX_COST_USD:-}" ] || return 0
+  codex_routing_enabled || return 0
+  CODEX_COST_WARNING_EMITTED=1
+  note "warning: MAX_COST_USD cannot bound Codex calls — Codex USD cost is recorded as 0; the cap covers Claude calls only"
+  # This is preflight bookkeeping, not an agent call. Seed explicit zero mirrors
+  # so a prior call/run cannot lend stale cost or turn values to the audit row.
+  echo 0 > .loop/last-cost
+  echo 0 > .loop/last-turns
+  journal_append "preflight" "CODEX_COST_UNTRACKED" "Codex-routed roles report no USD cost; MAX_COST_USD covers Claude calls only"
+}
+
+need_agents() { # run/fleet preflight; Claude is mandatory, Codex remains lazy
+  local scope="${1:-}" role agent model
+  need_claude "$scope"
+  for role in IMPLEMENT PLAN REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
+    agent=$(configured_agent "$role")
+    [ "$agent" = codex ] || continue
+    need_codex "$scope"
+    model=$(configured_role_model "$role")
+    case "$model" in
+      opus|sonnet|haiku|claude-*)
+        if [ "$scope" = fleet ]; then
+          fdie_next "AGENT_$role=codex but MODEL_$role='$model' is a Claude alias" "set MODEL_$role to a Codex model slug (e.g. gpt-5.5) in loop.models.sh"
+        else
+          die_next "AGENT_$role=codex but MODEL_$role='$model' is a Claude alias" "set MODEL_$role to a Codex model slug (e.g. gpt-5.5) in loop.models.sh"
+        fi ;;
+    esac
+  done
+}
+
 resolve_effort() { # $1 optional role key (e.g. REVIEW) — echoes the effective
   # reasoning effort for that role, or nothing.
   # Same safe key=value parse as get_model (efforts live in loop.models.sh
@@ -825,6 +987,25 @@ effort_opt() { # $1 optional role key — echoes '--effort <level>' for that rol
   # vanishes, adding no argument.
   local e; e=$(resolve_effort "${1:-}")
   [ -z "$e" ] || printf -- '--effort %s' "$e"
+}
+
+codex_effort_opt() { # $1 optional role key -> '-c model_reasoning_effort=<v>'
+  local e; e=$(resolve_effort "${1:-}")
+  [ "$e" != max ] || e=xhigh
+  [ -z "$e" ] || printf -- '-c model_reasoning_effort=%s' "$e"
+}
+
+codex_prompt() { # Claude skill invocation -> deterministic direct-file prompt
+  local prompt="$1" call skill rest=""
+  call=${prompt%% *}
+  case "$call" in
+    /loop-*) skill=${call#/loop-} ;;
+    *) printf '%s' "$prompt"; return 0 ;;
+  esac
+  case "$skill" in ''|*[!a-z-]*) printf '%s' "$prompt"; return 0 ;; esac
+  [ "$call" = "$prompt" ] || rest=${prompt#"$call" }
+  printf 'Read the file .claude/skills/loop-%s/SKILL.md and execute its instructions exactly as your current task.' "$skill"
+  [ -z "$rest" ] || printf ' Treat the following as the skill arguments: %s' "$rest"
 }
 
 resolve_iter_timeout() { # $1 optional role key — echoes the effective per-call
@@ -1141,66 +1322,146 @@ agent_log_path() { # $1 label, $2 json|err
   printf '%s/%s.%s' "$(active_log_dir)" "$1" "$2"
 }
 
+normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
+  local raw="$1" msg="$2" out="$3" status="$4"
+  local thread="" thread_escaped="" turns=0 is_error=false result_escaped="" error_line="" error_text="" error_tmp=""
+  if [ -f "$raw" ]; then
+    thread=$(awk '
+      $0 ~ /^[[:space:]]*\{[[:space:]]*"type"[[:space:]]*:[[:space:]]*"thread.started"/ {
+        s=$0
+        sub(/^.*"thread_id"[[:space:]]*:[[:space:]]*"/, "", s)
+        sub(/".*$/, "", s)
+        print s
+        exit
+      }
+    ' "$raw" 2>/dev/null || true)
+    turns=$(awk '$0 ~ /^[[:space:]]*\{[[:space:]]*"type"[[:space:]]*:[[:space:]]*"item.completed"/ { n++ } END { print n+0 }' "$raw" 2>/dev/null || true)
+    if awk '$0 ~ /^[[:space:]]*\{[[:space:]]*"type"[[:space:]]*:[[:space:]]*"(turn.failed|error)"/ { found=1; exit } END { exit !found }' "$raw" 2>/dev/null; then
+      is_error=true
+    fi
+  fi
+  case "$turns" in ''|*[!0-9]*) turns=0 ;; esac
+  [ "$status" -eq 0 ] || is_error=true
+  [ -s "$msg" ] || is_error=true
+
+  if [ -s "$msg" ]; then
+    result_escaped=$(json_escape < "$msg")
+  elif [ -f "$raw" ]; then
+    error_line=$(awk '$0 ~ /^[[:space:]]*\{[[:space:]]*"type"[[:space:]]*:[[:space:]]*"error"/ { print; exit }' "$raw" 2>/dev/null || true)
+    if [ -n "$error_line" ]; then
+      # json_field intentionally accepts regular files only; stage this one
+      # event beside the final envelope, then remove it immediately.
+      error_tmp="${out}.error.tmp.$$"
+      printf '%s\n' "$error_line" > "$error_tmp"
+      error_text=$(json_field "$error_tmp" message "")
+      rm -f "$error_tmp"
+      result_escaped=$(printf '%s' "$error_text" | json_escape)
+    fi
+  fi
+  thread_escaped=$(printf '%s' "$thread" | json_escape)
+  printf '{"type": "result", "result": "%s", "session_id": "%s", "num_turns": %s, "total_cost_usd": 0, "is_error": %s}\n' \
+    "$result_escaped" "$thread_escaped" "$turns" "$is_error" > "$out"
+}
+
 run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
   # $5 optional role key (EFFORT_<role> override; omitted = global effort only)
   # — cost accumulated
   local label="$1" prompt="$2" model="$3" mode="$4" role="${5:-}"
-  local logdir out err
+  local logdir out err raw="" msg="" agent codex_prompt_text=""
   logdir=$(active_log_dir)
   mkdir -p "$logdir"
   out="$logdir/${label}.json"
   err="$logdir/${label}.err"
+  # A label can be retried or resumed after routing changes. Never let an old
+  # Codex sidecar masquerade as evidence for a later Claude call (or NOMSG).
+  rm -f "$out" "$err" "$logdir/${label}.codex.jsonl" "$logdir/${label}.msg"
   local pid status elapsed cost is_err timed_out=0
   AGENT_FAIL_DIAG=""   # set on failure; consumed by journal reasons + terminal messages
-
-  # per-call USD cap only when a total budget is configured — subscription
-  # usage has no per-token charge (see MAX_COST_USD in loop.config.sh)
-  if [ -n "${MAX_COST_USD:-}" ]; then
-    set -- --max-budget-usd "$(remaining_budget)"
-  else
-    set --
+  agent=$(resolve_agent "$role")
+  # resolve_agent runs in command substitution (a subshell), so consume the
+  # parent-shell one-shot explicitly here; clearing inside the resolver alone
+  # would leak the override into later calls.
+  LOOP_AGENT_ONESHOT=""
+  if [ "$agent" = codex ]; then
+    # Defense in depth for pre-approval REVIEW calls, which do not pass through
+    # cmd_run/cmd_fleet's broader preflight.
+    need_codex
+    case "$model" in
+      opus|sonnet|haiku|claude-*)
+        die_next "AGENT_${role:-UNKNOWN}=codex but MODEL_${role:-UNKNOWN}='$model' is a Claude alias" "set MODEL_${role:-UNKNOWN} to a Codex model slug (e.g. gpt-5.5) in loop.models.sh" ;;
+    esac
   fi
-
-  # reasoning effort for this call (per-role EFFORT_* override, else the global
-  # LOOP_EFFORT; empty resolution passes no flag -> the CLI's own default effort)
-  local eff; eff=$(resolve_effort "$role")
-  [ -z "$eff" ] || set -- "$@" --effort "$eff"
 
   # per-call wall-clock watchdog: a per-role TIMEOUT_<ROLE> override (else the
   # global MAX_ITER_SECONDS) — a heavy IMPLEMENT iteration can legitimately
   # outlast the clerical STOP_EVAL/EVIDENCE calls, so the ceiling is per role.
   local iter_timeout; iter_timeout=$(resolve_iter_timeout "$role")
 
-  # opt-in session continuity (supervisor role): the caller sets
-  # CLAUDE_RESUME_SESSION for ONE call; every tool/effort/model flag is still
-  # passed explicitly per call, so a resumed session never widens permissions
-  if [ -n "${CLAUDE_RESUME_SESSION:-}" ]; then
-    set -- "$@" --resume "$CLAUDE_RESUME_SESSION"
-    CLAUDE_RESUME_SESSION=""
-  fi
-
-  if [ "$mode" = "reader" ]; then
-    # structurally read-only: editors and Bash do not exist in the session
-    launch_agent "$CLAUDE_CMD" -p "$prompt" \
-      --output-format json \
-      --model "$model" \
-      --fallback-model "sonnet" \
-      --tools "Read,Glob,Grep" \
+  if [ "$agent" = codex ]; then
+    raw="$logdir/${label}.codex.jsonl"
+    msg="$logdir/${label}.msg"
+    set --
+    local codex_eff="" codex_sandbox
+    codex_eff=$(codex_effort_opt "$role")
+    if [ -n "$codex_eff" ]; then
+      # codex_effort_opt only emits two whitelist-derived words.
+      # shellcheck disable=SC2086
+      set -- "$@" $codex_eff
+    fi
+    if [ "$mode" = reader ]; then
+      codex_sandbox=read-only
+    else
+      codex_sandbox=${LOOP_CODEX_SANDBOX:-workspace-write}
+      if [ "$codex_sandbox" = workspace-write ] && [ "${LOOP_CODEX_NETWORK:-1}" = 1 ]; then
+        set -- "$@" -c sandbox_workspace_write.network_access=true
+      fi
+    fi
+    # Codex v0.144 exposes approval policy globally, before the exec subcommand.
+    codex_prompt_text=$(codex_prompt "$prompt")
+    CLAUDE_RESUME_SESSION=""   # consume any stray Claude-only one-shot
+    launch_agent "$CODEX_CMD" --ask-for-approval never exec --json \
+      -o "$msg" \
+      -m "$model" \
+      --sandbox "$codex_sandbox" \
       "$@" \
-      > "$out" 2> "$err"
+      "$codex_prompt_text" \
+      > "$raw" 2> "$err"
   else
-    # Full session: broad ALLOWED_TOOLS grants the worker its tools; DISALLOWED_TOOLS
-    # (opt-in, loop.config.sh) restricts and wins over allow. Enforced under the
-    # deny-enforcing acceptEdits mode (bypassPermissions would ignore the deny-list).
-    [ -n "${DISALLOWED_TOOLS:-}" ] && set -- "$@" --disallowedTools "$DISALLOWED_TOOLS"
-    launch_agent "$CLAUDE_CMD" -p "$prompt" \
-      --output-format json \
-      --model "$model" \
-      --fallback-model "sonnet" \
-      --permission-mode "$PERMISSION_MODE" \
-      --allowedTools "$(derive_allowed_tools)" \
-      "$@" \
-      > "$out" 2> "$err"
+    # Every option below is Claude-only: USD budget, effort, fallback model,
+    # tool permissions and session resume never cross the adapter boundary.
+    if [ -n "${MAX_COST_USD:-}" ]; then
+      set -- --max-budget-usd "$(remaining_budget)"
+    else
+      set --
+    fi
+    local eff; eff=$(resolve_effort "$role")
+    [ -z "$eff" ] || set -- "$@" --effort "$eff"
+    if [ -n "${CLAUDE_RESUME_SESSION:-}" ]; then
+      set -- "$@" --resume "$CLAUDE_RESUME_SESSION"
+    fi
+    CLAUDE_RESUME_SESSION=""
+    if [ "$mode" = "reader" ]; then
+      # structurally read-only: editors and Bash do not exist in the session
+      launch_agent "$CLAUDE_CMD" -p "$prompt" \
+        --output-format json \
+        --model "$model" \
+        --fallback-model "sonnet" \
+        --tools "Read,Glob,Grep" \
+        "$@" \
+        > "$out" 2> "$err"
+    else
+      # Full session: broad ALLOWED_TOOLS grants the worker its tools;
+      # DISALLOWED_TOOLS restricts Claude only and wins over allow.
+      [ -n "${DISALLOWED_TOOLS:-}" ] && set -- "$@" --disallowedTools "$DISALLOWED_TOOLS"
+      launch_agent "$CLAUDE_CMD" -p "$prompt" \
+        --output-format json \
+        --model "$model" \
+        --fallback-model "sonnet" \
+        --permission-mode "$PERMISSION_MODE" \
+        --allowedTools "$(derive_allowed_tools)" \
+        "$@" \
+        > "$out" 2> "$err"
+    fi
   fi
   pid=$AGENT_PID
   CHILD_PID=$pid
@@ -1227,6 +1488,10 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
   wait "$pid" || status=$?
   CHILD_PID=""
 
+  if [ "$agent" = codex ]; then
+    normalize_codex_envelope "$raw" "$msg" "$out" "$status"
+  fi
+
   cost=$(json_field "$out" total_cost_usd 0)
   add_cost "$cost"
   echo "$cost" > .loop/last-cost
@@ -1244,14 +1509,14 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
     # the CLI reports API-level failures in the stdout JSON (is_error/result),
     # NOT on stderr — surface both, and preserve the evidence before the next
     # run's identically-labeled call overwrites it
-    local msg="" errtail=""
-    msg=$(json_field "$out" result "" | head -c 200 | tr '\n' ' ')
+    local result_preview="" errtail=""
+    result_preview=$(json_field "$out" result "" | head -c 200 | tr '\n' ' ')
     [ ! -s "$err" ] || errtail=$(tail -c 200 "$err" | tr '\n' ' ')
     AGENT_FAIL_DIAG="exit=$status is_error=$is_err"
     [ "$timed_out" = 0 ] || AGENT_FAIL_DIAG="$AGENT_FAIL_DIAG (watchdog kill after ${iter_timeout}s)"
-    [ -z "$msg" ] || AGENT_FAIL_DIAG="$AGENT_FAIL_DIAG; msg: $msg"
+    [ -z "$result_preview" ] || AGENT_FAIL_DIAG="$AGENT_FAIL_DIAG; msg: $result_preview"
     [ -z "$errtail" ] || AGENT_FAIL_DIAG="$AGENT_FAIL_DIAG; stderr: $errtail"
-    preserve_failed_call "$label" "$out" "$err"
+    preserve_failed_call "$label" "$out" "$err" "$raw" "$msg"
     note "agent call '$label' failed ($AGENT_FAIL_DIAG) — preserved: .loop/logs/failed/"
     return 1
   fi
@@ -1262,22 +1527,33 @@ preserve_failed_call() { # $1 label $2 stdout-JSON $3 stderr — preserve global
   # sidecars out of the per-run log dir (fixed names get overwritten by the next
   # run's identically-labeled call) into .loop/logs/failed/, pruned to the newest
   # 20 failures so evidence survives without unbounded growth.
-  local label="$1" out="$2" err="$3" ts f
+  local label="$1" out="$2" err="$3" raw="${4:-}" msg="${5:-}" ts f base
   ts=$(date -u +%Y%m%dT%H%M%SZ)
   mkdir -p .loop/logs/failed
-  for f in "$out" "$err"; do
+  for f in "$out" "$err" "$raw" "$msg"; do
+    [ -n "$f" ] || continue
     [ -s "$f" ] || continue
     cp "$f" ".loop/logs/failed/${label}.${ts}${f##*"$label"}" 2>/dev/null || true
   done
   # shellcheck disable=SC2012  # ls -t is the portable newest-first choice (macOS find lacks -printf)
   ls -t .loop/logs/failed/*.json 2>/dev/null | tail -n +21 | while IFS= read -r f; do
-    rm -f "$f" "${f%.json}.err"
-  done
+    base=${f%.json}
+    rm -f "$f" "$base.err" "$base.codex.jsonl" "$base.msg"
+  done || true
   # orphan .err sidecars (empty-JSON failures) get the same bound
   # shellcheck disable=SC2012
   ls -t .loop/logs/failed/*.err 2>/dev/null | tail -n +21 | while IFS= read -r f; do
     [ -f "${f%.err}.json" ] || rm -f "$f"
-  done
+  done || true
+  # Codex raw/message sidecars follow the primary envelope's lifetime too.
+  # shellcheck disable=SC2012
+  ls -t .loop/logs/failed/*.codex.jsonl 2>/dev/null | tail -n +21 | while IFS= read -r f; do
+    [ -f "${f%.codex.jsonl}.json" ] || rm -f "$f"
+  done || true
+  # shellcheck disable=SC2012
+  ls -t .loop/logs/failed/*.msg 2>/dev/null | tail -n +21 | while IFS= read -r f; do
+    [ -f "${f%.msg}.json" ] || rm -f "$f"
+  done || true
 }
 
 agent_result() { # $1 label -> the agent's final text
@@ -1450,7 +1726,7 @@ check_harness() { # $1 when — compares against the run's IN-MEMORY baselines, 
   # forged .loop/approved-harness (agent-writable) cannot defeat this check.
   # RISK_REQUIRES_APPROVAL (exit 3): human decision; watch must not retry this.
   if [ "$(harness_hash)" != "$RUN_HARNESS_HASH" ]; then
-    finish RISK_REQUIRES_APPROVAL "harness or session config changed $1 (loop.sh/evaluate.sh/skills/.claude settings/.mcp.json) — possible tampering; review the change, then ./loop.sh approve if intentional"
+    finish RISK_REQUIRES_APPROVAL "harness or session config changed $1 (loop.sh/evaluate.sh/skills/.claude settings/.mcp.json/.codex/config.toml) — possible tampering; review the change, then ./loop.sh approve if intentional"
   fi
   if [ "$(models_hash)" != "$RUN_MODELS_HASH" ]; then
     finish RISK_REQUIRES_APPROVAL "loop.models.sh or fleet.config.sh changed $1 — these files are gitignored (invisible to the diff policy), so a mid-run change can only come from inside the loop; review it, revert if unintended, then re-run"
@@ -1673,6 +1949,12 @@ run_review() { # $1 iter, $2 diff-base-ref, $3 mode (interim|gate), $4 scope (it
   label="iter-$1-review"
   if [ "$mode" = "gate" ]; then label="iter-$1-review-gate"; fi
   for _ in 1 2; do   # up to twice: retry on launch failure OR unparseable verdict
+    if [ "$mode" = interim ]; then
+      # One-shot keeps gate/decompose/contract reviews on AGENT_REVIEW while
+      # allowing interim steering to inherit or override it independently.
+      # Reset before EACH retry because run_claude consumes it per call.
+      LOOP_AGENT_ONESHOT=$(configured_agent REVIEW_INTERIM)
+    fi
     run_claude "$label" "$prompt" "$rmodel" reader REVIEW || continue
     res=$(agent_result "$label")
     verdict=$(extract_verdict "$res" "$vpat")
@@ -2802,7 +3084,7 @@ EOF
 }
 
 bootstrap_worktree() { # $1 id — worktree + full harness re-deploy; nonzero on failure
-  local id="$1" wt base d name seed dep pcf
+  local id="$1" wt base d name seed dep pcf session_file
   wt=$(wt_path "$id")
   base=$(git rev-parse HEAD) || return 1
   mkdir -p "$WT_ROOT" || return 1
@@ -2836,6 +3118,17 @@ bootstrap_worktree() { # $1 id — worktree + full harness re-deploy; nonzero on
   done
   cp loop.config.sh "$wt/loop.config.sh" || return 1          # seed; /loop-contract rewrites per task
   [ ! -f loop.models.sh ] || cp loop.models.sh "$wt/loop.models.sh" || return 1
+  # Session config participates in the parent's approved harness hash, including
+  # files that are commonly gitignored. Copy the exact approved bytes so a Fleet
+  # worker cannot silently run under a weaker/different Claude, MCP, or Codex
+  # configuration merely because `git worktree add` omitted an untracked file.
+  for session_file in .claude/settings.json .claude/settings.local.json .mcp.json; do
+    [ ! -f "$session_file" ] || cp "$session_file" "$wt/$session_file" || return 1
+  done
+  if [ -f .codex/config.toml ]; then
+    mkdir -p "$wt/.codex" || return 1
+    cp .codex/config.toml "$wt/.codex/config.toml" || return 1
+  fi
   printf '*\n!.gitignore\n!docs\n!docs/**\n' > "$wt/.loop/.gitignore"
   ensure_gitignore "$wt" >/dev/null   # same marker blocks; note silenced (supervisor stdout)
 
@@ -2903,12 +3196,12 @@ task_pid_alive() {
   # adopting it would freeze the task at RUNNING and burn a slot forever. Confirm
   # identity, most authoritative first; a ps miss must NEVER flip a live task to
   # "dead" (that reaps real work and drops the busy-resume guard):
-  #   1. worktree .loop/run.pid == pid — the worker exec'd `loop.sh run`, which
-  #      writes its own $$ there; environment-independent proof it is our loop.
-  #   2. ps says loop.sh — fallback (its -o command= format varies across envs).
-  #   3. fresh run heartbeat — the ps-independent liveness half (see run_beat).
+  #   1. ps says loop.sh (its -o command= format varies across environments).
+  #   2. fresh run heartbeat — the ps-independent liveness half (see run_beat).
+  # A matching worktree run.pid is only historical ownership: SIGKILL leaves it
+  # behind, so accepting it alone lets a recycled foreign pid look live forever.
+  # Both launch paths seed the heartbeat before publishing their live phase.
   wt=$(renv_get "$1" WT "")
-  [ -n "$wt" ] && [ "$(cat "$wt/.loop/run.pid" 2>/dev/null)" = "$pid" ] && return 0
   ps -p "$pid" -o command= 2>/dev/null | grep -q "loop\.sh" && return 0
   [ -n "$wt" ] && run_heartbeat_fresh "$wt"
 }
@@ -3080,10 +3373,11 @@ park_human_stopped() { # $1 id — STOPPED_BY=human (set by cmd_fleet_stop befor
 }
 
 reap_task() { # $1 id — its process died; derive the outcome from the worktree state
-  local id="$1" phase state wt retries rc=0
+  local id="$1" phase state wt retries pid rc=0
   phase=$(renv_get "$id" PHASE)
+  pid=$(renv_get "$id" PID "")
   set +e
-  wait "$(renv_get "$id" PID 0)" 2>/dev/null
+  wait "${pid:-0}" 2>/dev/null
   rc=$?
   set -e
   case "$phase" in
@@ -3098,6 +3392,15 @@ reap_task() { # $1 id — its process died; derive the outcome from the worktree
       fi
       ;;
     RUNNING)
+      wt=$(renv_get "$id" WT)
+      # task_pid_alive already rejected this recorded PID by process identity
+      # and heartbeat. Retire only the matching historical ownership record;
+      # never kill the (possibly recycled, foreign) PID, and never erase a
+      # successor's pidfile if another dispatcher updated the task meanwhile.
+      if [ -n "$wt" ] && [ -n "$pid" ] && [ "$(renv_get "$id" PID "")" = "$pid" ] \
+         && [ "$(cat "$wt/.loop/run.pid" 2>/dev/null)" = "$pid" ]; then
+        rm -f "$wt/.loop/run.pid" "$wt/.loop/run.heartbeat" 2>/dev/null || true
+      fi
       state=$(wt_state "$id")
       renv_set "$id" RESULT "$state"
       case "$state" in
@@ -3328,10 +3631,21 @@ approve_task() { # $1 id, $2 journal-event — record the approval inside the wo
 
 SUPERVISOR_SESSION_FILE=".loop/fleet/supervisor-session"
 
-supervisor_session_drop() { rm -f "$SUPERVISOR_SESSION_FILE"; }
+supervisor_session_drop() {
+  # Codex supervision never reads or writes the Claude resume cache; leave a
+  # stale file untouched so bypass means exactly no interaction with it.
+  [ "$(configured_agent SUPERVISE)" = codex ] || rm -f "$SUPERVISOR_SESSION_FILE"
+}
 
 run_claude_supervisor() { # $1 label, $2 prompt — reader call with session reuse
   local label="$1" prompt="$2" sid="" count=0 line max
+  if [ "$(configured_agent SUPERVISE)" = codex ]; then
+    # Codex v1 calls stay fresh. A stale Claude session file may remain, but is
+    # neither read nor updated and therefore cannot become authority.
+    CLAUDE_RESUME_SESSION=""
+    run_claude "$label" "$prompt" "$MODEL_SUPERVISE" reader SUPERVISE
+    return $?
+  fi
   max=$(fcfg FLEET_SUPERVISOR_SESSION_MAX 20)
   case "$max" in ''|*[!0-9]*) max=20 ;; esac
   if [ "$(fcfg FLEET_SUPERVISOR_SESSION 1)" != "0" ] && [ -f "$SUPERVISOR_SESSION_FILE" ]; then
@@ -4749,7 +5063,7 @@ cmd_fleet_run() {
   # a manual `fleet run` must not adopt PLANNED tasks whose contract has since
   # changed (same guard as run_fleet_orchestration — no single choke point exists)
   check_fleet_contract_binding
-  need_claude fleet
+  need_agents fleet
   # the supervise step (tick 2.5) calls run_claude from THIS process; give it
   # the pieces load_config/load_models would provide in an orchestrated run
   # (loop.config.sh cannot be sourced here — no approval verification happened)
@@ -5853,6 +6167,10 @@ run_decompose_once() { # $1 label, $2 optional prompt suffix (retry feedback poi
     echo "decompose agent call failed${AGENT_FAIL_DIAG:+ — $AGENT_FAIL_DIAG} (evidence: .loop/logs/failed/)" > .loop/decompose-feedback.md
     return 1
   fi
+  # DECOMPOSE is a full authoring role for either CLI, but its authority ends at
+  # the plan. Check ignored/hash-protected surfaces before parsing or enqueueing;
+  # otherwise a modified loop.sh/model/skill could be copied into every worker.
+  check_harness "during decomposition"
   # containment: this step may only write under .loop/ (the plan file). Any
   # project-file diff means the decomposer did implementation work — fail
   # closed to a human (the pre-decompose snapshot protects user work).
@@ -6782,7 +7100,7 @@ cmd_decompose() { # preview/refresh the task plan without enqueueing or running
   ensure_loop_dir
   need_awk
   need_sha
-  need_claude
+  need_agents
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "not a git repository — run: git init && git add -A && git commit -m init"
   verify_approval
@@ -6793,6 +7111,7 @@ cmd_decompose() { # preview/refresh the task plan without enqueueing or running
   fi
   load_config
   load_models
+  warn_codex_cost_untracked
   RUN_CONTRACT_HASH=$(contract_hash)
   RUN_HARNESS_HASH=$(harness_hash)
   RUN_MODELS_HASH=$(models_hash)
@@ -6812,7 +7131,7 @@ target_harness_sha() { # $1 target dir
   {
     cat "$1/loop.sh" "$1/.loop/bin/evaluate.sh" 2>/dev/null
     cat "$1"/.claude/skills/loop-*/SKILL.md 2>/dev/null
-    cat "$1/.claude/settings.json" "$1/.claude/settings.local.json" "$1/.mcp.json" 2>/dev/null || true
+    cat "$1/.claude/settings.json" "$1/.claude/settings.local.json" "$1/.mcp.json" "$1/.codex/config.toml" 2>/dev/null || true
   } | sha256
 }
 
@@ -6865,8 +7184,9 @@ config_drift_note() { # $1 kit template, $2 user file, $3 label — list keys th
   local missing="" k
   while IFS= read -r k; do
     [ -n "$k" ] || continue
-    grep -qE "^[[:space:]]*$k=" "$2" || missing="$missing $k"
-  done < <(grep -oE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "$1" | sed -E 's/[[:space:]]//g; s/=$//' | sort -u)
+    grep -qE "^[[:space:]]*#?[[:space:]]*$k=" "$2" || missing="$missing $k"
+  done < <(grep -oE '^[[:space:]]*#?[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "$1" \
+           | sed -E 's/[[:space:]#]//g; s/=$//' | sort -u)
   [ -n "$missing" ] || return 0
   note "note: kit's $3 has keys your file lacks (new options; your file keeps its values):$missing"
   note "      compare with: diff \"$2\" \"$1\""
@@ -8047,8 +8367,9 @@ cmd_approve() {
     mv -f "$tmp" "$slot/approved-harness"
   fi
   note "approved: contract + config ($(cut -c1-12 < .loop/approved)…), harness ($(cut -c1-12 < .loop/approved-harness)…)"
+  print_agent_routing
   note "any change to the contract, loop.config.sh, loop.sh, evaluate.sh, the skills,"
-  note "or the session config (.claude settings, .mcp.json) now stops the loop until you re-approve."
+  note "or the session config (.claude settings, .mcp.json, .codex/config.toml) now stops the loop until you re-approve."
   # ---- decision rebind: re-approving after a decision stop re-binds the run
   # checkpoint to the NEW hashes so `run` resumes with counters/cost intact.
   # Same trust move as the budget-only exception: the human is present and is
@@ -8194,7 +8515,7 @@ cmd_run() {
   RUN_HARNESS_HASH=$(harness_hash)
   RUN_MODELS_HASH=$(models_hash)
 
-  need_claude
+  need_agents
   need_awk
   need_sha
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
@@ -8212,6 +8533,18 @@ cmd_run() {
   identity_mode=$(decide_run_mode "$force_fresh" "$require_resume" "$prefer_resume")
   case "$identity_mode" in refuse:*) die "${identity_mode#refuse:}" ;; esac
   initialize_run_identity "$identity_mode"
+  # The Codex budget warning is journaled before decomposition can spend an
+  # agent call. On a logical resume, restore the cumulative total first so its
+  # bookkeeping row cannot make total_usd jump backwards to the process default
+  # of zero. The normal resume branch re-reads the same mirrors defensively.
+  if [ "$identity_mode" = resume ] || fleet_inflight; then
+    TOTAL_COST=$(cat .loop/cost-total 2>/dev/null || true)
+    if [ -z "$TOTAL_COST" ] && [ -f .loop/run-checkpoint ]; then
+      TOTAL_COST=$(ckpt_get TOTAL_COST)
+    fi
+    [ -n "$TOTAL_COST" ] || TOTAL_COST=0
+  fi
+  warn_codex_cost_untracked
   pin_observation_manifest \
     || die "observations manifest is unreadable or not a regular file — inspect .loop/observations-manifest.jsonl before running"
 

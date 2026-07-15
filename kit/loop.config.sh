@@ -2,7 +2,7 @@
 # Generated/updated by the /loop-contract skill; hashed together with
 # .loop/docs/product-contract.md at `./loop.sh approve` time. Any later change
 # stops the loop with NEEDS_SPEC_DECISION until re-approved.
-# (Model choices live in loop.models.sh and can change without re-approval.)
+# (Agent/model choices live in loop.models.sh and can change without re-approval.)
 
 # Deterministic verification gate: ALL commands must exit 0 for success.
 # These are the loop's success condition — keep them honest and fast.
@@ -65,12 +65,14 @@ MAX_ITER_SECONDS=900       # default wall-clock watchdog per agent call
 #TIMEOUT_DECOMPOSE=
 #TIMEOUT_SUPERVISE=
 
-# Total USD cap across all agent calls in one run. EMPTY = no cap (the default):
+# Total reported USD cap across Claude-routed calls in one run. EMPTY = no cap
+# (the default). Codex calls report 0 USD and cannot be bounded by this knob;
+# the harness warns when a run combines Codex routing with a non-empty cap.
 # Claude Code subscription (Pro/Max) usage has no per-token charge and the
 # reported USD is notional — a cap here would stop healthy loops early.
 # Set a number ONLY when the user explicitly asks for a hard cost cap
 # (e.g. API-billed usage). When set, it is enforced from loop.sh's in-memory
-# total and mirrored to each call via --max-budget-usd.
+# total and mirrored to each Claude call via --max-budget-usd.
 MAX_COST_USD=""
 
 # Stop heuristics
@@ -112,8 +114,25 @@ SPLIT_NUDGE_AT=70          # fleet workers only: past this % of MAX_ITERATIONS w
                            # boundary (the supervisor splits the remainder into
                            # phased tasks) or justify continuing. 0 = off.
 
-# Agent execution — the worker runs in a deny-enforcing permission mode with a BROAD
-# tool allow-list; the deny-list (DISALLOWED_TOOLS) is the primary control you tune, and
+# Codex-routed roles only (AGENT_<ROLE>="codex" in loop.models.sh). The worker
+# runs under Codex's OS-level sandbox; these are the safety knobs and therefore
+# live HERE (approval-hashed), not in the freely-editable loop.models.sh.
+#   LOOP_CODEX_SANDBOX: read-only | workspace-write | danger-full-access
+#   LOOP_CODEX_NETWORK: 1 = allow network inside the workspace-write sandbox
+#     (parity with the Claude-side default posture: ALLOWED_TOOLS ships with
+#      WebFetch/WebSearch). 0 = Codex's own default (network blocked).
+# NB: DISALLOWED_TOOLS is a Claude Code concept and does NOT constrain
+# codex-routed roles — containment there is the OS sandbox + the checker layer.
+# The LOOP_ prefix is deliberate: Codex itself exports CODEX_SANDBOX in some
+# environments, so reusing that name would make host state override old configs.
+# (evaluator re-run, independent review, diff policy). `./loop.sh approve`
+# prints a one-line warning when both are in play.
+LOOP_CODEX_SANDBOX="workspace-write"
+LOOP_CODEX_NETWORK=1
+
+# Claude-routed agent execution — the worker runs in a deny-enforcing
+# permission mode with a BROAD tool allow-list; the deny-list
+# (DISALLOWED_TOOLS) is the primary control you tune, and
 # it wins over the allow-list. Containment otherwise comes from the checker layer
 # (deterministic evaluator, independent reviewer, approval-hash, and the
 # DENIED_PATHS/ESCALATE_PATHS diff policy), not from clipping the agent's tools.

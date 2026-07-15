@@ -76,7 +76,8 @@ strings and their pass/fail results, file paths, and git refs.
    context. **Do not inspect or cite any sibling/parent log directory**: those
    belong to another task or run and are historical, not evidence for this one.
    This is a prompt/citation policy plus a harness integrity boundary, not an OS
-   sandbox: with the same UID and full Bash those paths may be physically readable.
+   sandbox: with the same UID and broad filesystem read access those paths may
+   be physically readable.
    Physical readability does not make them authorized evidence.
 
 ## Write .loop/docs/evidence-report.md

@@ -150,7 +150,7 @@ project root; everything else lives in hidden directories:
 your-project/
 ├── loop.sh              ← the entry point. Single and parallel runs both start here.
 ├── loop.config.sh       ← stop conditions (hash-protected once approved)
-├── loop.models.sh       ← model and effort routing (edit between runs; no re-approval)
+├── loop.models.sh       ← agent, model, and effort routing (edit between runs; no re-approval)
 ├── fleet.config.sh      ← parallel settings (edit between runs; no re-approval)
 ├── loop-instruction.md  ← (optional) where you write your instructions
 ├── .claude/skills/      ← the loop's prompts (hidden; standard Claude Code location)
@@ -755,7 +755,7 @@ iteration 1 and re-spending your whole budget.
 | Crash / Ctrl-C / machine died | `RUNNING` / `INTERRUPTED` | Just `./loop.sh run` — it **auto-resumes** (counters, cost, and any uncommitted work restored). `./loop.sh run --fresh` forces a clean restart. |
 | Terminal failure | `BLOCKED` / `STALLED` | Fix the cause, then `./loop.sh resume` (iteration and cost intact; the stop-heuristic streaks — stagnation, futility, repeat-fail fingerprints, review rejections — get a **fresh window** so one repeat can't instantly re-block a legitimately fixed run). Pass what changed with `./loop.sh resume --note '<guidance>'` — the note reaches the next iteration as the human decision and is journaled as `RUN_NUDGE`. A bare `run` starts fresh. |
 | Ran out of iterations | `BUDGET_EXCEEDED` | Raise `MAX_ITERATIONS`, `./loop.sh approve`, then `./loop.sh resume`. A budget-only re-approval is recognized and continues under the bigger cap. |
-| Rate / usage limit (transient) | `BLOCKED` (api-stall guidance) | Nothing is wrong with your loop — **wait for the limit to reset, then `./loop.sh run`** (checkpoint and counters intact). The stop shows this wait-and-retry guidance instead of the sign-off box; if it keeps failing, check `.loop/logs/failed/` and your Claude auth. |
+| Rate / usage limit (transient) | `BLOCKED` (api-stall guidance) | Nothing is wrong with your loop — **wait for the limit to reset, then `./loop.sh resume`** (checkpoint and counters intact). The stop shows this wait-and-retry guidance instead of the sign-off box; if it keeps failing, check `.loop/logs/failed/` and the routed Claude/Codex CLI's authentication. |
 | An escalation (`NEEDS_*` / `RISK_*`) | needs your answer | **Never auto-resumes.** Make the call (edit the contract if needed), then `./loop.sh approve` re-binds the checkpoint to the new approval, and the next `./loop.sh run` resumes with counters and cost intact. |
 | A plan-review escalation (phase boundary) | `NEEDS_SPEC_DECISION`, queued phases held | Decide the `DR-FLEET-PLAN-*` question (edit/clean the queue if needed), acknowledge with `./loop.sh fleet ack-plan <merged-id>`, then `./loop.sh run`. A rerun **without** the ack stops at the same request — restarts never release the held phases silently. |
 
@@ -818,7 +818,7 @@ loop until you re-approve. The key settings:
 | `MAX_ITER_SECONDS` | 900 | Default wall-clock watchdog on each individual agent call. |
 | `TIMEOUT_<ROLE>` | (empty → inherits `MAX_ITER_SECONDS`) | Per-role watchdog override (seconds), e.g. `TIMEOUT_IMPLEMENT=1800` so a heavy implement iteration outlasts the clerical `STOP_EVAL`/`EVIDENCE` calls. Roles: `IMPLEMENT REVIEW PLAN CONTRACT EVIDENCE STOP_EVAL DECOMPOSE SUPERVISE`. Lives here (not `loop.models.sh`) because the watchdog is a safety budget — raising it is gated by re-approval. A blank/non-numeric value silently inherits the global. |
 | `MAX_RUN_SECONDS` | (empty) | Optional wall-clock budget checked at iteration/orchestration boundaries. A later resume gets a fresh window; it does not interrupt an individual `VERIFY_COMMAND`. |
-| `MAX_COST_USD` | (empty = no cap) | A hard USD cap. Left off by default — see below. |
+| `MAX_COST_USD` | (empty = no cap) | A hard cap on USD reported by Claude calls. Codex reports no USD amount and is therefore unbounded by this knob; see the Codex routing notes below. |
 | `STAGNATION_N` | 2 | Consecutive no-diff iterations → STALLED. |
 | `REPEAT_FAIL_N` | 3 | Identical verify failure this many times → BLOCKED. Also derives the oscillation window: ≤2 distinct failure fingerprints across `2×N` consecutive failing iterations → BLOCKED (catches the fix-A-breaks-B ping-pong the identical rule misses). |
 | `FUTILE_N` | 2 | Consecutive "futile" stop-eval verdicts → STALLED. |
@@ -832,14 +832,17 @@ loop until you re-approve. The key settings:
 | `GATE_RETRY_WAITS` | `"60 300"` | Seconds to wait before gate retry 1, 2, … (the last entry repeats). The run heartbeat stays fresh throughout the wait. |
 | `LOOP_OBS_MAX_FILE_KB` | 2048 | Maximum size of one runtime observation the evaluator may stamp into the manifest. Oversize evidence remains unverified. |
 | `LOOP_OBS_MAX_TOTAL_MB` | 50 | Maximum combined size of `.loop/observations/` eligible for certification. |
-| `PERMISSION_MODE` | `acceptEdits` | How Claude Code handles tool permissions (see below). |
+| `LOOP_CODEX_SANDBOX` | `workspace-write` | OS sandbox for Codex-routed full roles. Reader roles are always forced to `read-only`. |
+| `LOOP_CODEX_NETWORK` | 1 | Allow network access for Codex roles only when `LOOP_CODEX_SANDBOX=workspace-write`; 0 leaves Codex's network-blocked default. |
+| `PERMISSION_MODE` | `acceptEdits` | How Claude-routed workers handle tool permissions (see below). |
 
-### `loop.models.sh` — which model runs each step (tune between runs)
+### `loop.models.sh` — which agent and model run each step (tune between runs)
 
-Each step of the loop can use a different model. This file is parsed as plain `key=value`
-pairs — never executed — and changes between runs do not need re-approval. The
-harness snapshots it at run start; a mid-run edit stops as
-`RISK_REQUIRES_APPROVAL`.
+Each routable in-loop role can use Claude (the default) or Codex, and every role can
+use a different model. Contract definition and refinement remain pinned to Claude.
+This file is parsed as plain `key=value` pairs — never executed — and changes between
+runs do not need re-approval. The harness snapshots it at run start; a mid-run edit
+stops as `RISK_REQUIRES_APPROVAL`.
 
 | Role | Used for | Default |
 |---|---|---|
@@ -853,20 +856,24 @@ harness snapshots it at run start; a mid-run edit stops as
 | `MODEL_DECOMPOSE` | Supervisor: contract → task plan | **opus** |
 | `MODEL_SUPERVISE` | Supervisor: mid-run decisions on tasks | **opus** |
 
-The same file also sets the reasoning effort passed to every `claude` call
-(`low | medium | high | xhigh | max`): `LOOP_EFFORT` (default `xhigh`) is the global value,
-and `EFFORT_<ROLE>` (e.g. `EFFORT_STOP_EVAL`, `EFFORT_IMPLEMENT`) overrides it per role —
-the kit ships `EFFORT_STOP_EVAL="low"` and `EFFORT_EVIDENCE="medium"` so the clerical roles
-stop paying maximum-thinking prices. An empty or unrecognized override falls back to
-`LOOP_EFFORT` (a typo can never break a running loop). Models that support effort levels
-(Opus 4.8 and similar) honor it; others ignore it.
+The same file also sets reasoning effort (`low | medium | high | xhigh | max`):
+`LOOP_EFFORT` (default `xhigh`) is the global value, and `EFFORT_<ROLE>` (for example,
+`EFFORT_STOP_EVAL` or `EFFORT_IMPLEMENT`) overrides it per role. Claude receives
+`--effort`; Codex receives `model_reasoning_effort`, with `max` mapped to `xhigh`.
+The kit ships `EFFORT_STOP_EVAL="low"` and `EFFORT_EVIDENCE="medium"` so clerical roles
+do not use maximum reasoning by default. An empty or unrecognized override falls back
+to `LOOP_EFFORT` (a typo can never break a running loop). Model support still decides
+whether a given effort level changes behavior.
 
 `TURNS_NUDGE_AT` (kit ships 70, ≈ p90 of healthy production iterations) is the
 runaway-context signal: when one implement call consumes at least that many agent turns,
 the next iteration gets an advisory `.loop/context-nudge.md` telling it to re-plan into a
 smaller committed step instead of resuming mid-flight — long-tail iterations are where
 cache-read cost explodes. Journaled as `CONTEXT_NUDGE`; empty = off. If it fires on more
-than ~1 in 4 iterations, raise the threshold for that project.
+than ~1 in 4 iterations, raise the threshold for that project. For a Codex-routed
+IMPLEMENT call, the harness approximates turns by counting `item.completed` events; this
+usually runs higher than Claude's turn count, so raise `TURNS_NUDGE_AT` if it nudges healthy
+Codex iterations.
 
 > **Implement and gate review default to the same model.** The maker–checker separation here
 > is *procedural* (a fresh context, a read-only process) — not statistical. A blind spot one
@@ -875,6 +882,54 @@ than ~1 in 4 iterations, raise the threshold for that project.
 > `MODEL_REVIEW` at a different family or tier. The deterministic `VERIFY_COMMANDS` gate is
 > unaffected either way, and **the primary stop decision is never a model's** — it's the
 > checker re-running your commands.
+
+### Assigning roles to Codex
+
+Claude Code remains required because contract definition, refinement, and the unattended
+definition pass are pinned to Claude. Codex routing is optional and requires either a
+ChatGPT subscription usable by Codex or an `OPENAI_API_KEY`. Install a current Codex CLI
+and authenticate it with `codex login`; for API-key authentication, use
+`printenv OPENAI_API_KEY | codex login --with-api-key`. A custom executable or test double
+can be selected with `LOOP_CODEX_CMD=/path/to/codex`.
+
+Route implementation to Codex while leaving planning and review on Claude:
+
+```sh
+# loop.models.sh
+AGENT_IMPLEMENT="codex"
+MODEL_IMPLEMENT="gpt-5.5"
+```
+
+The routable keys are `AGENT_IMPLEMENT`, `AGENT_PLAN`, `AGENT_REVIEW`,
+`AGENT_REVIEW_INTERIM`, `AGENT_STOP_EVAL`, `AGENT_EVIDENCE`, `AGENT_DECOMPOSE`, and
+`AGENT_SUPERVISE`. Unset or unrecognized values safely fall back to `claude`;
+`AGENT_REVIEW_INTERIM` inherits `AGENT_REVIEW` when empty. `AGENT_CONTRACT` is ignored,
+and a Codex-routed role must use a Codex model slug rather than `opus`, `sonnet`, `haiku`,
+or a `claude-*` model name. Agent inheritance does not overwrite the independently tiered
+`MODEL_REVIEW_INTERIM`: when routing `AGENT_REVIEW` to Codex, also set
+`MODEL_REVIEW_INTERIM` to a Codex slug (or explicitly route interim review elsewhere).
+
+| Role mode | Claude route | Codex route |
+|---|---|---|
+| Reader (review/checker roles) | `Read,Glob,Grep` only | Forced `--sandbox read-only` |
+| Full (implementation and authoring roles) | `PERMISSION_MODE` plus `ALLOWED_TOOLS` / `DISALLOWED_TOOLS` | `LOOP_CODEX_SANDBOX` (`workspace-write` by default) |
+
+`LOOP_CODEX_NETWORK=1` enables network access only for the `workspace-write` sandbox; set it to
+0 to retain Codex's network-blocked default. `danger-full-access` removes the Codex OS
+sandbox and should be used only inside an environment you already isolate. Claude Code's
+`DISALLOWED_TOOLS` rules do **not** constrain Codex-routed roles; their containment is the
+Codex sandbox plus the same evaluator, independent review, approval hash, and diff policy.
+`./loop.sh approve` warns when a Codex route and a non-empty deny-list coexist.
+
+Codex does not report a USD amount in the normalized result, so Codex calls are journaled
+with cost 0. Reported USD totals and `MAX_COST_USD` therefore cover Claude calls only; the
+harness warns when a USD cap is combined with Codex routing, but cannot enforce that cap
+against Codex usage. The raw Codex JSONL remains available for usage auditing.
+
+A useful maker–checker split is Codex for `IMPLEMENT` and Claude for `REVIEW`: independent
+vendors reduce the chance that one model family's blind spot appears on both sides. This is
+additional diversity, not a substitute for the deterministic evaluator re-running every
+approved `VERIFY_COMMAND`.
 
 ### `fleet.config.sh` — parallel-execution settings (tune between runs)
 
@@ -906,11 +961,13 @@ between runs are free; a mid-run change triggers `RISK_REQUIRES_APPROVAL`.
 On a Pro/Max subscription there's no per-token charge and the reported USD figure is
 notional, so the **default runaway guards are iterations and time, not dollars** —
 `MAX_ITERATIONS`, `MAX_ITER_SECONDS`, and optional `MAX_RUN_SECONDS`. `MAX_COST_USD` is
-**unset by default**; set it only if you're on API billing and want a hard cost ceiling
-(it then enforces an in-memory running total and adds `--max-budget-usd` to every call).
+**unset by default**; set it only if you're on API billing and want a hard ceiling on
+Claude-reported cost (it then enforces an in-memory running total and adds
+`--max-budget-usd` to every Claude call).
 The contract session never suggests or sets a USD cap unless you bring up cost yourself.
-Cost is always tracked and logged regardless — `./loop.sh status` shows the last run **and**
-the lifetime total across all runs (derived from the append-only journal), and
+Claude-reported cost is tracked and logged; Codex calls are recorded as 0 because its result
+does not expose USD. `./loop.sh status` shows the last run **and** the lifetime total across
+all runs (derived from the append-only journal), and
 `./loop.sh report --text` breaks the last run down by role (implement / interim vs gate
 review / plan / evidence / stop-eval) plus the largest implement call by agent turns, so a
 runaway iteration is visible instead of buried in one total. Every journal row also carries
@@ -919,11 +976,12 @@ the call's `turns` count, and each iteration prints its cost and turns live.
 <details>
 <summary>Permission mode &amp; the tool allow/deny lists</summary>
 
-The worker runs in `acceptEdits` mode with a **broad allow-list** (`ALLOWED_TOOLS` — all common
-built-in tools plus web access by default) and an **opt-in deny-list** (`DISALLOWED_TOOLS`) that is
-the primary control you tune. Deny wins over allow; nothing is denied by default. Containment
-otherwise lives in the checker layer (evaluator, independent reviewer, approval hash,
-`DENIED_PATHS`/`ESCALATE_PATHS`), not in clipping tools.
+A Claude-routed worker runs in `acceptEdits` mode with a **broad allow-list**
+(`ALLOWED_TOOLS` — all common built-in tools plus web access by default) and an **opt-in
+deny-list** (`DISALLOWED_TOOLS`) that is the primary Claude-side control you tune. Deny wins
+over allow; nothing is denied by default. Containment otherwise lives in the checker layer
+(evaluator, independent reviewer, approval hash, `DENIED_PATHS`/`ESCALATE_PATHS`), not in
+clipping tools. Codex-routed roles use the sandbox controls described above instead.
 
 Do not confuse the worker setting with the two uses of "auto." Interactive contract
 and refine sessions default to Claude Code's `--permission-mode auto` (overridable
@@ -931,7 +989,8 @@ with `LOOP_CONTRACT_PERMISSION_MODE` / `LOOP_REFINE_PERMISSION_MODE`), while
 `./loop.sh auto` is loop-kit's unattended definition-and-approval workflow. Neither
 changes the approved worker default, `PERMISSION_MODE="acceptEdits"`.
 
-Set `DISALLOWED_TOOLS` in `loop.config.sh` to block specific tools (it re-triggers approval):
+Set `DISALLOWED_TOOLS` in `loop.config.sh` to block specific Claude Code tools (it
+re-triggers approval):
 `"WebSearch,WebFetch"` (no web), `"Bash(sudo *),Bash(git push *)"` (no privilege-escalation / no
 push). Bash rules are prefix-globs matched per sub-command across `&&`/`||`/`|`/`;`.
 
@@ -1011,7 +1070,7 @@ the work. The short version:
 
 - **You approve a hash, not a promise.** `approve` records SHA-256 hashes of the
   contract + config and of the harness (`loop.sh` / `evaluate.sh` / the skills)
-  plus session config (`.claude/settings*.json` / `.mcp.json`). These baselines
+  plus session config (`.claude/settings*.json` / `.mcp.json` / `.codex/config.toml`). These baselines
   are loaded into the running script's memory and re-checked every iteration.
   Model and Fleet settings are intentionally editable without re-approval between
   runs; they are separately snapshotted at run start and protected from mid-run
@@ -1021,10 +1080,10 @@ the work. The short version:
   agent-writable, `approve` also records the hashes in a store outside the repository
   (`~/.loop-kit/approvals/…`, relocatable via `LOOP_APPROVAL_HOME`). A run refuses to start
   unless that off-tree store matches — repo-local files alone are no longer trusted.
-- **The checkers are structurally read-only.** The reviewer, the stop evaluator, the contract
-  review, and the supervisor all run with `--tools Read,Glob,Grep` — no editor, no Bash. The
-  supervisor never writes anything itself: its decisions travel back as text and the *harness*
-  performs every write, logging each one.
+- **The checkers are structurally read-only.** The reviewer, stop evaluator, contract review,
+  and supervisor get only `Read,Glob,Grep` on Claude routes or Codex's OS-level `read-only`
+  sandbox on Codex routes. The supervisor never writes anything itself: its decisions travel
+  back as text and the *harness* performs every write, logging each one.
 - **Nothing gets into SUCCESS unreviewed.** The evidence report is generated *after* the
   reviewer approves, and the harness's success gate then confirms there's zero code change
   (outside `.loop`) since the HEAD the reviewer actually looked at. Any later change is BLOCKED.
@@ -1047,12 +1106,12 @@ the work. The short version:
 | Contract + config | Approval hash held **in `loop.sh`'s memory**, passed to the evaluator each iteration (`--approved-hash`); forging `.loop/approved` has no effect. The hash check runs *before* the config is sourced, so tampered config code never executes. |
 | Approval provenance | Also recorded in an **off-tree store** (`~/.loop-kit/approvals/<repo-id>/<slot-id>/`, where the ids are hashes of the repo's and the worktree's git paths — so fleet worktrees group under one repo but keep distinct slots); a run refuses to start (exit 2) unless the store matches. `LOOP_APPROVAL_HOME` relocates it; the literal value `repo` opts back into repo-local-only records for containers with no `$HOME`. Honest residual: this moves the trust boundary out of the repo, not out of your account — a `VERIFY_COMMANDS` entry still runs with your privileges. |
 | The harness (loop.sh / evaluate.sh / skills) | A start-of-run hash kept in memory is re-checked every iteration, right after implementation (before the evaluator runs), and after evidence. A change → `RISK_REQUIRES_APPROVAL`; a tampered evaluator can never actually run. Skill edits are also caught by the diff policy on `.claude/**`. |
-| Session config (`.claude/settings*.json` / `.mcp.json`) | Folded into the harness hash and checked in memory each iteration, so an agent can't inject a permission allowlist or MCP server that would take effect in a *future* session. |
+| Session config (`.claude/settings*.json` / `.mcp.json` / `.codex/config.toml`) | Folded into the harness hash and checked in memory each iteration, so an agent can't inject a permission allowlist, MCP server, or Codex project override that would take effect in a *future* session. Gitignored local copies are propagated byte-for-byte into Fleet worktrees. |
 | Model config (`loop.models.sh`, `fleet.config.sh`) | Parsed as safe `key=value`, never sourced. Gitignored, so the diff policy alone wouldn't see edits — its hash is taken into memory at run start, and any change during a run → `RISK_REQUIRES_APPROVAL`. Editing between runs is free. |
 | Observation manifest + certificate inputs | The evaluator-owned manifest is pinned in memory and may change only through a trusted preflight/canonicalization step. Before evidence generation, the contract, ledgers, reviewer verdicts, manifest, and cited observation bytes are snapshotted; any evidence-agent mutation is BLOCKED. Report citations are then resolved back through checklist + manifest + bytes. |
-| Budget | The running cost total lives in memory, so a file edit can't bypass it. With `MAX_COST_USD` set, each call also gets `--max-budget-usd`. |
+| Budget | The running Claude cost total lives in memory, so a file edit can't bypass it. With `MAX_COST_USD` set, each Claude call also gets `--max-budget-usd`. Codex exposes no equivalent USD amount/cap; its calls record 0 and trigger an explicit warning. |
 | Master contract in worktrees | Each task gets a read-only copy whose expected sha256 the parent pins outside that task worktree; a mismatch is restored and journaled `MASTER_TAMPER`. This prevents a local-copy edit from passing the harness check, but the pin is not OS-inaccessible to a same-UID process with full Bash. |
-| Decompose containment | The decomposition step may write only its plan file; any project-file change after it → `RISK_REQUIRES_APPROVAL`. |
+| Decompose containment | The decomposition step may write only its plan file; any project-file change after it → `RISK_REQUIRES_APPROVAL`. Hash-protected harness, model, Fleet, and session settings are re-checked immediately before the plan can be parsed or published. |
 | Post-review changes | The harness confirms at the success gate that there is zero non-`.loop` diff from the reviewed HEAD; any diff → BLOCKED. No change that skipped review can reach SUCCESS. |
 | Resume checkpoint | Agent-writable, so it carries no success authority: parsed as data; resume ids/counters may be read but ids are labels only. A forged run review base is validated as an ancestor of HEAD or replaced conservatively; the task-wide base is the fixed off-tree task record. |
 
@@ -1152,21 +1211,25 @@ instead of merging and gating old work against the new contract.
   and never trusts the agent's self-report; the diff policy (denied/escalate paths); and
   hash-locked contract, harness, skills, and session config with in-memory baselines that a
   forged on-disk file can't defeat, anchored in an off-tree approval store.
-- **Structurally read-only checkers** — reviewer / stop-eval / contract-review sessions get
-  `Read,Glob,Grep` only: no editor, no Bash.
-- **Opt-in tool deny-list** — the worker gets a broad tool allow-list; block specific tools
-  (web access, `Bash(...)` commands, MCP servers) via `DISALLOWED_TOOLS` in `loop.config.sh`.
-  Deny wins over allow (enforced under the default `acceptEdits` mode).
+- **Structurally read-only checkers** — Claude-routed reviewer / stop-eval /
+  contract-review sessions get `Read,Glob,Grep` only; Codex-routed checkers run under its
+  OS-level `read-only` sandbox.
+- **Opt-in Claude tool deny-list** — Claude-routed workers get a broad tool allow-list;
+  block specific tools (web access, `Bash(...)` commands, MCP servers) via
+  `DISALLOWED_TOOLS` in `loop.config.sh`. Deny wins over allow under the default
+  `acceptEdits` mode. Codex-routed roles use `LOOP_CODEX_SANDBOX` / `LOOP_CODEX_NETWORK` instead.
 
 **Not provided — bring your own environment.** Following Simon Willison's writing on prompt
 injection and the recent agent-security literature, these belong at the OS/container boundary,
 not in a shell harness:
 
-- **Process/filesystem/network sandboxing.** The loop runs with your user's privileges. For
-  untrusted repos or instructions, run the whole loop inside a container or VM with only the
-  project mounted. In particular, same-UID sessions with full Bash can physically read
+- **Whole-loop process/filesystem/network sandboxing.** The harness, evaluator,
+  `VERIFY_COMMANDS`, and Claude-routed roles run with your user's privileges. Codex-routed
+  roles receive the configured Codex sandbox, but that does not contain the rest of the loop.
+  For untrusted repos or instructions, run the whole loop inside a container or VM with only
+  the project mounted. Same-UID sessions with broad filesystem read access may still read
   off-tree approval files and sibling task/run logs; their normal isolation is a harness
-  integrity check plus prompt/citation policy, not an OS access-control boundary.
+  integrity check plus prompt/citation policy, not a whole-loop OS access-control boundary.
 - **Scoped credentials.** Nothing stops a command in `VERIFY_COMMANDS` (or a hook in the
   project's own build) from reading `~/.aws` and friends. Give the loop least-privilege,
   short-lived tokens.
@@ -1188,10 +1251,11 @@ prompt-injection regression corpus for the skills.
 tests/run_tests.sh
 ```
 
-The suite runs a **fake agent** in place of `claude` (`LOOP_CLAUDE_CMD` swaps it in) to
+The suite runs fake Claude and Codex agents (`LOOP_CLAUDE_CMD` and `LOOP_CODEX_CMD`) to
 drive every terminal state end to end — more than 1,400 assertions at zero token cost.
 It covers review and stop-eval, the pre-approval contract review, verdict parsing,
-counter separation, forced and fail-closed gates, model routing, the tamper defenses, the
+counter separation, forced and fail-closed gates, agent/model routing, Codex sandbox mapping
+and envelope normalization, the tamper defenses, the
 off-tree approval store, the full resume matrix (auto-resume, resume-by-id, budget-raise
 continuation, the decision rebind, the `MAX_RESUMES` backstop), and the whole fleet:
 queue atomicity, dynamic add + drain grace, the approval gate, isolation, serialized
@@ -1290,10 +1354,10 @@ software-engineering practice. Each row maps an idea to the concrete harness mec
 | A loop is a work cycle that runs until a stop condition; four kinds (turn / goal / time / proactive) | [Anthropic: Getting started with loops](https://claude.com/blog/getting-started-with-loops) | The external shell loop covers long-running work; combined with `/goal`, `/loop`, and `/schedule`, all four kinds are covered |
 | A loop spec is a bounded, reusable artifact with five parts: trigger, goal, verification, stopping rule, memory | [arXiv 2607.00038](https://arxiv.org/abs/2607.00038) (Macedo, *Stop Hand-Holding Your Coding Agent*) | Spec = contract + config; verification = `evaluate.sh`; stopping = named states with stable exit codes; memory = `.loop/docs` + git |
 | "The verifier is the bottleneck" — deterministic checks first | same / [Firecrawl](https://www.firecrawl.dev/blog/loop-engineering) | The first gate re-runs the actual commands outside the model; AI review is second; humans see only the evidence |
-| Three hard stops against runaways: iteration cap, budget, stagnation | 2026 practitioner write-ups | `MAX_ITERATIONS` + `MAX_ITER_SECONDS` by default, optional `MAX_COST_USD`, plus stagnation / repeat-failure / futile detection |
+| Three hard stops against runaways: iteration cap, budget, stagnation | 2026 practitioner write-ups | `MAX_ITERATIONS` + `MAX_ITER_SECONDS` by default, optional Claude-only `MAX_COST_USD`, plus stagnation / repeat-failure / futile detection |
 | Fixed requirements contract, flexible plan, evidence review, escalation | Loop-engineering design theory | Contract locked by an approval hash / plan free to evolve / evidence reports / the `NEEDS_*` states |
 | Maker–checker separation (no self-grading; a fresh-context verifier) | [Firecrawl](https://www.firecrawl.dev/blog/loop-engineering) / [Addy Osmani](https://addyosmani.com/blog/agent-harness-engineering/) | An independent read-only reviewer each iteration + the deterministic evaluator — applied to the *goalposts themselves* too (the auto-mode contract review) |
-| The Ralph loop (fresh context each time; memory in the filesystem) | [Geoffrey Huntley](https://ghuntley.com/ralph/) / [ralph-wiggum plugin](https://github.com/anthropics/claude-code/blob/main/plugins/ralph-wiggum/README.md) | A new `claude -p` call every iteration; memory in `.loop/docs` + git |
+| The Ralph loop (fresh context each time; memory in the filesystem) | [Geoffrey Huntley](https://ghuntley.com/ralph/) / [ralph-wiggum plugin](https://github.com/anthropics/claude-code/blob/main/plugins/ralph-wiggum/README.md) | A fresh routed CLI call every iteration; memory in `.loop/docs` + git |
 | Orchestrator–worker: decompose with explicit boundaries and dependencies; parallelize independent, serialize dependent; verify before merge | [Anthropic: multi-agent research system](https://www.anthropic.com/engineering/built-multi-agent-research-system) / [Claude Code worktrees](https://code.claude.com/docs/en/worktrees) | `/loop-decompose` + deterministic validation (Kahn cycle check, REQ coverage) + independent decompose review; dependency gating on merged work; worktree isolation + serial merges + the integration gate |
 | Analytic rubrics beat holistic judgment: one verdict per criterion prevents halo effects | [Autorubric, arXiv 2603.00077](https://arxiv.org/abs/2603.00077) | The gate reviewer renders one machine-parsed verdict per `REQ`; the harness downgrades an APPROVE whose table is missing or non-`MET` (fail closed) |
 | Agentic entropy: iterating agents degrade code; per-diff review is blind to cross-iteration damage | [Beyond the Diff, arXiv 2604.16323](https://arxiv.org/abs/2604.16323) / [SlopCodeBench, arXiv 2603.24755](https://arxiv.org/abs/2603.24755) | Requirement-first read order + a widened `scope=run` erosion audit every `HOLISTIC_EVERY_N` iterations or on a large diff; the requirements ledger gives reviews cross-iteration memory |

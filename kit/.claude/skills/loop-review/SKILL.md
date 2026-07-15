@@ -93,9 +93,9 @@ Code quality is judged only after requirements. On every review:
 - **Verification evidence**: for acceptance-checklist rows this diff's area
   touches, a row claimed `verified` with method `run` must cite an
   observation artifact (screenshot / probe log under `.loop/observations/`,
-  or probe output in `.loop/last-verify.log`). Open the cited artifact (Read
-  displays images) and judge it against the expectation. A `run` row
-  `verified` on code reading alone, with a missing artifact, or with an
+  or probe output in `.loop/last-verify.log`). Open and inspect the cited
+  artifact, including image contents, and judge it against the expectation. A
+  `run` row `verified` on code reading alone, with a missing artifact, or with an
   artifact that does not actually show the behavior ⇒ REVISE, naming the row.
 
 ## Sanctioned side-work (gate mode, fleet)
@@ -259,5 +259,5 @@ VERDICT: ESCALATE <the exact question for the human>
 
 (`ESCALATE` is valid **only in gate mode**, only for a human-required
 adjudication; interim reviews are two-valued.) You may reason before the
-verdict line, but nothing may follow it. You cannot write files or run
-commands in this session — your message text IS the review.
+verdict line, but nothing may follow it. You cannot modify files or repository
+state in this session — your message text IS the review.

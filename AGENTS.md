@@ -21,7 +21,7 @@ manual, but confirm implementation claims against the scripts and tests.
 - `kit/loop-docs/`: pristine templates copied into deployed projects.
 - `kit/*.config.sh` and `kit/loop.models.sh`: shipped configuration defaults.
 - `tests/run_tests.sh`: authoritative zero-token behavioral suite using
-  `tests/fake_claude.sh`; it exercises the deployed layout.
+  `tests/fake_claude.sh` and `tests/fake_codex.sh`; it exercises the deployed layout.
 - `tests/artifact-lifecycle.txt`: required ownership classification for every
   `.loop/` path literal introduced in `bin/loop.sh`.
 - `examples/`: small deployment fixtures, not the harness implementation.
@@ -31,7 +31,7 @@ manual, but confirm implementation claims against the scripts and tests.
 Assume Claude Code and Codex sessions may be implementing concurrently.
 
 1. Before editing, run `git status --porcelain` and check for live
-   `run_tests.sh`, `loop.sh`, or `fake_claude.sh` processes.
+   `run_tests.sh`, `loop.sh`, `fake_claude.sh`, or `fake_codex.sh` processes.
 2. Treat every pre-existing diff, untracked file, or unexpectedly fresh edit as
    peer-owned. Never drop, revert, restore, overwrite, or check out another
    agent's work.
@@ -71,7 +71,7 @@ Assume Claude Code and Codex sessions may be implementing concurrently.
 During iteration, run `bash -n` on every changed shell script. Run:
 
 ```bash
-shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh tests/run_tests.sh
+shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh tests/fake_codex.sh tests/run_tests.sh
 ```
 
 The final behavioral gate is:

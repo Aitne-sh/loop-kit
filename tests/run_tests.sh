@@ -15,6 +15,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FAKE="$ROOT/tests/fake_claude.sh"
+FAKE_CODEX="$ROOT/tests/fake_codex.sh"
 WORK="$(mktemp -d /tmp/loop-tests.XXXXXX)"
 
 cleanup() {
@@ -67,6 +68,10 @@ export LOOP_FLEET_TICK=0.2
 # force a no-op opener globally. HTML tests override this inline with a sentinel
 # stub (+ </dev/null) to assert the interactive gate actually suppresses opening.
 export LOOP_BROWSER_CMD=true
+export LOOP_CODEX_CMD="$FAKE_CODEX"
+# Codex itself exports this internal marker in sandboxed sessions. It must not
+# collide with loop-kit's separately named, approval-gated sandbox setting.
+export CODEX_SANDBOX=seatbelt
 # approvals are recorded in an OFF-TREE store (default $HOME/.loop-kit/approvals)
 # in addition to the repo-local mirrors. Point the store into the suite workdir so
 # tests never touch the real user store and cleanup rides on rm -rf $WORK —
@@ -484,6 +489,218 @@ run_loop "CONTINUE_FIX,READY_NOW"
 check "exit 0" roleeffbad 0 "$RC"
 paste -d' ' .loop/fake-models .loop/fake-effort > "$WORK/roleeffbad.calls" 2>/dev/null || true
 if grep -q '^fake-stop xhigh$' "$WORK/roleeffbad.calls"; then ok "invalid override degraded to the global effort"; else bad "bogus override leaked: $(grep fake-stop "$WORK/roleeffbad.calls")" roleeffbad; fi
+
+echo "== Codex routing is lazy: a pure-Claude run starts no Codex process =="
+if [ ! -e .loop/fake-codex-invocations ]; then
+  ok "no Codex help/auth/exec process was started"
+else
+  bad "pure-Claude run invoked Codex: $(tr '\n' ' ' < .loop/fake-codex-invocations)" codex-lazy
+fi
+
+echo "== Codex IMPLEMENT routing: argv, envelope, logs, and cost accounting =="
+make_fixture codex-implement
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+run_loop "READY_NOW"
+check "exit 0" codex-implement 0 "$RC"
+check "state SUCCESS" codex-implement SUCCESS "$STATE"
+if grep -q '^model=gpt-5.5 sandbox=workspace-write approval=never ' .loop/fake-codex-args \
+   && grep -q 'sandbox_workspace_write.network_access=true' .loop/fake-codex-args \
+   && grep -q 'model_reasoning_effort=xhigh' .loop/fake-codex-args; then
+  ok "IMPLEMENT reached Codex with model, writable sandbox, network, and effort"
+else
+  bad "Codex IMPLEMENT argv wrong: $(cat .loop/fake-codex-args 2>/dev/null | tr '\n' ' ')" codex-implement
+fi
+if grep -q '^--ask-for-approval never exec --json ' .loop/fake-codex-invocations; then
+  ok "approval policy is a global option before exec"
+else
+  bad "Codex exec argv order wrong: $(cat .loop/fake-codex-invocations 2>/dev/null | tr '\n' ' ')" codex-implement
+fi
+if grep -q 'loop-iterate/SKILL.md' .loop/fake-codex-prompts; then
+  ok "Claude skill shorthand was expanded to a direct-file Codex prompt"
+else
+  bad "Codex prompt wrapper missing: $(cat .loop/fake-codex-prompts 2>/dev/null)" codex-implement
+fi
+if grep -qx 'fake-rev' .loop/fake-models && grep -qx 'fake-evi' .loop/fake-models \
+   && ! grep -q 'gpt-5.5' .loop/fake-models; then
+  ok "Claude review/evidence routing stayed separate from Codex telemetry"
+else
+  bad "Claude/Codex routing logs crossed: $(sort -u .loop/fake-models 2>/dev/null | tr '\n' ' ')" codex-implement
+fi
+check "Codex exec capability probe ran once" codex-implement 1 "$(grep -xc 'exec --help' .loop/fake-codex-invocations || true)"
+check "Codex global capability probe ran once" codex-implement 1 "$(grep -xc -- '--help' .loop/fake-codex-invocations || true)"
+check "Codex login help probe ran once" codex-implement 1 "$(grep -xc 'login --help' .loop/fake-codex-invocations || true)"
+check "Codex advisory auth probe ran once" codex-implement 1 "$(grep -xc 'login status' .loop/fake-codex-invocations || true)"
+codex_tid=$(json_scalar .loop/docs/certification.json task_id)
+codex_rid=$(json_scalar .loop/docs/certification.json run_id)
+codex_logdir=".loop/logs/$codex_tid/$codex_rid"
+if [ -s "$codex_logdir/iter-1.codex.jsonl" ] && [ -s "$codex_logdir/iter-1.msg" ]; then
+  ok "raw Codex JSONL and last-message sidecars retained in the run namespace"
+else
+  bad "Codex sidecars missing from $codex_logdir" codex-envelope
+fi
+if grep -q '"total_cost_usd": 0' "$codex_logdir/iter-1.json" \
+   && grep -q '"session_id": "fake-codex-' "$codex_logdir/iter-1.json" \
+   && grep -q '"num_turns": 1' "$codex_logdir/iter-1.json" \
+   && grep -q '"is_error": false' "$codex_logdir/iter-1.json"; then
+  ok "Codex JSONL normalized into the existing Claude-compatible envelope"
+else
+  bad "normalized Codex envelope wrong: $(cat "$codex_logdir/iter-1.json" 2>/dev/null)" codex-envelope
+fi
+if grep '"iteration": "1"' .loop/journal.jsonl | grep -q '"cost_usd": 0'; then
+  ok "Codex iteration journaled zero USD cost"
+else
+  bad "Codex iteration did not journal zero cost" codex-envelope
+fi
+if grep -q '"state": "CODEX_COST_UNTRACKED"' .loop/journal.jsonl; then
+  ok "USD-cap degradation is explicitly journaled"
+else
+  bad "CODEX_COST_UNTRACKED audit row missing" codex-cost
+fi
+
+echo "== Codex reader routing forces read-only and suppresses network widening =="
+make_fixture codex-reader
+printf 'AGENT_REVIEW="codex"\nMODEL_REVIEW="gpt-5.5-review"\n' >> loop.models.sh
+run_loop "READY_NOW"
+check "exit 0" codex-reader 0 "$RC"
+if [ -s .loop/fake-codex-args ] \
+   && [ "$(grep -c 'sandbox=read-only' .loop/fake-codex-args || true)" = "$(wc -l < .loop/fake-codex-args | tr -d ' ')" ] \
+   && ! grep -q 'sandbox_workspace_write.network_access=true' .loop/fake-codex-args; then
+  ok "reviewer Codex calls are structurally read-only with no network override"
+else
+  bad "Codex reader mapping wrong: $(cat .loop/fake-codex-args 2>/dev/null | tr '\n' ' ')" codex-reader
+fi
+if grep -q 'loop-review/SKILL.md' .loop/fake-codex-prompts; then ok "review prompt routed to Codex"; else bad "review prompt did not route to Codex" codex-reader; fi
+
+echo "== interim-review Codex override survives its format retry, then is consumed =="
+make_fixture codex-interim
+printf 'AGENT_REVIEW_INTERIM="codex"\nMODEL_REVIEW_INTERIM="gpt-5.5-review"\n' >> loop.models.sh
+run_loop "CONTINUE_FIX,READY_NOW" "NOVERDICT,APPROVE,APPROVE"
+check "exit 0" codex-interim 0 "$RC"
+check "both interim attempts used Codex" codex-interim 2 "$(wc -l < .loop/fake-codex-args | tr -d ' ')"
+check "format-reminder retry stayed on Codex" codex-interim 1 "$(grep -c 'FORMAT REMINDER' .loop/fake-codex-prompts || true)"
+if grep -qx 'fake-rev' .loop/fake-models; then ok "success-gate review returned to Claude"; else bad "one-shot Codex routing leaked into the success gate" codex-interim; fi
+
+echo "== Codex network-off, max-effort mapping, and advisory auth probe =="
+make_fixture codex-network-off
+printf 'LOOP_CODEX_NETWORK=0\n' >> loop.config.sh
+./loop.sh approve >/dev/null
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\nLOOP_EFFORT="max"\n' >> loop.models.sh
+RC=0
+LOOP_FAKE_CODEX=NOAUTH LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/codex-network-off.out" 2>&1 </dev/null || RC=$?
+check "exit 0 despite advisory login-status failure" codex-network-off 0 "$RC"
+if grep -q 'model_reasoning_effort=xhigh' .loop/fake-codex-args \
+   && ! grep -q 'sandbox_workspace_write.network_access=true' .loop/fake-codex-args; then
+  ok "max effort mapped to xhigh and LOOP_CODEX_NETWORK=0 emitted no network config"
+else
+  bad "Codex network/effort mapping wrong: $(cat .loop/fake-codex-args 2>/dev/null | tr '\n' ' ')" codex-network-off
+fi
+if grep -q 'codex login status failed' "$WORK/codex-network-off.out"; then
+  ok "failed login-status probe warns but defers authority to exec"
+else
+  bad "advisory Codex auth warning missing" codex-network-off
+fi
+
+echo "== Codex danger-full-access is accepted without workspace network widening =="
+make_fixture codex-danger
+printf 'LOOP_CODEX_SANDBOX="danger-full-access"\n' >> loop.config.sh
+./loop.sh approve >/dev/null
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+run_loop "READY_NOW"
+check "exit 0" codex-danger 0 "$RC"
+if grep -q '^model=gpt-5.5 sandbox=danger-full-access approval=never ' .loop/fake-codex-args \
+   && ! grep -q 'sandbox_workspace_write.network_access=true' .loop/fake-codex-args; then
+  ok "danger-full-access maps directly and never receives the workspace-only network knob"
+else
+  bad "Codex danger-full-access mapping wrong: $(cat .loop/fake-codex-args 2>/dev/null | tr '\n' ' ')" codex-danger
+fi
+
+echo "== per-role Codex effort reaches STOP_EVAL as a reader =="
+make_fixture codex-stop-effort
+printf 'AGENT_STOP_EVAL="codex"\nMODEL_STOP_EVAL="gpt-5.5-mini"\nEFFORT_STOP_EVAL="low"\n' >> loop.models.sh
+run_loop "CONTINUE_FIX,READY_NOW"
+check "exit 0" codex-stop-effort 0 "$RC"
+if grep -q '^model=gpt-5.5-mini sandbox=read-only approval=never configs=model_reasoning_effort=low ' .loop/fake-codex-args \
+   && grep -q 'loop-stop-eval/SKILL.md' .loop/fake-codex-prompts; then
+  ok "STOP_EVAL used low reasoning effort in a read-only Codex call"
+else
+  bad "Codex STOP_EVAL argv wrong: $(cat .loop/fake-codex-args 2>/dev/null | tr '\n' ' ')" codex-stop-effort
+fi
+
+echo "== Codex guards fail closed with canonical recovery commands =="
+make_fixture codex-missing
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+RC=0
+LOOP_CODEX_CMD="$WORK/no-such-codex" LOOP_CLAUDE_CMD="$FAKE" \
+  ./loop.sh run >"$WORK/codex-missing.out" 2>&1 </dev/null || RC=$?
+check "missing Codex exits 2" codex-missing 2 "$RC"
+if grep -q 'codex CLI not found' "$WORK/codex-missing.out" && grep -q '→ next:' "$WORK/codex-missing.out"; then ok "missing CLI names its recovery"; else bad "missing-CLI recovery absent" codex-missing; fi
+
+make_fixture codex-old
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+RC=0
+LOOP_FAKE_CODEX=OLD LOOP_CLAUDE_CMD="$FAKE" ./loop.sh run >"$WORK/codex-old.out" 2>&1 </dev/null || RC=$?
+check "old Codex exits 2" codex-old 2 "$RC"
+if grep -q 'codex CLI too old' "$WORK/codex-old.out" && grep -q '→ next:' "$WORK/codex-old.out" \
+   && [ ! -e .loop/fake-codex-args ]; then ok "capability probe failed before exec with recovery"; else bad "old-CLI guard did not fail pre-exec" codex-old; fi
+
+make_fixture codex-model-alias
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="opus"\n' >> loop.models.sh
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" ./loop.sh run >"$WORK/codex-model-alias.out" 2>&1 </dev/null || RC=$?
+check "Claude alias on Codex exits 2" codex-model-alias 2 "$RC"
+if grep -q "MODEL_IMPLEMENT='opus' is a Claude alias" "$WORK/codex-model-alias.out" \
+   && grep -q '→ next:' "$WORK/codex-model-alias.out" && [ ! -e .loop/fake-codex-args ]; then
+  ok "model/agent mismatch failed before exec with recovery"
+else
+  bad "Codex model-alias guard missing" codex-model-alias
+fi
+
+make_fixture codex-config-sandbox
+printf 'LOOP_CODEX_SANDBOX=invalid\n' >> loop.config.sh
+./loop.sh approve >/dev/null
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" ./loop.sh run >"$WORK/codex-config-sandbox.out" 2>&1 </dev/null || RC=$?
+check "invalid LOOP_CODEX_SANDBOX exits 2" codex-config-sandbox 2 "$RC"
+if grep -q 'LOOP_CODEX_SANDBOX must be' "$WORK/codex-config-sandbox.out" && grep -q '→ next:' "$WORK/codex-config-sandbox.out"; then ok "sandbox enum fails closed"; else bad "sandbox enum guard missing" codex-config-sandbox; fi
+
+make_fixture codex-config-network
+printf 'LOOP_CODEX_NETWORK=2\n' >> loop.config.sh
+./loop.sh approve >/dev/null
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" ./loop.sh run >"$WORK/codex-config-network.out" 2>&1 </dev/null || RC=$?
+check "invalid LOOP_CODEX_NETWORK exits 2" codex-config-network 2 "$RC"
+if grep -q 'LOOP_CODEX_NETWORK must be 0 or 1' "$WORK/codex-config-network.out" && grep -q '→ next:' "$WORK/codex-config-network.out"; then ok "network enum fails closed"; else bad "network enum guard missing" codex-config-network; fi
+
+echo "== unknown AGENT value degrades to Claude; CONTRACT remains pinned =="
+make_fixture codex-agent-typo
+printf 'AGENT_IMPLEMENT="codexx"\n' >> loop.models.sh
+run_loop "READY_NOW"
+check "agent typo still completes" codex-agent-typo 0 "$RC"
+if grep -qx 'fake-imp' .loop/fake-models && [ ! -e .loop/fake-codex-invocations ]; then ok "unknown agent value degraded to Claude"; else bad "agent typo did not degrade safely" codex-agent-typo; fi
+
+make_fixture codex-contract-pin nocontract
+printf 'AGENT_CONTRACT="codex"\n' >> loop.models.sh
+RC=0
+LOOP_FAKE_CONTRACT=READY LOOP_CLAUDE_CMD="$FAKE" \
+  ./loop.sh start "fix value.txt so the check passes" >"$WORK/codex-contract-pin.out" 2>&1 </dev/null || RC=$?
+check "contract generation exits 0" codex-contract-pin 0 "$RC"
+if grep -qx 'fake-con' .loop/fake-models && [ ! -e .loop/fake-codex-invocations ]; then ok "CONTRACT stayed pinned to Claude"; else bad "AGENT_CONTRACT escaped the Claude pin" codex-contract-pin; fi
+./loop.sh approve >"$WORK/codex-contract-pin-approve.out" 2>&1
+if grep -q 'AGENT_CONTRACT is ignored' "$WORK/codex-contract-pin-approve.out"; then ok "ignored AGENT_CONTRACT is visible at approval"; else bad "contract-pin warning missing" codex-contract-pin; fi
+
+echo "== DISALLOWED_TOOLS warning distinguishes Claude and Codex controls =="
+make_fixture codex-disallowed
+printf 'DISALLOWED_TOOLS="Bash"\n' >> loop.config.sh
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+./loop.sh approve >"$WORK/codex-disallowed.out" 2>&1
+if grep -q 'DISALLOWED_TOOLS constrains Claude only' "$WORK/codex-disallowed.out" \
+   && grep -q 'IMPLEMENT -> codex/gpt-5.5' "$WORK/codex-disallowed.out"; then
+  ok "approval prints the Codex control-surface warning and routing table"
+else
+  bad "Codex DISALLOWED_TOOLS warning/routing missing" codex-disallowed
+fi
 
 echo "== runaway-context nudge (TURNS_NUDGE_AT) =="
 make_fixture ctxnudge
@@ -1165,6 +1382,63 @@ if grep '"state": "AGENT_ERROR"' .loop/journal.jsonl | grep -q 'FATAL: fake agen
 if ls .loop/logs/failed/*.err >/dev/null 2>&1; then ok "failed-call sidecars preserved (.loop/logs/failed/)"; else bad "no preserved failure evidence" crash; fi
 if grep -q 'last error:' "$WORK/last-run.out"; then ok "BLOCKED message carries the diagnostics"; else bad "BLOCKED message undiagnosed" crash; fi
 
+echo "== Codex CLI failure normalizes diagnostics and preserves raw JSONL =="
+make_fixture codex-fail
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+RC=0
+LOOP_FAKE_CODEX=FAIL LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/codex-fail.out" 2>&1 </dev/null || RC=$?
+check "exit code 4" codex-fail 4 "$RC"
+check "state BLOCKED" codex-fail BLOCKED "$(cat .loop/state 2>/dev/null || echo none)"
+if grep '"state": "AGENT_ERROR"' .loop/journal.jsonl | grep -q 'fake codex failure' \
+   && grep -q 'last error:.*fake codex failure' "$WORK/codex-fail.out"; then
+  ok "Codex error event reached AGENT_FAIL_DIAG and the terminal stop"
+else
+  bad "Codex failure diagnostics missing: $(grep AGENT_ERROR .loop/journal.jsonl | head -1)" codex-fail
+fi
+if ls .loop/logs/failed/*.codex.jsonl >/dev/null 2>&1 \
+   && grep -q '"is_error": true' .loop/logs/failed/*.json \
+   && grep -q '"type":"turn.failed"' .loop/logs/failed/*.codex.jsonl; then
+  ok "failed Codex envelope and raw event stream were preserved"
+else
+  bad "Codex failure sidecars missing or not normalized" codex-fail
+fi
+
+echo "== Codex turn.failed fails closed even with exit 0 and a non-empty message =="
+make_fixture codex-turnfail
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+RC=0
+LOOP_FAKE_CODEX=TURNFAIL LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/codex-turnfail.out" 2>&1 </dev/null || RC=$?
+check "exit code 4" codex-turnfail 4 "$RC"
+if grep '"state": "AGENT_ERROR"' .loop/journal.jsonl | grep -q 'exit=0 is_error=true' \
+   && grep -q '"type":"turn.failed"' .loop/logs/failed/*.codex.jsonl \
+   && grep -q '"is_error": true' .loop/logs/failed/*.json; then
+  ok "turn.failed event alone marked the normalized envelope as an error"
+else
+  bad "turn.failed was not authoritative when exit/message looked successful" codex-turnfail
+fi
+
+echo "== Codex success JSONL without -o message fails closed (no stale reuse) =="
+make_fixture codex-nomsg
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+RC=0
+LOOP_FAKE_CODEX=NOMSG LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/codex-nomsg.out" 2>&1 </dev/null || RC=$?
+check "exit code 4" codex-nomsg 4 "$RC"
+check "state BLOCKED" codex-nomsg BLOCKED "$(cat .loop/state 2>/dev/null || echo none)"
+if grep '"state": "AGENT_ERROR"' .loop/journal.jsonl | grep -q 'exit=0 is_error=true' \
+   && grep -q '"is_error": true' .loop/logs/failed/*.json \
+   && ls .loop/logs/failed/*.codex.jsonl >/dev/null 2>&1 \
+   && [ -z "$(find .loop/logs/failed -name '*.msg' -type f -print -quit)" ]; then
+  ok "missing last-message was normalized as an error without a stale .msg"
+else
+  bad "NOMSG did not fail closed with preserved JSONL" codex-nomsg
+fi
+
 echo "== API-level failure (is_error JSON, exit 0): diagnosed + cost still tracked =="
 make_fixture errjson
 run_loop "ERRJSON,ERRJSON"
@@ -1784,6 +2058,31 @@ rm -f .loop/kit-source
 out=$(./loop.sh update --from "$ROOT" 2>&1) || true
 if echo "$out" | grep -qi 'up to date'; then ok "self-update detects up-to-date harness"; else bad "expected up-to-date: $out" upd-noop; fi
 if grep -qF "$ROOT" .loop/kit-source 2>/dev/null; then ok "kit-source (re)written via --from"; else bad "kit-source not written" upd-noop; fi
+if echo "$out" | grep -q 'loop.models.sh has keys your file lacks.*AGENT_IMPLEMENT'; then
+  ok "update surfaces new commented AGENT_* routing keys to existing deployments"
+else
+  bad "commented agent-routing keys were invisible to update drift detection: $out" upd-noop
+fi
+
+echo "== .codex/config.toml participates in approval and update hash parity =="
+make_fixture upd-codex-config
+mkdir -p .codex
+printf 'model_reasoning_effort = "high"\n' > .codex/config.toml
+./loop.sh approve >/dev/null
+out=$(./loop.sh update --from "$ROOT" 2>&1) || true
+if echo "$out" | grep -qi 'up to date' && ! echo "$out" | grep -qi 'approval.*stale'; then
+  ok "update hash matches the approved harness when Codex project config is unchanged"
+else
+  bad "target_harness_sha drifted from harness_hash: $out" codex-config-hash
+fi
+printf 'model_reasoning_effort = "low"\n' > .codex/config.toml
+run_loop "READY_NOW"
+check "Codex project-config mutation refuses the run" codex-config-hash 2 "$RC"
+if grep -q '.codex/config.toml' "$WORK/last-run.out"; then
+  ok "approval failure names the changed Codex session config"
+else
+  bad "Codex config tamper was not explained: $(cat "$WORK/last-run.out")" codex-config-hash
+fi
 
 echo "== update refuses an unknown kit source (deployed, no recorded source, no --from) =="
 make_fixture upd-nosrc
@@ -2973,6 +3272,34 @@ fleet_result() { grep -E '^RESULT=' ".loop/fleet/runs/$1.env" 2>/dev/null | tail
 fleet_wt()     { grep -E '^WT='     ".loop/fleet/runs/$1.env" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
 qcount()      { find ".loop/fleet/queue/$1" -name '*.md' 2>/dev/null | wc -l | tr -d ' '; }
 
+echo "== fleet: Codex role selection propagates into the worker worktree =="
+make_fleet_fixture fleet-codex-route
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+mkdir -p .codex
+printf '\n.codex/config.toml\n' >> .gitignore
+git add .gitignore && git commit -q -m "ignore local Codex project config"
+printf 'model_reasoning_effort = "high"\n' > .codex/config.toml
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" LOOP_FAKE_REVIEW=APPROVE \
+  LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh fleet run task-a.md --auto --drain >"$WORK/fleet-codex-route.out" 2>&1 </dev/null &
+wait_sup $! fleet-codex-route
+check "supervisor exit 0" fleet-codex-route 0 "$RC"
+check "task done" fleet-codex-route 1 "$(qcount "done")"
+id=$(fleet_task_id alpha)
+wt=$(fleet_wt "$id")
+if [ -s "$wt/.loop/fake-codex-args" ] \
+   && grep -q '^model=gpt-5.5 sandbox=workspace-write approval=never ' "$wt/.loop/fake-codex-args"; then
+  ok "copied loop.models.sh routed worker IMPLEMENT to Codex"
+else
+  bad "Codex worker routing missing in $wt" fleet-codex-route
+fi
+if cmp -s .codex/config.toml "$wt/.codex/config.toml"; then
+  ok "gitignored approved Codex project config propagated byte-for-byte to the worker"
+else
+  bad "Codex worker lost the parent project config" fleet-codex-route
+fi
+
 echo "== fleet: add is an atomic maildir enqueue (works without a supervisor) =="
 make_fleet_fixture fleet-add
 out=$(./loop.sh fleet add task-a.md 2>&1)
@@ -3370,7 +3697,11 @@ id=""
 n=0
 while [ "$n" -lt 60 ]; do
   id=$(fleet_task_id alpha)
-  [ -n "$id" ] && [ "$(fleet_phase "$id")" = "PENDING_APPROVAL" ] && break
+  # PHASE is published immediately before the audit row. Require both so this
+  # assertion cannot land in that tiny, valid transition window.
+  [ -n "$id" ] && [ "$(fleet_phase "$id")" = "PENDING_APPROVAL" ] \
+    && grep -q '"event": "CONTRACT_REVIEW_REFUSED"' .loop/fleet/journal.jsonl 2>/dev/null \
+    && break
   sleep 1; n=$((n + 1))
 done
 check "REVISE demoted auto-approval to PENDING_APPROVAL" fleet-conrev PENDING_APPROVAL "$(fleet_phase "$id")"
@@ -4007,6 +4338,22 @@ check "exit 0" orch-reuse 0 "$RC"
 check "decompose model called exactly once across both runs" orch-reuse 1 "$(cat .loop/fake-decompose-i 2>/dev/null)"
 if grep -q '"state": "DECOMPOSE_REUSE"' .loop/journal.jsonl; then ok "reuse journaled"; else bad "DECOMPOSE_REUSE missing" orch-reuse; fi
 
+echo "== Codex DECOMPOSE tampering is caught before plan publication =="
+make_orch_fixture orch-codex-decompose-tamper
+printf 'AGENT_DECOMPOSE="codex"\nMODEL_DECOMPOSE="gpt-5.5"\n' >> loop.models.sh
+RC=0
+LOOP_FAKE_DECOMPOSE_TAMPER=MODELS LOOP_FAKE_DECOMPOSE=ONE LOOP_CLAUDE_CMD="$FAKE" \
+  ./loop.sh decompose --force >"$WORK/orch-codex-decompose-tamper.out" 2>&1 </dev/null || RC=$?
+check "tampering decompose exits 3" orch-codex-decompose-tamper 3 "$RC"
+check "state RISK_REQUIRES_APPROVAL" orch-codex-decompose-tamper RISK_REQUIRES_APPROVAL "$(cat .loop/state)"
+if grep -q 'loop-decompose/SKILL.md' .loop/fake-codex-prompts \
+   && grep -q 'loop.models.sh or fleet.config.sh changed during decomposition' "$WORK/orch-codex-decompose-tamper.out" \
+   && [ ! -f .loop/decompose-approved ]; then
+  ok "Codex decomposition was routed, then stopped before its plan became approved"
+else
+  bad "decompose integrity check did not stop publication" orch-codex-decompose-tamper
+fi
+
 echo "== orch: decompose review REVISE regenerates once, then approves =="
 make_orch_fixture orch-drev
 RC=0
@@ -4140,6 +4487,37 @@ value.txt must contain "fixed".
 EOF
   git add -A && git commit -q -m master
 }
+
+echo "== supervise: Codex stays fresh and bypasses Claude session persistence =="
+make_sup_fixture fleet-codex-supervise
+printf 'AGENT_SUPERVISE="codex"\nMODEL_SUPERVISE="gpt-5.5-review"\n' >> loop.models.sh
+LOOP_CLAUDE_CMD="$FAKE" ./loop.sh fleet add task-a.md >/dev/null 2>&1
+id=$(fleet_task_id alpha)
+printf 'PLANNED=1\nREQS=REQ-001\n' >> ".loop/fleet/runs/$id.env"
+RC=0
+LOOP_FAKE_SLEEP=0.3 LOOP_FAKE_SCENARIO="DECLARE_SPEC,READY_NOW" \
+  LOOP_FAKE_SUPERVISE=ANSWER LOOP_CLAUDE_CMD="$FAKE" \
+  ./loop.sh fleet run --auto --drain >"$WORK/fleet-codex-supervise.out" 2>&1 </dev/null &
+SUP=$!
+n=0
+while [ "$n" -lt 150 ]; do
+  [ "$(qcount claimed)" -ge 1 ] && break
+  sleep 0.2; n=$((n + 1))
+done
+# fleet startup has already rotated any prior session once the task is claimed.
+# Seed a stale handle now: the Codex supervisor path must neither read nor update it.
+printf 'stale-claude-session 19\n' > .loop/fleet/supervisor-session
+wait_sup "$SUP" fleet-codex-supervise
+check "supervisor exit 0" fleet-codex-supervise 0 "$RC"
+check "task done" fleet-codex-supervise 1 "$(qcount "done")"
+if grep -q '^model=gpt-5.5-review sandbox=read-only approval=never ' .loop/fake-codex-args \
+   && grep -q 'loop-supervise/SKILL.md' .loop/fake-codex-prompts; then
+  ok "SUPERVISE routed to a fresh read-only Codex call"
+else
+  bad "Codex supervisor call missing or not read-only" fleet-codex-supervise
+fi
+check "stale Claude session file was not read/updated by Codex" fleet-codex-supervise \
+  "stale-claude-session 19" "$(cat .loop/fleet/supervisor-session 2>/dev/null || echo missing)"
 
 echo "== supervise: ANSWER writes guidance and relaunches the task to SUCCESS =="
 make_sup_fixture fleet-supanswer
@@ -5870,6 +6248,23 @@ check "no second RUN_START (same run continued)" resume-blocked "$starts_before"
 if grep -q 'sentinel-baseline-kept' .loop/baseline-verify.log 2>/dev/null && grep -q '^\[FAIL\] ./check.sh' .loop/baseline-verify.log 2>/dev/null; then ok "baseline log survives resume (baseline never re-run mid-run)"; else bad "baseline log clobbered on resume" resume-blocked; fi
 if [ ! -f .loop/run-checkpoint ]; then ok "checkpoint removed on SUCCESS"; else bad "checkpoint left after SUCCESS" resume-blocked; fi
 
+echo "== resume: Codex cost-warning bookkeeping preserves the restored Claude total =="
+make_fixture codex-resume-cost
+printf 'AGENT_REVIEW="codex"\nMODEL_REVIEW="gpt-5.5-review"\n' >> loop.models.sh
+run_loop "DECLARE_BLOCKED,READY_NOW"
+check "first run BLOCKED" codex-resume-cost 4 "$RC"
+c1=$(cat .loop/cost-total)
+resume_run "DECLARE_BLOCKED,READY_NOW" resume
+check "resume exits 0" codex-resume-cost 0 "$RC"
+warn_total=$(grep '"state": "CODEX_COST_UNTRACKED"' .loop/journal.jsonl | tail -1 \
+  | sed -E 's/.*"total_usd": ([0-9.]+).*/\1/')
+check "one cost warning per process" codex-resume-cost 2 "$(grep -c '"state": "CODEX_COST_UNTRACKED"' .loop/journal.jsonl || true)"
+if awk -v before="$c1" -v warned="$warn_total" 'BEGIN{exit !(before > 0 && before == warned)}'; then
+  ok "resume warning retained the restored cumulative total (\$$warn_total)"
+else
+  bad "Codex warning rewound total_usd on resume (had $c1, warning wrote $warn_total)" codex-resume-cost
+fi
+
 echo "== resume: bare ./loop.sh run auto-resumes an interrupted run at iteration N (not 1) =="
 make_fixture resume-interrupt
 run_loop "CONTINUE_FIX,DECLARE_BLOCKED,READY_NOW"   # iter1 CONTINUE, iter2 BLOCKED
@@ -6496,9 +6891,11 @@ if [ ! -d "$WORK/resume-orphan-loops/ghost-1" ]; then ok "orphan worktree remove
 if ! git rev-parse -q --verify refs/heads/loop/ghost-1 >/dev/null; then ok "orphan branch removed"; else bad "orphan branch left" resume-orphan; fi
 if grep -q '"event": "ORPHAN_CLEANED"' .loop/fleet/journal.jsonl; then ok "gc journaled as ORPHAN_CLEANED"; else bad "ORPHAN_CLEANED missing" resume-orphan; fi
 
-echo "== resume: a dead RUNNING task is listed '(process dead)' and resume reaps+relaunches =="
+echo "== resume: a recycled RUNNING pid is listed '(process dead)' and resume reaps+relaunches =="
 # E11/G7b: phase RUNNING with a dead pid used to be an unresumable 'busy' —
-# liveness makes it a stale-running class the human can act on directly.
+# liveness makes it a stale-running class the human can act on directly. Make
+# the stronger PID-reuse case deterministic: a SIGKILL-stale run.pid must not
+# turn an unrelated, still-live process into permanent task liveness.
 make_fleet_fixture resume-stale
 LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="CONTINUE_FIX,CONTINUE_FIX,READY_NOW" LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
   ./loop.sh fleet run task-a.md --auto > "$WORK/resume-stale1.out" 2>&1 </dev/null &
@@ -6518,16 +6915,28 @@ kill -9 "$SUP" 2>/dev/null || true
 kill -9 "$LOOP_PID" 2>/dev/null || true
 wait "$SUP" 2>/dev/null || true
 sleep 1
-check "phase left RUNNING by the kill (dead pid)" resume-stale RUNNING "$(fleet_phase "$id")"
+sleep 300 &
+DECOY_PID=$!
+printf 'PID=%s\n' "$DECOY_PID" >> ".loop/fleet/runs/$id.env"
+printf '%s\n' "$DECOY_PID" > "$(fleet_wt "$id")/.loop/run.pid"
+rm -f "$(fleet_wt "$id")/.loop/run.heartbeat"
+check "phase left RUNNING with its pid recycled by a foreign process" resume-stale RUNNING "$(fleet_phase "$id")"
 out=$(./loop.sh resume --list 2>&1) || true
 if printf '%s\n' "$out" | grep "$id" | grep -q '(process dead)'; then
-  ok "listing flags the dead RUNNING task as resumable (process dead)"
+  ok "listing rejects stale run.pid ownership and flags the task (process dead)"
 else
   bad "no (process dead) verdict: $(printf '%s\n' "$out" | grep "$id" || echo missing)" resume-stale
 fi
 RC=0
 LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO=READY_NOW LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
   ./loop.sh resume "$id" > "$WORK/resume-stale2.out" 2>&1 </dev/null || RC=$?
+if kill -0 "$DECOY_PID" 2>/dev/null; then
+  ok "stale ownership cleanup never signals the recycled foreign process"
+else
+  bad "resume killed the recycled foreign process" resume-stale
+fi
+kill "$DECOY_PID" 2>/dev/null || true
+wait "$DECOY_PID" 2>/dev/null || true
 check "resume reaps the corpse and relaunches inline (exit 0)" resume-stale 0 "$RC"
 if [ -f ".loop/fleet/queue/done/$id.md" ]; then ok "task completed after the stale-running resume"; else bad "task not done ($(fleet_phase "$id"))" resume-stale; fi
 check "parent value fixed" resume-stale fixed "$(cat value.txt)"
@@ -6658,13 +7067,13 @@ fi
 echo "== shellcheck =="
 if command -v shellcheck >/dev/null 2>&1; then
   # Parallel: loop.sh alone is ~9s and dominates; a serial run stacks the other
-  # three files on top (~16-35s total). shellcheck analyzes each file independently
+  # four files on top (~16-35s total). shellcheck analyzes each file independently
   # (no cross-file sourcing here), so per-file concurrency is result-identical and
   # collapses the gate to the slowest single file. Output is replayed in a fixed
   # (glob) order so findings stay deterministic.
   sc_rc=0
   sc_tmp=$(mktemp -d "$WORK/shellcheck.XXXXXX")
-  for f in "$ROOT/bin/loop.sh" "$ROOT/bin/evaluate.sh" "$ROOT/tests/fake_claude.sh" "$ROOT/tests/run_tests.sh"; do
+  for f in "$ROOT/bin/loop.sh" "$ROOT/bin/evaluate.sh" "$ROOT/tests/fake_claude.sh" "$ROOT/tests/fake_codex.sh" "$ROOT/tests/run_tests.sh"; do
     b=$(basename "$f")
     ( shellcheck "$f" > "$sc_tmp/$b.out" 2>&1; echo $? > "$sc_tmp/$b.rc" ) &
   done

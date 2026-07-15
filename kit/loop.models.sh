@@ -1,6 +1,6 @@
-# loop.models.sh — model roles for every in-loop process.
+# loop.models.sh — agent and model roles for every in-loop process.
 # Edit freely (no re-approval needed); parsed as plain key=value, never executed.
-# Format: KEY="model-alias"  (opus / sonnet / haiku, or a full model name)
+# Format: MODEL_<ROLE>="model-name"  (a Claude alias/full name or Codex slug)
 #
 # Defaults: heavyweight model for the important work (implementation, review,
 # planning, contract), lightweight model for stop evaluation.
@@ -32,13 +32,36 @@ MODEL_REVIEW_INTERIM="sonnet"
 # above already differs by default). The deterministic VERIFY_COMMANDS gate is
 # unaffected either way.
 
-# Reasoning effort for every in-loop `claude` call (passed as `claude --effort`).
+# ---- Agent routing (per-role CLI selection) -------------------------------
+# AGENT_<ROLE> = "claude" (default) | "codex". Unset/typo -> claude (a typo
+# can never kill a running loop; same degrade posture as EFFORT_*).
+# When a role routes to codex, set MODEL_<ROLE> to a Codex model slug
+# (e.g. gpt-5.5, gpt-5.6-sol) — Claude aliases (opus/sonnet/haiku) are
+# rejected at run preflight.
+# Recipe — plan/review on Claude, implementation on Codex:
+#   AGENT_IMPLEMENT="codex"
+#   MODEL_IMPLEMENT="gpt-5.5"
+#AGENT_IMPLEMENT=""
+#AGENT_PLAN=""
+#AGENT_REVIEW=""          # gate + decompose/contract reviews
+#AGENT_REVIEW_INTERIM=""  # interim reviews only; empty = inherit AGENT_REVIEW
+#AGENT_STOP_EVAL=""
+#AGENT_EVIDENCE=""
+#AGENT_DECOMPOSE=""
+#AGENT_SUPERVISE=""       # codex here disables supervisor session reuse (fresh calls)
+# NOTE: CONTRACT (interactive definition / refine / headless auto) is always Claude.
+# Agent inheritance does not replace MODEL_REVIEW_INTERIM: if AGENT_REVIEW=codex
+# is inherited here, set MODEL_REVIEW_INTERIM to a Codex slug too (or explicitly
+# route AGENT_REVIEW_INTERIM to another agent).
+
+# Reasoning effort for every in-loop agent call. Claude receives `--effort`;
+# Codex receives `model_reasoning_effort` (`max` maps to Codex's `xhigh`).
 # One of: low | medium | high | xhigh | max. Applies to all roles above
 # (implement, review, plan, contract, evidence, stop-eval, decompose, supervise)
 # and to the interactive contract sessions. Higher = more thinking per call.
 #
-# Requires a Claude Code CLI that supports --effort (>= ~2.1) and a model that
-# honors effort levels (Opus 4.8 etc.); models that don't just ignore it.
+# Claude routing requires a Claude Code CLI that supports --effort (>= ~2.1).
+# Whether an effort level changes behavior ultimately depends on the model.
 # Blank or remove this line to pass no flag and fall back to the CLI's own
 # default effort. An unrecognized value is dropped (no flag) rather than sent.
 LOOP_EFFORT="xhigh"

@@ -15,9 +15,10 @@ compiled artifact. The deliverable is the scripts themselves.
 ## Commands
 
 ```bash
-# Full test suite — the primary gate. Zero-token E2E: swaps a fake agent in for `claude`
-# (LOOP_CLAUDE_CMD) and drives every terminal state, review/stop-eval, the fleet, resume
-# matrix, and tamper defenses. ~1000+ assertions, a few minutes. Ends with a shellcheck gate.
+# Full test suite — the primary gate. Zero-token E2E: swaps fake agents in for `claude` /
+# `codex` (LOOP_CLAUDE_CMD / LOOP_CODEX_CMD) and drives every terminal state,
+# review/stop-eval, the fleet, the resume matrix, and tamper defenses. ~1000+ assertions,
+# a few minutes. Ends with a shellcheck gate.
 tests/run_tests.sh
 
 # Fast syntax check while iterating on the harness (loop.sh targets bash, not POSIX sh —
@@ -25,7 +26,7 @@ tests/run_tests.sh
 bash -n bin/loop.sh
 
 # Lint (also run as the suite's final assertion)
-shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh tests/run_tests.sh
+shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh tests/fake_codex.sh tests/run_tests.sh
 
 # Deploy / manage the kit in a target project (run from THIS repo = "kit mode")
 bin/loop.sh init <dir> [--template demo1-bugfix|demo2-feature]
@@ -48,6 +49,8 @@ Two layers, and the split is the point:
 - **`bin/loop.sh`** — the deterministic harness (one large bash file; the fleet supervisor is
   folded into it, there is no separate `fleet.sh`). Orchestration, state machine, approval
   hashing, git/worktree management, journaling, and command dispatch all live here.
+  `run_claude` retains its historical name but dispatches each routable role through
+  `AGENT_<ROLE>`; its Codex adapter normalizes JSONL into the existing result envelope.
 - **`bin/evaluate.sh`** — the evaluator. Re-runs the user's `VERIFY_COMMANDS` *outside* the
   model. This is the maker–checker boundary: deterministic checks gate first, AI review second,
   humans see only an evidence report. No model self-grades.
@@ -58,7 +61,7 @@ Two layers, and the split is the point:
 - **`kit/loop-docs/*.md`** — pristine templates for the working docs (`product-contract.md`,
   `implementation-plan.md`, `progress.md`, `requirements-ledger.md`, `evidence-report.md`, …).
 - **`kit/loop.config.sh` / `loop.models.sh` / `fleet.config.sh`** — user-tunable config templates
-  (stop conditions/paths, per-phase model routing, fleet knobs).
+  (stop conditions/paths, per-phase agent/model routing, fleet knobs).
 
 `init`/`update` copy `bin/*` + `kit/*` into a project as `loop.sh`, `.loop/bin/evaluate.sh`,
 `.claude/skills/loop-*`, `.loop/docs/*`, and the config files. `README.md` (extensive) is the
@@ -123,7 +126,7 @@ be mid-implementation on the very files you are about to touch — do not destro
 **Detect before you edit** shared files (`bin/loop.sh`, `bin/evaluate.sh`, `tests/**`, `kit/**`):
 
 ```bash
-ps aux | grep -E "run_tests.sh|loop.sh|fake_claude.sh" | grep -v grep   # peer suite / fleet?
+ps aux | grep -E "run_tests.sh|loop.sh|fake_claude.sh|fake_codex.sh" | grep -v grep   # peer suite / fleet?
 git status --porcelain                                                  # uncommitted work you didn't make?
 ```
 

@@ -117,6 +117,10 @@
 # .loop/fake-tools mirrors .loop/fake-models: one line per call,
 #                     "<model> <flag>=<value>…" for every tool-restriction flag
 #                     (--tools/--allowedTools/--disallowedTools) received.
+# LOOP_FAKE_RAW_RESULT=1: print only the decoded result text (used internally by
+#                     fake_codex.sh; unset preserves the legacy JSON envelope).
+# LOOP_FAKE_DELEGATED_CODEX=1: suppress Claude argv telemetry for that internal
+#                     delegation so Claude/Codex routing logs remain disjoint.
 # (last entry repeats when exhausted). LOOP_FAKE_COST overrides per-call cost.
 
 set -euo pipefail
@@ -150,15 +154,17 @@ mkdir -p .loop .loop/docs
 # orphan-detection probe (spawned BEFORE the .loop/fake-models readiness marker the
 # interrupt tests poll, so the grandchild provably exists when they fire the signal)
 [ -z "${LOOP_FAKE_GRANDCHILD:-}" ] || ( sleep "$LOOP_FAKE_GRANDCHILD"; : > .loop/fake-grandchild-alive ) &
-echo "$MODEL_SEEN" >> .loop/fake-models
-# one line per call: the --resume session id the harness passed ('-' = fresh
-# call) — tests assert supervisor-session reuse/rotation sequences with this
-echo "${RESUME_SEEN:--}" >> .loop/fake-resumes
-# one line per call: the --effort value the harness passed (blank if it passed
-# none) — tests assert LOOP_EFFORT routing the way .loop/fake-models proves model routing
-echo "$EFFORT_SEEN" >> .loop/fake-effort
-# mirror of .loop/fake-models with the tool-restriction flags per call
-[ -z "$TOOLFLAGS" ] || echo "$MODEL_SEEN$TOOLFLAGS" >> .loop/fake-tools
+if [ "${LOOP_FAKE_DELEGATED_CODEX:-0}" != 1 ]; then
+  echo "$MODEL_SEEN" >> .loop/fake-models
+  # one line per call: the --resume session id the harness passed ('-' = fresh
+  # call) — tests assert supervisor-session reuse/rotation sequences with this
+  echo "${RESUME_SEEN:--}" >> .loop/fake-resumes
+  # one line per call: the --effort value the harness passed (blank if it passed
+  # none) — tests assert LOOP_EFFORT routing the way .loop/fake-models proves model routing
+  echo "$EFFORT_SEEN" >> .loop/fake-effort
+  # mirror of .loop/fake-models with the tool-restriction flags per call
+  [ -z "$TOOLFLAGS" ] || echo "$MODEL_SEEN$TOOLFLAGS" >> .loop/fake-tools
+fi
 cost="${LOOP_FAKE_COST:-0.01}"
 
 # Record protocol prompts BEFORE any opt-in delay below: tests use "prompt
@@ -189,6 +195,12 @@ if [ -f .loop/fake-scenario ]; then
 fi
 
 emit_json() { # $1 cost, $2 result text (no quotes/backslashes)
+  if [ "${LOOP_FAKE_RAW_RESULT:-0}" = 1 ]; then
+    # Scenario strings carry JSON-style \n escapes. Codex's -o file contains the
+    # rendered message, so materialize them only for this explicit adapter mode.
+    printf '%b\n' "$2"
+    return 0
+  fi
   # per-cwd incrementing session ids (fake-s1, fake-s2, …): the harness stores
   # the LAST call's id as the next --resume handle, so tests can assert exact
   # fresh-vs-resumed sequences. num_turns mirrors the real CLI's top-level
@@ -263,6 +275,11 @@ case "$PROMPT" in
     # (the harness must keep .loop/decompose-feedback.md alive across the retry)
     [ ! -f .loop/decompose-feedback.md ] \
       || head -1 .loop/decompose-feedback.md >> .loop/fake-decompose-fb-seen
+    if [ "${LOOP_FAKE_DECOMPOSE_TAMPER:-}" = MODELS ]; then
+      # A full DECOMPOSE role can physically reach ignored harness/config files;
+      # the parent must catch this before it parses or publishes the plan.
+      echo 'MODEL_REVIEW="tampered-by-decompose"' >> loop.models.sh
+    fi
     dv=$(next_from_list "${LOOP_FAKE_DECOMPOSE:-ONE}" .loop/fake-decompose-i)
     dep="-"
     [ "$dv" = "CHAIN" ] && dep="part-a"
