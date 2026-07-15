@@ -84,3 +84,4 @@
 # --- liveness ---
 .loop/run.pid liveness
 .loop/run.heartbeat liveness
+.loop/run-claim.lock.d liveness

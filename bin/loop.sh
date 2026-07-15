@@ -2912,6 +2912,37 @@ single_loop_alive() { # is a live single-loop `run` recorded in ./.loop/run.pid?
   run_heartbeat_fresh .
 }
 
+acquire_run_claim() { # atomic cold-start claim for `run` — closes the TOCTOU
+  # window between the split-brain guard (a plain state read) and the first
+  # .loop/run.pid write, which spans config loads, the fresh-clear, and the
+  # full baseline verify (VERIFY_COMMANDS — minutes): two runs could pass the
+  # guard together and race the run-scoped artifacts. mkdir is the atomic
+  # primitive (acquire_lock's pattern); a dead holder is reclaimed via
+  # kill -0, never ps parsing alone. Released by release_run_claim once
+  # run.pid + heartbeat own liveness; a holder that die()d leaves a dead pid
+  # the next run reclaims — the claim can never brick a repo.
+  local d=.loop/run-claim.lock.d holder
+  if mkdir "$d" 2>/dev/null; then
+    echo $$ > "$d/pid"
+    return 0
+  fi
+  holder=$(cat "$d/pid" 2>/dev/null || echo "")
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    return 1
+  fi
+  rm -rf "$d" 2>/dev/null || true
+  mkdir "$d" 2>/dev/null || return 1
+  echo $$ > "$d/pid"
+  return 0
+}
+
+release_run_claim() { # owner-only: a successor's claim must never be removed
+  local d=.loop/run-claim.lock.d
+  [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ] || return 0
+  rm -rf "$d" 2>/dev/null || true
+  return 0
+}
+
 task_done() { # $1 id, $2 detail
   mv -f "$QUEUE_DIR/claimed/$1.md" "$QUEUE_DIR/done/$1.md" 2>/dev/null || true
   renv_set "$1" PHASE DONE
@@ -7909,6 +7940,11 @@ cmd_run() {
   if [ "$(cat .loop/state 2>/dev/null)" = "RUNNING" ] && single_loop_alive; then
     die "a run is already active in this repo (pid $(cat .loop/run.pid 2>/dev/null)) — wait for it or stop it (Ctrl-C / kill $(cat .loop/run.pid 2>/dev/null)) before running again"
   fi
+  # the guard above is a plain read (TOCTOU): claim the cold-start window
+  # atomically so a second `run` launched before this one seeds .loop/run.pid
+  # cannot enter beside it. Released once the liveness pidfile takes over.
+  acquire_run_claim \
+    || die_next "another ./loop.sh run is already starting in this repo (pid $(cat .loop/run-claim.lock.d/pid 2>/dev/null))" "wait for it to appear in ./loop.sh status, or stop it, then ./loop.sh run"
   # SECURITY: verify hashes BEFORE sourcing any config shell code
   verify_approval
   load_config
@@ -8004,6 +8040,7 @@ cmd_run() {
       # A PARKED pre-start queue (manual adds only, nothing ever started) is NOT
       # in flight: it falls through so the contract still decomposes, and the
       # orchestration start dispatches the parked tasks alongside the planned ones.
+      release_run_claim   # the supervisor's own atomic lock takes over from here
       run_fleet_orchestration resume
     fi
     if [ "$(fcfg FLEET_DECOMPOSE 1)" != "0" ]; then
@@ -8013,6 +8050,7 @@ cmd_run() {
         # --fresh restarts the LOOP fresh but still reuses an approved plan that
         # matches the contract; regenerating the plan is `./loop.sh decompose --force`
         if cmd_decompose_flow 0 1; then
+          release_run_claim   # the supervisor's own atomic lock takes over from here
           run_fleet_orchestration start
         fi
       fi
@@ -8094,6 +8132,7 @@ cmd_run() {
     # run.pid precedes run_beat; a finish() below (MAX_RESUMES) removes it.
     echo $$ > .loop/run.pid
     run_beat
+    release_run_claim   # run.pid + heartbeat own liveness from here
     # crash-loop backstop: too many resumes without the run ever moving forward
     # (a resumed run that completes an iteration resets this to 0 — see below)
     if [ "$resumes" -ge "$MAX_RESUMES" ]; then
@@ -8223,6 +8262,7 @@ cmd_run() {
     # correcting). finish()/on_interrupt remove it.
     echo $$ > .loop/run.pid
     run_beat
+    release_run_claim   # run.pid + heartbeat own liveness from here
     journal_append "run" "RUN_START" "baseline $run_start_ref"
     # journaled AFTER RUN_START on purpose: per-segment aggregation treats
     # RUN_START as the segment boundary, so this row must belong to THIS run
