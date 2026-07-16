@@ -46,6 +46,7 @@ CLAUDE_CMD="${LOOP_CLAUDE_CMD:-claude}"
 CODEX_CMD="${LOOP_CODEX_CMD:-codex}"
 CODEX_PROBE_DONE=0
 CODEX_COST_WARNING_EMITTED=0
+AGENT_ROUTE_WARNING_EMITTED=0
 TOTAL_COST=0
 CHILD_PID=""
 AGENT_PID=""
@@ -911,8 +912,24 @@ get_config_scalar() { # $1 key, $2 default — display/warning parser; never sou
   printf '%s' "${v:-$2}"
 }
 
+warn_unknown_agent_values() { # the degrade posture is pinned (unknown -> claude,
+  # a typo can never kill a loop) — but say so, or a routing typo silently
+  # erases a cross-vendor maker–checker intent. Advisory only; never dies.
+  [ "$AGENT_ROUTE_WARNING_EMITTED" = 0 ] || return 0
+  AGENT_ROUTE_WARNING_EMITTED=1
+  local role raw
+  for role in CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
+    raw=$(get_model "AGENT_$role" "")
+    case "$raw" in
+      ''|claude|codex) ;;
+      *) note "warning: AGENT_$role='$raw' is not recognized — routing to claude" ;;
+    esac
+  done
+}
+
 print_agent_routing() {
   local role agent model
+  warn_unknown_agent_values
   note "agent routing (role -> agent/model):"
   note "  CONTRACT -> $(configured_agent CONTRACT)/$(configured_role_model CONTRACT) (headless definition; interactive start/refine always Claude)"
   for role in PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
@@ -973,6 +990,12 @@ need_contract_agent() { # start/auto preflight — require the CLI the DEFINITIO
   # CONTRACT) is routable. The predicate must mirror the dispatch below:
   # [ -t 0 ] && AUTO_MODE != 1 -> interactive.
   if [ -t 0 ] && [ "$AUTO_MODE" != "1" ]; then
+    # A Codex-routed CONTRACT covers only headless definition — when Claude is
+    # absent, name that path instead of a bare install hint (a Codex-only user
+    # is one command away, not stuck).
+    if [ "$(configured_agent CONTRACT)" = codex ] && ! command -v "$CLAUDE_CMD" >/dev/null 2>&1; then
+      die_next "the interactive definition session needs the Claude CLI ('$CLAUDE_CMD'); AGENT_CONTRACT=codex covers only headless definition" "install Claude Code (or set LOOP_CLAUDE_CMD), or define headlessly on Codex: ./loop.sh auto \"<what to build>\""
+    fi
     need_claude
     return 0
   fi
@@ -1023,6 +1046,7 @@ warn_codex_cost_untracked() {
 
 need_agents() { # run/fleet preflight; each CLI is required only when routed-to
   local scope="${1:-}" role agent model roles why
+  warn_unknown_agent_values
   roles="IMPLEMENT PLAN REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE"
   # Claude is not unconditional: an all-Codex routing must be able to run on a
   # machine with no claude CLI at all. Fleet additionally covers CONTRACT —
@@ -9204,7 +9228,10 @@ cmd_refine() { # ./loop.sh refine ['<opening note>'] — interactive design-gate
   # contract is immutable here — a REQUIRED-behavior change is /loop-contract's job.
   need_project
   need_awk
-  need_claude
+  # refine is an interactive Claude surface; without the CLI the same outcome
+  # is reachable by hand — name that path instead of a bare install hint.
+  command -v "$CLAUDE_CMD" >/dev/null 2>&1 \
+    || die_next "refine needs the Claude CLI ('$CLAUDE_CMD') for its interactive session" "install Claude Code (or set LOOP_CLAUDE_CMD) — or without Claude: mark the 'human' row(s) 'verified' in .loop/docs/acceptance-checklist.md, then ./loop.sh resume"
   local st note_arg="${1:-}" rc=0 ans=""
   st=$(cat .loop/state 2>/dev/null || echo "")
   if [ "$st" != "BLOCKED" ]; then

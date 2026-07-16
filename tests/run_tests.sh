@@ -691,6 +691,25 @@ printf 'AGENT_IMPLEMENT="codexx"\n' >> loop.models.sh
 run_loop "READY_NOW"
 check "agent typo still completes" codex-agent-typo 0 "$RC"
 if grep -qx 'fake-imp' .loop/fake-models && [ ! -e .loop/fake-codex-invocations ]; then ok "unknown agent value degraded to Claude"; else bad "agent typo did not degrade safely" codex-agent-typo; fi
+if grep -q "AGENT_IMPLEMENT='codexx' is not recognized — routing to claude" "$WORK/last-run.out"; then
+  ok "typo degrade is announced at preflight"
+else
+  bad "silent AGENT typo degrade (no preflight note)" codex-agent-typo
+fi
+check "typo note printed once per process" codex-agent-typo 1 "$(grep -c "is not recognized — routing to claude" "$WORK/last-run.out" || true)"
+
+echo "== refine without the Claude CLI names the manual sign-off path =="
+make_fixture refine-noclaude
+RC=0
+LOOP_CLAUDE_CMD="$WORK/no-such-claude" ./loop.sh refine >"$WORK/refine-noclaude.out" 2>&1 </dev/null || RC=$?
+check "exit 2" refine-noclaude 2 "$RC"
+if grep -q "acceptance-checklist.md" "$WORK/refine-noclaude.out" \
+   && grep -q './loop.sh resume' "$WORK/refine-noclaude.out" \
+   && grep -q '→ next:' "$WORK/refine-noclaude.out"; then
+  ok "claude-less refine recovery names the manual sign-off path"
+else
+  bad "refine recovery missing: $(cat "$WORK/refine-noclaude.out")" refine-noclaude
+fi
 
 echo "== AGENT_CONTRACT routes the HEADLESS definition to Codex (interactive stays Claude) =="
 make_fixture codex-contract-route nocontract

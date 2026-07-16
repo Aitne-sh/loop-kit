@@ -901,7 +901,7 @@ can be selected with `LOOP_CODEX_CMD=/path/to/codex`.
 | `./loop.sh run` / `resume` (single loop) | Yes — route every `AGENT_<ROLE>` to codex (a hand-written or pre-generated contract needs no model to `approve`) |
 | `./loop.sh auto` / no-TTY `start` | Yes — additionally set `AGENT_CONTRACT="codex"` |
 | Fleet orchestration | Yes — with `AGENT_CONTRACT="codex"` workers define their task contracts on Codex; otherwise the orchestration entry refuses and names `run --single` |
-| Interactive `./loop.sh start` / `refine` | No — always launches Claude Code |
+| Interactive `./loop.sh start` / `refine` | No — always launches Claude Code. Claude-less equivalents: define with `./loop.sh auto "<instruction>"`; instead of `refine`, mark the `human` acceptance rows `verified` in `.loop/docs/acceptance-checklist.md` and `./loop.sh resume` (both errors name these paths) |
 
 Route implementation to Codex while leaving planning and review on Claude:
 
