@@ -374,7 +374,7 @@ fi
 # harness files the agent must never touch (tracked in git, so the diff sees them;
 # the untracked .loop/bin half and any gitignored session config are covered by
 # loop.sh's in-memory hash baselines)
-HARNESS_PATHS="loop.sh loop.models.sh fleet.sh fleet.config.sh .mcp.json .claude/**"
+HARNESS_PATHS="loop.sh loop.models.sh fleet.sh fleet.config.sh .mcp.json .claude/** .codex/**"
 
 # ---------- changed paths in this iteration (tracked diff + untracked, minus .loop) ----------
 changed=""

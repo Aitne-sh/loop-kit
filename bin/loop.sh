@@ -986,10 +986,24 @@ need_contract_agent() { # start/auto preflight — require the CLI the DEFINITIO
   fi
 }
 
+restore_total_cost() { # re-adopt the logical run's cumulative cost in a fresh
+  # process BEFORE any bookkeeping row is journaled, so total_usd can never
+  # jump backwards to the process default of zero (and so a later add_cost
+  # cannot rewind the .loop/cost-total mirror to just this process's spend).
+  TOTAL_COST=$(cat .loop/cost-total 2>/dev/null || true)
+  if [ -z "$TOTAL_COST" ] && [ -f .loop/run-checkpoint ]; then
+    TOTAL_COST=$(ckpt_get TOTAL_COST)
+  fi
+  [ -n "$TOTAL_COST" ] || TOTAL_COST=0
+}
+
 warn_codex_cost_untracked() {
   [ "$CODEX_COST_WARNING_EMITTED" = 0 ] || return 0
   [ -n "${MAX_COST_USD:-}" ] || return 0
-  codex_routing_enabled || return 0
+  # CONTRACT counts alongside the in-run roles: fleet workers define their task
+  # contracts mid-run, and headless definition spends Codex before any cap
+  # could apply — either way the cap's coverage claim no longer holds.
+  codex_routing_enabled || [ "$(configured_agent CONTRACT)" = codex ] || return 0
   CODEX_COST_WARNING_EMITTED=1
   note "warning: MAX_COST_USD cannot bound Codex calls — Codex USD cost is recorded as 0; the cap covers Claude calls only"
   # This is preflight bookkeeping, not an agent call. Seed explicit zero mirrors
@@ -7206,6 +7220,10 @@ cmd_decompose() { # preview/refresh the task plan without enqueueing or running
   fi
   load_config
   load_models
+  # a manual decompose journals preflight bookkeeping into the LIVE task's
+  # journal from a fresh process — re-adopt the cumulative total first so the
+  # row (and the mirror add_cost rewrites) cannot rewind it to zero
+  restore_total_cost
   warn_codex_cost_untracked
   RUN_CONTRACT_HASH=$(contract_hash)
   RUN_HARNESS_HASH=$(harness_hash)
@@ -8637,11 +8655,7 @@ cmd_run() {
   # bookkeeping row cannot make total_usd jump backwards to the process default
   # of zero. The normal resume branch re-reads the same mirrors defensively.
   if [ "$identity_mode" = resume ] || fleet_inflight; then
-    TOTAL_COST=$(cat .loop/cost-total 2>/dev/null || true)
-    if [ -z "$TOTAL_COST" ] && [ -f .loop/run-checkpoint ]; then
-      TOTAL_COST=$(ckpt_get TOTAL_COST)
-    fi
-    [ -n "$TOTAL_COST" ] || TOTAL_COST=0
+    restore_total_cost
   fi
   warn_codex_cost_untracked
   pin_observation_manifest \

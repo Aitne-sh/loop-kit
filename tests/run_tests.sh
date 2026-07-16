@@ -557,6 +557,18 @@ else
   bad "CODEX_COST_UNTRACKED audit row missing" codex-cost
 fi
 
+echo "== a Codex-routed CONTRACT alone still voids the USD cap's coverage claim =="
+make_fixture codex-contract-cost
+printf 'AGENT_CONTRACT="codex"\nMODEL_CONTRACT="gpt-5.5"\n' >> loop.models.sh
+run_loop "READY_NOW"
+check "exit 0 (contract already defined; in-run roles stay Claude)" codex-contract-cost 0 "$RC"
+if grep -q '"state": "CODEX_COST_UNTRACKED"' .loop/journal.jsonl \
+   && grep -q 'MAX_COST_USD cannot bound Codex calls' "$WORK/last-run.out"; then
+  ok "CONTRACT-only Codex routing triggers the cap warning"
+else
+  bad "CONTRACT-only routing did not warn" codex-contract-cost
+fi
+
 echo "== Codex reader routing forces read-only and suppresses network widening =="
 make_fixture codex-reader
 printf 'AGENT_REVIEW="codex"\nMODEL_REVIEW="gpt-5.5-review"\n' >> loop.models.sh
@@ -2249,6 +2261,19 @@ if grep -q '.codex/config.toml' "$WORK/last-run.out"; then
 else
   bad "Codex config tamper was not explained: $(cat "$WORK/last-run.out")" codex-config-hash
 fi
+
+echo "== evaluator diff policy classifies .codex/config.toml as a harness path =="
+make_fixture codex-eval-diff
+mkdir -p .codex
+printf 'model_reasoning_effort = "high"\n' > .codex/config.toml
+git add .codex/config.toml && git commit -q -m "track codex project config"
+printf 'model_reasoning_effort = "low"\n' > .codex/config.toml
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "verdict RISK_REQUIRES_APPROVAL" codex-eval-diff RISK_REQUIRES_APPROVAL "${out%% *}"
+case "$out" in
+  *"harness file(s) modified by the loop: .codex/config.toml"*) ok "diff policy names the Codex project config" ;;
+  *) bad "evaluator did not classify .codex/config.toml as harness: $out" codex-eval-diff ;;
+esac
 
 echo "== update refuses an unknown kit source (deployed, no recorded source, no --from) =="
 make_fixture upd-nosrc
@@ -4555,6 +4580,23 @@ if grep -q 'loop-decompose/SKILL.md' .loop/fake-codex-prompts \
   ok "Codex decomposition was routed, then stopped before its plan became approved"
 else
   bad "decompose integrity check did not stop publication" orch-codex-decompose-tamper
+fi
+
+echo "== manual decompose bookkeeping re-adopts the run's cumulative cost =="
+make_orch_fixture orch-codex-decompose-cost
+printf 'AGENT_DECOMPOSE="codex"\nMODEL_DECOMPOSE="gpt-5.5"\n' >> loop.models.sh
+echo 3.21 > .loop/cost-total
+RC=0
+LOOP_FAKE_DECOMPOSE=ONE LOOP_CLAUDE_CMD="$FAKE" \
+  ./loop.sh decompose --force >"$WORK/orch-codex-decompose-cost.out" 2>&1 </dev/null || RC=$?
+check "decompose exits 0" orch-codex-decompose-cost 0 "$RC"
+warn_total=$(grep '"state": "CODEX_COST_UNTRACKED"' .loop/journal.jsonl | tail -1 \
+  | sed -E 's/.*"total_usd": ([0-9.]+).*/\1/')
+check "warning row keeps the cumulative total" orch-codex-decompose-cost 3.21 "$warn_total"
+if awk -v t="$(cat .loop/cost-total)" 'BEGIN{exit !(t >= 3.21)}'; then
+  ok "manual decompose did not rewind the cost-total mirror"
+else
+  bad "manual decompose rewound .loop/cost-total to $(cat .loop/cost-total)" orch-codex-decompose-cost
 fi
 
 echo "== orch: decompose review REVISE regenerates once, then approves =="
