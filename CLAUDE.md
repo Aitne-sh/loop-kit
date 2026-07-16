@@ -51,6 +51,8 @@ Two layers, and the split is the point:
   hashing, git/worktree management, journaling, and command dispatch all live here.
   `run_claude` retains its historical name but dispatches each routable role through
   `AGENT_<ROLE>`; its Codex adapter normalizes JSONL into the existing result envelope.
+  `AGENT_CONTRACT` governs only the headless definition path — interactive `start`/`refine`
+  launch the Claude TUI directly and never consult the resolver.
 - **`bin/evaluate.sh`** — the evaluator. Re-runs the user's `VERIFY_COMMANDS` *outside* the
   model. This is the maker–checker boundary: deterministic checks gate first, AI review second,
   humans see only an evidence report. No model self-grades.

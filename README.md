@@ -839,7 +839,8 @@ loop until you re-approve. The key settings:
 ### `loop.models.sh` — which agent and model run each step (tune between runs)
 
 Each routable in-loop role can use Claude (the default) or Codex, and every role can
-use a different model. Contract definition and refinement remain pinned to Claude.
+use a different model. Interactive contract definition and refinement always run on
+Claude; the headless definition pass follows `AGENT_CONTRACT`.
 This file is parsed as plain `key=value` pairs — never executed — and changes between
 runs do not need re-approval. The harness snapshots it at run start; a mid-run edit
 stops as `RISK_REQUIRES_APPROVAL`.
@@ -885,12 +886,22 @@ Codex iterations.
 
 ### Assigning roles to Codex
 
-Claude Code remains required because contract definition, refinement, and the unattended
-definition pass are pinned to Claude. Codex routing is optional and requires either a
-ChatGPT subscription usable by Codex or an `OPENAI_API_KEY`. Install a current Codex CLI
-and authenticate it with `codex login`; for API-key authentication, use
+Claude Code is required only for the interactive surfaces: a TTY `./loop.sh start`
+definition session and `./loop.sh refine` always launch Claude. Every headless surface can
+route to Codex — including the headless definition pass (`auto`, no-TTY `start`, fleet
+workers) via `AGENT_CONTRACT` — so a fully headless project can run with **no Claude CLI
+installed at all**. Codex routing is optional and requires either a ChatGPT subscription
+usable by Codex or an `OPENAI_API_KEY`. Install a current Codex CLI and authenticate it
+with `codex login`; for API-key authentication, use
 `printenv OPENAI_API_KEY | codex login --with-api-key`. A custom executable or test double
 can be selected with `LOOP_CODEX_CMD=/path/to/codex`.
+
+| Surface | Claude-less operation |
+|---|---|
+| `./loop.sh run` / `resume` (single loop) | Yes — route every `AGENT_<ROLE>` to codex (a hand-written or pre-generated contract needs no model to `approve`) |
+| `./loop.sh auto` / no-TTY `start` | Yes — additionally set `AGENT_CONTRACT="codex"` |
+| Fleet orchestration | Yes — with `AGENT_CONTRACT="codex"` workers define their task contracts on Codex; otherwise the orchestration entry refuses and names `run --single` |
+| Interactive `./loop.sh start` / `refine` | No — always launches Claude Code |
 
 Route implementation to Codex while leaving planning and review on Claude:
 
@@ -900,12 +911,24 @@ AGENT_IMPLEMENT="codex"
 MODEL_IMPLEMENT="gpt-5.5"
 ```
 
+Or additionally hand the evidence report (and any HTML views it authors) to Codex,
+keeping Claude for planning and review:
+
+```sh
+# loop.models.sh
+AGENT_IMPLEMENT="codex"
+MODEL_IMPLEMENT="gpt-5.5"
+AGENT_EVIDENCE="codex"
+MODEL_EVIDENCE="gpt-5.5"
+```
+
 The routable keys are `AGENT_IMPLEMENT`, `AGENT_PLAN`, `AGENT_REVIEW`,
-`AGENT_REVIEW_INTERIM`, `AGENT_STOP_EVAL`, `AGENT_EVIDENCE`, `AGENT_DECOMPOSE`, and
-`AGENT_SUPERVISE`. Unset or unrecognized values safely fall back to `claude`;
-`AGENT_REVIEW_INTERIM` inherits `AGENT_REVIEW` when empty. `AGENT_CONTRACT` is ignored,
-and a Codex-routed role must use a Codex model slug rather than `opus`, `sonnet`, `haiku`,
-or a `claude-*` model name. Agent inheritance does not overwrite the independently tiered
+`AGENT_REVIEW_INTERIM`, `AGENT_STOP_EVAL`, `AGENT_EVIDENCE`, `AGENT_DECOMPOSE`,
+`AGENT_SUPERVISE`, and `AGENT_CONTRACT` (headless definition only — interactive sessions
+stay on Claude). Unset or unrecognized values safely fall back to `claude`;
+`AGENT_REVIEW_INTERIM` inherits `AGENT_REVIEW` when empty. A Codex-routed role must use a
+Codex model slug rather than `opus`, `sonnet`, `haiku`, or a `claude-*` model name.
+Agent inheritance does not overwrite the independently tiered
 `MODEL_REVIEW_INTERIM`: when routing `AGENT_REVIEW` to Codex, also set
 `MODEL_REVIEW_INTERIM` to a Codex slug (or explicitly route interim review elsewhere).
 
@@ -930,6 +953,16 @@ A useful maker–checker split is Codex for `IMPLEMENT` and Claude for `REVIEW`:
 vendors reduce the chance that one model family's blind spot appears on both sides. This is
 additional diversity, not a substitute for the deterministic evaluator re-running every
 approved `VERIFY_COMMAND`.
+
+Two operational caveats. First, the adapter's failure detection assumes the Codex CLI's
+JSONL events carry `"type"` as their first key and that `codex login status` exists — both
+hold for codex-cli 0.144, but the capability probe does not pin them, so after a major
+Codex CLI upgrade re-verify that a failing call still normalizes to `"is_error": true`
+(a `turn.failed` event must fail the iteration even on exit 0). Second, a Codex-routed
+`REVIEW` judging screenshot observations (`run`-method acceptance rows) has **not** been
+verified against real image inspection — if your contract leans on screenshot evidence,
+keep `AGENT_REVIEW` on Claude or first verify your Codex CLI can actually read the cited
+images.
 
 ### `fleet.config.sh` — parallel-execution settings (tune between runs)
 
@@ -1230,6 +1263,9 @@ not in a shell harness:
   the project mounted. Same-UID sessions with broad filesystem read access may still read
   off-tree approval files and sibling task/run logs; their normal isolation is a harness
   integrity check plus prompt/citation policy, not a whole-loop OS access-control boundary.
+  User-global agent configuration (`~/.claude*`, `~/.codex/config.toml`) is likewise outside
+  the harness hash and writable by any same-UID process — including a Claude-routed worker's
+  Bash — so treat it as part of the environment you isolate, not something the hash protects.
 - **Scoped credentials.** Nothing stops a command in `VERIFY_COMMANDS` (or a hook in the
   project's own build) from reading `~/.aws` and friends. Give the loop least-privilege,
   short-lived tokens.
