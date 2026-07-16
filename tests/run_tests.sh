@@ -5307,9 +5307,10 @@ if [ "$merges" -ge 1 ]; then ok "serial merge(s) landed ($merges)"; else bad "no
 
 echo "== orch: parent's approved Codex sandbox posture survives a worker config rewrite =="
 make_orch_fixture orch-codex-posture 2
+# loop.config.sh / loop.models.sh are gitignored in a deployment — the posture
+# change needs only re-approval (contract_hash covers loop.config.sh), no commit
 printf 'LOOP_CODEX_NETWORK=0\n' >> loop.config.sh
 printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
-git add -A && git commit -q -m "network-off posture"
 ./loop.sh approve >/dev/null
 RC=0
 LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_DECOMPOSE=TWO_PAR LOOP_FAKE_SCENARIO=READY_NOW \
