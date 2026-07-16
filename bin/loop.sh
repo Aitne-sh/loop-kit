@@ -815,6 +815,14 @@ load_config() {
     0|1) ;;
     *) die_next "LOOP_CODEX_NETWORK must be 0 or 1" "fix LOOP_CODEX_NETWORK in loop.config.sh, then ./loop.sh approve" ;;
   esac
+  # Fleet workers REWRITE their seeded loop.config.sh during sub-contract
+  # generation; a generator that drops these keys must degrade to the PARENT'S
+  # approved sandbox posture, never back to the harness default (which would
+  # silently re-enable network under workspace-write). Exporting the validated
+  # values hands every child process them as environment fallbacks: a worker
+  # file that still defines a key wins (sourcing overrides the environment); a
+  # missing key inherits these instead of the ':=' default above.
+  export LOOP_CODEX_SANDBOX LOOP_CODEX_NETWORK
   : "${PERMISSION_MODE:=acceptEdits}"   # deny-enforcing; bypassPermissions would IGNORE DISALLOWED_TOOLS
   : "${ALLOWED_TOOLS:=Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite,NotebookEdit}"
   : "${DISALLOWED_TOOLS:=}"             # opt-in tool deny-list (primary control); empty = deny nothing
@@ -5176,6 +5184,10 @@ cmd_fleet_run() {
   # MAX_COST_USD it would need lives in that not-yet-verified config, and
   # sourcing (or env-injecting) it here would either execute unverified config
   # or leak an assignment into the supervise calls; the orchestrated path warns.
+  # The same stance covers LOOP_CODEX_SANDBOX/LOOP_CODEX_NETWORK: on this path
+  # no parent posture was ever approved, so each worker's own approved config
+  # (or the caller's exported environment) governs — load_config's export only
+  # propagates a posture that passed approval, i.e. the orchestrated entry.
   MAX_ITER_SECONDS="${MAX_ITER_SECONDS:-900}"
   MODEL_SUPERVISE=$(configured_role_model SUPERVISE)
   mkdir -p .loop/logs   # run_claude writes its call logs here (init may not have)

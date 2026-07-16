@@ -5286,6 +5286,32 @@ fi
 merges=$(git log --format=%s | grep -c '^fleet: merge' || true)
 if [ "$merges" -ge 1 ]; then ok "serial merge(s) landed ($merges)"; else bad "no merge commits" orch-par; fi
 
+echo "== orch: parent's approved Codex sandbox posture survives a worker config rewrite =="
+make_orch_fixture orch-codex-posture 2
+printf 'LOOP_CODEX_NETWORK=0\n' >> loop.config.sh
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+git add -A && git commit -q -m "network-off posture"
+./loop.sh approve >/dev/null
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_DECOMPOSE=TWO_PAR LOOP_FAKE_SCENARIO=READY_NOW \
+  LOOP_FAKE_CONTRACT_STRIP_CODEX_KEYS=1 \
+  ./loop.sh run >"$WORK/orch-codex-posture.out" 2>&1 </dev/null || RC=$?
+check "exit 0" orch-codex-posture 0 "$RC"
+check "state SUCCESS" orch-codex-posture SUCCESS "$(cat .loop/state)"
+wa=$(fleet_wt "$(fleet_task_id part-a)")
+if [ -f "$wa/loop.config.sh" ] && ! grep -q '^LOOP_CODEX_' "$wa/loop.config.sh"; then
+  ok "worker sub-contract rewrite dropped the Codex keys (fixture precondition)"
+else
+  bad "strip hook did not run — inheritance not exercised" orch-codex-posture
+fi
+if [ -s "$wa/.loop/fake-codex-args" ] \
+   && grep -q 'sandbox=workspace-write' "$wa/.loop/fake-codex-args" \
+   && ! grep -q 'sandbox_workspace_write.network_access=true' "$wa/.loop/fake-codex-args"; then
+  ok "worker inherited the parent's approved network-off posture"
+else
+  bad "worker regained network despite parent LOOP_CODEX_NETWORK=0: $(cat "$wa/.loop/fake-codex-args" 2>/dev/null | tr '\n' ' ')" orch-codex-posture
+fi
+
 echo "== orch: final-verify tampering with the contract is caught before certification =="
 make_orch_fixture orch-tamper-final 2
 # the tamper arms only at the parent's integration gate: workers have no

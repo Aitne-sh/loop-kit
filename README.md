@@ -944,6 +944,11 @@ sandbox and should be used only inside an environment you already isolate. Claud
 Codex sandbox plus the same evaluator, independent review, approval hash, and diff policy.
 `./loop.sh approve` warns when a Codex route and a non-empty deny-list coexist.
 
+In an orchestrated fleet the parent's approved `LOOP_CODEX_SANDBOX` / `LOOP_CODEX_NETWORK`
+also travel to every worker as environment fallbacks: a worker whose regenerated
+`loop.config.sh` omits the keys degrades to the parent's approved posture, not to the
+harness default (a worker file that still defines a key keeps its own approved value).
+
 Codex does not report a USD amount in the normalized result, so Codex calls are journaled
 with cost 0. Reported USD totals and `MAX_COST_USD` therefore cover Claude calls only; the
 harness warns when a USD cap is combined with Codex routing, but cannot enforce that cap

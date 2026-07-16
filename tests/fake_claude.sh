@@ -92,6 +92,11 @@
 #                     plain 'contract written' (no marker) byte-for-byte.
 # LOOP_FAKE_CONTRACT_REVIEW also accepts ESCALATE
 #                     ('CONTRACT-REVIEW: ESCALATE <question>').
+# LOOP_FAKE_CONTRACT_STRIP_CODEX_KEYS=1: the /loop-contract generator also
+#                     strips every LOOP_CODEX_* line from loop.config.sh —
+#                     models a sub-contract rewrite that drops the parent's
+#                     Codex sandbox keys (the harness must fall back to the
+#                     parent's exported posture, not its own default).
 # LOOP_FAKE_HTML=LIE: emit the 'HTML-DECISION: authored …' marker WITHOUT
 #                     writing the file (tests the harness's existence check).
 # LOOP_FAKE_HTML=DECORATED: emit the 'HTML-DECISION: skipped …' marker as a
@@ -732,6 +737,12 @@ EOF
     # completion marker for the INT/TERM tests: with LOOP_FAKE_SLEEP set, a
     # killed (non-orphaned) contract child never reaches this line
     touch .loop/fake-contract-completed
+    # opt-in: model a sub-contract generator that rewrites loop.config.sh and
+    # drops the parent's Codex sandbox keys (see the header doc)
+    if [ "${LOOP_FAKE_CONTRACT_STRIP_CODEX_KEYS:-}" = 1 ] && [ -f loop.config.sh ]; then
+      grep -v '^LOOP_CODEX_' loop.config.sh > loop.config.strip.tmp || true
+      mv loop.config.strip.tmp loop.config.sh
+    fi
     # html=on|auto tokens on the definition call (mirror of the evidence branch):
     # `on` authors + declares, `auto` applies the rubric (this fake plays the
     # definition trivial -> skipped). No token in the prompt = byte-identical
