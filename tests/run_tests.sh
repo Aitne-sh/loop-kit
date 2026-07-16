@@ -712,6 +712,48 @@ else
   bad "CONTRACT alias guard missing" codex-contract-alias
 fi
 
+echo "== inherited/unset alias diagnostics name the key the user actually wrote =="
+make_fixture codex-alias-inherit
+printf 'AGENT_REVIEW="codex"\nMODEL_REVIEW="gpt-5.5-review"\nMODEL_REVIEW_INTERIM="sonnet"\n' >> loop.models.sh
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" ./loop.sh run >"$WORK/codex-alias-inherit.out" 2>&1 </dev/null || RC=$?
+check "inherited interim alias exits 2" codex-alias-inherit 2 "$RC"
+if grep -q "AGENT_REVIEW=codex (inherited by REVIEW_INTERIM) but MODEL_REVIEW_INTERIM='sonnet' is a Claude alias" "$WORK/codex-alias-inherit.out" \
+   && grep -q '→ next:' "$WORK/codex-alias-inherit.out"; then
+  ok "diagnostic blames AGENT_REVIEW inheritance, not a key the user never set"
+else
+  bad "inherited-alias diagnostic wrong: $(grep -i alias "$WORK/codex-alias-inherit.out" | head -2)" codex-alias-inherit
+fi
+
+make_fixture codex-alias-unset
+printf 'AGENT_DECOMPOSE="codex"\n' >> loop.models.sh
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" ./loop.sh run >"$WORK/codex-alias-unset.out" 2>&1 </dev/null || RC=$?
+check "unset model on a Codex role exits 2" codex-alias-unset 2 "$RC"
+if grep -q "MODEL_DECOMPOSE is unset (defaults to 'opus', a Claude alias)" "$WORK/codex-alias-unset.out" \
+   && grep -q '→ next:' "$WORK/codex-alias-unset.out"; then
+  ok "diagnostic explains the aliased default instead of quoting a phantom line"
+else
+  bad "unset-model diagnostic wrong: $(grep -i alias "$WORK/codex-alias-unset.out" | head -2)" codex-alias-unset
+fi
+
+echo "== approve warns on a read-only sandbox with Codex authoring roles; status shows routing =="
+make_fixture codex-readonly-warn
+printf 'LOOP_CODEX_SANDBOX="read-only"\n' >> loop.config.sh
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+./loop.sh approve >"$WORK/codex-readonly-warn.out" 2>&1
+if grep -q 'LOOP_CODEX_SANDBOX=read-only — Codex-routed authoring roles (IMPLEMENT) cannot write' "$WORK/codex-readonly-warn.out"; then
+  ok "approval flags the write-less authoring configuration"
+else
+  bad "read-only sandbox warning missing" codex-readonly-warn
+fi
+out=$(./loop.sh status 2>&1) || true
+if printf '%s\n' "$out" | grep -q 'agents:   codex -> implement (all other roles claude)'; then
+  ok "status names the Codex-routed roles"
+else
+  bad "status agents line wrong: $(printf '%s\n' "$out" | grep agents || echo missing)" codex-readonly-warn
+fi
+
 echo "== DISALLOWED_TOOLS warning distinguishes Claude and Codex controls =="
 make_fixture codex-disallowed
 printf 'DISALLOWED_TOOLS="Bash"\n' >> loop.config.sh

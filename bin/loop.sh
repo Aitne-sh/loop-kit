@@ -918,6 +918,15 @@ print_agent_routing() {
   if codex_routing_enabled && [ -n "$(get_config_scalar DISALLOWED_TOOLS "")" ]; then
     note "  warning: DISALLOWED_TOOLS constrains Claude only; Codex roles use LOOP_CODEX_SANDBOX/LOOP_CODEX_NETWORK"
   fi
+  if [ "$(get_config_scalar LOOP_CODEX_SANDBOX workspace-write)" = read-only ]; then
+    # authoring roles must write files; a read-only OS sandbox guarantees the
+    # loop fails at the first Codex-routed full call — say so at approval time
+    local full_codex=""
+    for role in CONTRACT PLAN IMPLEMENT EVIDENCE DECOMPOSE; do
+      [ "$(configured_agent "$role")" != codex ] || full_codex="$full_codex $role"
+    done
+    [ -z "$full_codex" ] || note "  warning: LOOP_CODEX_SANDBOX=read-only — Codex-routed authoring roles (${full_codex# }) cannot write files and will fail"
+  fi
 }
 
 codex_routing_enabled() {
@@ -961,10 +970,16 @@ need_contract_agent() { # start/auto preflight — require the CLI the DEFINITIO
   fi
   if [ "$(configured_agent CONTRACT)" = codex ]; then
     need_codex
-    local model; model=$(configured_role_model CONTRACT)
+    local model why; model=$(configured_role_model CONTRACT)
     case "$model" in
       opus|sonnet|haiku|claude-*)
-        die_next "AGENT_CONTRACT=codex but MODEL_CONTRACT='$model' is a Claude alias" "set MODEL_CONTRACT to a Codex model slug (e.g. gpt-5.5) in loop.models.sh" ;;
+        why="AGENT_CONTRACT=codex"
+        if [ -z "$(get_model MODEL_CONTRACT "")" ]; then
+          why="$why but MODEL_CONTRACT is unset (defaults to '$model', a Claude alias)"
+        else
+          why="$why but MODEL_CONTRACT='$model' is a Claude alias"
+        fi
+        die_next "$why" "set MODEL_CONTRACT to a Codex model slug (e.g. gpt-5.5) in loop.models.sh" ;;
     esac
   else
     need_claude
@@ -985,7 +1000,7 @@ warn_codex_cost_untracked() {
 }
 
 need_agents() { # run/fleet preflight; each CLI is required only when routed-to
-  local scope="${1:-}" role agent model roles
+  local scope="${1:-}" role agent model roles why
   roles="IMPLEMENT PLAN REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE"
   # Claude is not unconditional: an all-Codex routing must be able to run on a
   # machine with no claude CLI at all. Fleet additionally covers CONTRACT —
@@ -1007,10 +1022,23 @@ need_agents() { # run/fleet preflight; each CLI is required only when routed-to
     model=$(configured_role_model "$role")
     case "$model" in
       opus|sonnet|haiku|claude-*)
-        if [ "$scope" = fleet ]; then
-          fdie_next "AGENT_$role=codex but MODEL_$role='$model' is a Claude alias" "set MODEL_$role to a Codex model slug (e.g. gpt-5.5) in loop.models.sh"
+        # Name the key the user actually wrote: REVIEW_INTERIM inherits its
+        # agent from AGENT_REVIEW, and an unset MODEL_<role> arrives here as a
+        # Claude-alias default — a bare "MODEL_X='opus'" would accuse a line
+        # that does not exist in the user's loop.models.sh.
+        why="AGENT_$role=codex"
+        if [ "$role" = REVIEW_INTERIM ] && [ -z "$(get_model AGENT_REVIEW_INTERIM "")" ]; then
+          why="AGENT_REVIEW=codex (inherited by REVIEW_INTERIM)"
+        fi
+        if [ -z "$(get_model "MODEL_$role" "")" ]; then
+          why="$why but MODEL_$role is unset (defaults to '$model', a Claude alias)"
         else
-          die_next "AGENT_$role=codex but MODEL_$role='$model' is a Claude alias" "set MODEL_$role to a Codex model slug (e.g. gpt-5.5) in loop.models.sh"
+          why="$why but MODEL_$role='$model' is a Claude alias"
+        fi
+        if [ "$scope" = fleet ]; then
+          fdie_next "$why" "set MODEL_$role to a Codex model slug (e.g. gpt-5.5) in loop.models.sh"
+        else
+          die_next "$why" "set MODEL_$role to a Codex model slug (e.g. gpt-5.5) in loop.models.sh"
         fi ;;
     esac
   done
@@ -1093,18 +1121,24 @@ resolve_iter_timeout() { # $1 optional role key — echoes the effective per-cal
 load_models() {
   # (MODEL_CONTRACT is resolved inline at contract-definition time via get_model,
   #  not here — load_models runs in cmd_run, after the contract already exists.)
-  MODEL_PLAN=$(get_model MODEL_PLAN opus)
-  MODEL_IMPLEMENT=$(get_model MODEL_IMPLEMENT opus)
-  MODEL_REVIEW=$(get_model MODEL_REVIEW opus)
+  # Per-role defaults live in configured_role_model — the single table shared
+  # with the preflight alias checks and the approve-time routing display, so a
+  # default changed there can never drift from what actually runs.
+  MODEL_PLAN=$(configured_role_model PLAN)
+  MODEL_IMPLEMENT=$(configured_role_model IMPLEMENT)
+  MODEL_REVIEW=$(configured_role_model REVIEW)
   # interim reviews only (steering feedback each iteration); empty = inherit
   # MODEL_REVIEW. The gate/decompose/contract reviews (certification) always
   # use MODEL_REVIEW — this knob never weakens an approval-adjacent check.
+  # (Kept as the raw value: run_review applies the inheritance at the call
+  # site; configured_role_model REVIEW_INTERIM materializes it ONLY for
+  # preflight checks and display.)
   MODEL_REVIEW_INTERIM=$(get_model MODEL_REVIEW_INTERIM "")
-  MODEL_EVIDENCE=$(get_model MODEL_EVIDENCE sonnet)
-  MODEL_STOP_EVAL=$(get_model MODEL_STOP_EVAL haiku)
-  MODEL_DECOMPOSE=$(get_model MODEL_DECOMPOSE opus)
+  MODEL_EVIDENCE=$(configured_role_model EVIDENCE)
+  MODEL_STOP_EVAL=$(configured_role_model STOP_EVAL)
+  MODEL_DECOMPOSE=$(configured_role_model DECOMPOSE)
   # shellcheck disable=SC2034  # consumed by the supervise step (fleet dispatcher)
-  MODEL_SUPERVISE=$(get_model MODEL_SUPERVISE opus)
+  MODEL_SUPERVISE=$(configured_role_model SUPERVISE)
 }
 
 ensure_loop_dir() {
@@ -5123,9 +5157,13 @@ cmd_fleet_run() {
   need_agents fleet
   # the supervise step (tick 2.5) calls run_claude from THIS process; give it
   # the pieces load_config/load_models would provide in an orchestrated run
-  # (loop.config.sh cannot be sourced here — no approval verification happened)
+  # (loop.config.sh cannot be sourced here — no approval verification happened).
+  # Deliberate: no CODEX_COST_UNTRACKED warning on this manual path — the
+  # MAX_COST_USD it would need lives in that not-yet-verified config, and
+  # sourcing (or env-injecting) it here would either execute unverified config
+  # or leak an assignment into the supervise calls; the orchestrated path warns.
   MAX_ITER_SECONDS="${MAX_ITER_SECONDS:-900}"
-  MODEL_SUPERVISE=$(get_model MODEL_SUPERVISE opus)
+  MODEL_SUPERVISE=$(configured_role_model SUPERVISE)
   mkdir -p .loop/logs   # run_claude writes its call logs here (init may not have)
   [ "$AUTO_MODE" = "1" ] && auto_flag=1
   if [ "${#args[@]}" -ge 1 ]; then
@@ -9370,6 +9408,13 @@ cmd_status() {
   fi
   echo "cost:     \$$(cat .loop/cost-total 2>/dev/null || echo 0) (last run)${lifeline:+ / $lifeline}"
   echo "models:   implement=$(get_model MODEL_IMPLEMENT opus) review=$(get_model MODEL_REVIEW opus) stop-eval=$(get_model MODEL_STOP_EVAL haiku)"
+  if codex_routing_enabled || [ "$(configured_agent CONTRACT)" = codex ]; then
+    local _ag="" _r2
+    for _r2 in CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
+      [ "$(configured_agent "$_r2")" != codex ] || _ag="$_ag $(printf '%s' "$_r2" | tr '[:upper:]_' '[:lower:]-')"
+    done
+    echo "agents:   codex ->${_ag} (all other roles claude)"
+  fi
   local _eo="" _r _v
   for _r in IMPLEMENT REVIEW PLAN CONTRACT EVIDENCE STOP_EVAL DECOMPOSE SUPERVISE; do
     _v=$(get_model "EFFORT_$_r" "")
