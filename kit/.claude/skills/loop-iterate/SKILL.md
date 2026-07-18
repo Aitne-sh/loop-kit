@@ -156,6 +156,13 @@ refuse the row. When you recapture, REPLACE the old path — never append the
 new one alongside it; if you mention prior captures at all, write them
 prefix-less (`iter2-AC-xxx-probe.log`, not the full path). Never write
 brace patterns (`settings-{a,b}.png`) — one full literal path.
+The same discipline covers EVERY other certification cell: a requirements-
+ledger row or a `cmd`/`human` checklist row may name a full
+`.loop/observations/` path only when it is exactly a verified `run` row's
+canonical citation — any other full path there (a human row's supporting
+screenshot, a superseded capture) is refused by the evaluator, because the
+evidence report echoes it and the certification gate rejects citations
+outside the verified checklist. Mention such captures prefix-less.
 **Reading your own code is never evidence for
 a `run` row** — "the wiring looks correct" is exactly how a migration that
 renders nothing gets certified. If observation is impossible this iteration

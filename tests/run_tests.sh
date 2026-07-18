@@ -3582,6 +3582,195 @@ else
   ok "no non-ASCII bytes in stamped paths"
 fi
 
+echo "== stray observation citations outside the verified run rows are refused =="
+# 6.6(f): the terminal report validator binds EVERY .loop/observations/ literal
+# in the evidence report to the verified checklist, and the evidence agent
+# echoes what the certification docs cite — so a full path leaking from a
+# ledger cell or a cmd/human checklist row deadlocks the terminal gate after
+# burning every regeneration attempt (a real run hit exactly this via a ledger
+# cell citing a human row's supporting screenshots). Refuse at promotion time,
+# naming the source cell.
+make_fixture aclist-stray
+echo fixed > value.txt
+seed_ledger_met
+mkdir -p .loop/observations
+printf 'observed\n' > .loop/observations/iter1-AC-001.png
+printf 'supporting capture\n' > .loop/observations/iter0-AC-001.png
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the page visibly renders | run | verified | .loop/observations/iter1-AC-001.png |
+EOF
+cat > .loop/docs/requirements-ledger.md <<'EOF'
+# Requirements Ledger
+
+| REQ | Status | Evidence | Iter |
+|---|---|---|---|
+| REQ-001 | met | value.txt fixed — supporting capture .loop/observations/iter0-AC-001.png | 1 |
+EOF
+printf 'READY_FOR_REVIEW fixture agent\n' > .loop/agent-state
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "ledger stray citation refused (CONTINUE)" aclist-stray CONTINUE "${out%% *}"
+case "$out" in
+  *"REQ-001(.loop/observations/iter0-AC-001.png)"*) ok "stray citation named with its source cell" ;;
+  *) bad "stray-citation refusal absent: $out" aclist-stray ;;
+esac
+case "$out" in
+  *"prefix-less"*) ok "refusal names the fix" ;;
+  *) bad "refusal fix instruction missing: $out" aclist-stray ;;
+esac
+# a ledger cell echoing the CANONICAL citation is safe (the report may echo it
+# too) and must not be refused — the certified final state of the real run
+# that motivated this check mentions its canonical probe log in a ledger cell
+cat > .loop/docs/requirements-ledger.md <<'EOF'
+# Requirements Ledger
+
+| REQ | Status | Evidence | Iter |
+|---|---|---|---|
+| REQ-001 | met | value.txt fixed — canonical .loop/observations/iter1-AC-001.png | 1 |
+EOF
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "ledger echoing the canonical citation promotes" aclist-stray SUCCESS_CANDIDATE "${out%% *}"
+# a human row's supporting capture must be prefix-less: the full path is
+# exactly the leak that made the evidence report cite an observation outside
+# the verified checklist
+seed_ledger_met
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the page visibly renders | run | verified | .loop/observations/iter1-AC-001.png |
+| AC-002 | REQ-001 | settings UI looks right | human | verified | human signed off — capture .loop/observations/iter0-AC-001.png |
+EOF
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "human-row full path refused (CONTINUE)" aclist-stray CONTINUE "${out%% *}"
+case "$out" in
+  *"AC-002(.loop/observations/iter0-AC-001.png)"*) ok "human-row stray named with its source cell" ;;
+  *) bad "human-row stray refusal absent: $out" aclist-stray ;;
+esac
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the page visibly renders | run | verified | .loop/observations/iter1-AC-001.png |
+| AC-002 | REQ-001 | settings UI looks right | human | verified | human signed off — capture iter0-AC-001.png (prefix-less) |
+EOF
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "prefix-less human-row mention promotes" aclist-stray SUCCESS_CANDIDATE "${out%% *}"
+
+echo "== the ledger-leak deadlock shape fails EARLY at iteration time =="
+# Mirror of the gate-deadlock regression above, for the OTHER certification
+# cells: a human row citing its supporting capture in full-path form. The run
+# must stop at iteration time with the source cell named — never reach the
+# terminal evidence gate.
+make_fixture stray-e2e
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the probe answers | run | verified | probe output in .loop/last-verify.log |
+| AC-002 | REQ-001 | settings look right | human | verified | signed off — capture .loop/observations/iter9-AC-002-settings.png |
+EOF
+git add -A && git commit -q -m "stray-citation evidence cell"
+./loop.sh approve >/dev/null
+run_loop "READY_NOW,NO_DIFF,NO_DIFF"
+check "exit code 4 (stalls; the gate is never reached)" stray-e2e 4 "$RC"
+check "state STALLED" stray-e2e STALLED "$STATE"
+if grep -q "outside the verified run rows" .loop/journal.jsonl \
+   && grep -q "AC-002(.loop/observations/iter9-AC-002-settings.png)" .loop/journal.jsonl; then
+  ok "stray citation refused at iteration time with its source cell"
+else
+  bad "stray-citation refusal missing from journal" stray-e2e
+fi
+if ! grep -q "current evidence report is invalid" "$WORK/last-run.out" \
+   && ! grep -q '"state": "SUCCESS"' .loop/journal.jsonl; then
+  ok "failure moved off the terminal evidence gate"
+else
+  bad "stray citation still reaches the terminal gate or SUCCESS" stray-e2e
+fi
+
+echo "== identical promotion refusal repeated REPEAT_FAIL_N times blocks =="
+# The identical-verify-failure rule's missing sibling: a real run looped the
+# SAME deterministic promotion refusal for five gate attempts, burning real
+# cost each lap, because only verify failures fed the fingerprint file. Same
+# threshold, same file — so an explicit resume resets this streak with all
+# the other stop heuristics.
+make_fixture promo-repeat
+echo fixed > value.txt
+seed_ledger_met
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the page visibly renders | run | verified | .loop/observations/iter1-AC-001.png |
+EOF
+printf 'READY_FOR_REVIEW fixture agent\n' > .loop/agent-state
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "identical refusal 1 continues" promo-repeat CONTINUE "${out%% *}"
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "identical refusal 2 continues" promo-repeat CONTINUE "${out%% *}"
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "identical refusal 3 blocks" promo-repeat BLOCKED "${out%% *}"
+case "$out" in
+  *"identical promotion refusal repeated 3 times"*) ok "repeat-refusal rule named in the reason" ;;
+  *) bad "repeat-refusal reason missing: $out" promo-repeat ;;
+esac
+# resume clears .loop/fail-fingerprints (pinned elsewhere); after that reset
+# the streak must restart from one
+rm -f .loop/fail-fingerprints
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "reset restarts the refusal streak" promo-repeat CONTINUE "${out%% *}"
+# reasons that CHANGE between refusals are progress signals, not a stuck loop
+rm -f .loop/fail-fingerprints
+sed -i.bak 's/iter1-AC-001.png/iter2-AC-001.png/' .loop/docs/acceptance-checklist.md && rm -f .loop/docs/acceptance-checklist.md.bak
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "varied refusal A continues" promo-repeat CONTINUE "${out%% *}"
+sed -i.bak 's/iter2-AC-001.png/iter3-AC-001.png/' .loop/docs/acceptance-checklist.md && rm -f .loop/docs/acceptance-checklist.md.bak
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "varied refusal B continues" promo-repeat CONTINUE "${out%% *}"
+sed -i.bak 's/iter3-AC-001.png/iter2-AC-001.png/' .loop/docs/acceptance-checklist.md && rm -f .loop/docs/acceptance-checklist.md.bak
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "varied refusal A again continues (no 3-identical tail)" promo-repeat CONTINUE "${out%% *}"
+# the stop-eval forced-gate preflight re-runs these checks INSIDE the same
+# iteration — it must not double-count the streak
+rm -f .loop/fail-fingerprints
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD --preflight 2>&1) || true
+check "preflight refusal continues" promo-repeat CONTINUE "${out%% *}"
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD --preflight 2>&1) || true
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD --preflight 2>&1) || true
+check "3 preflight refusals never block" promo-repeat CONTINUE "${out%% *}"
+if [ ! -e .loop/fail-fingerprints ]; then
+  ok "preflight refusals do not feed the fingerprint file"
+else
+  bad "preflight refusals appended fingerprints" promo-repeat
+fi
+
+echo "== a run declaring ready against the same deterministic refusal blocks (end-to-end) =="
+make_fixture promo-repeat-e2e
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the page visibly renders | run | verified | .loop/observations/iter1-AC-001.png |
+EOF
+git add -A && git commit -q -m "unclosable run row"
+./loop.sh approve >/dev/null
+run_loop "READY_NOW,READY_NOW,READY_NOW"
+check "exit code 4 (blocked, not iterating to the budget)" promo-repeat-e2e 4 "$RC"
+check "state BLOCKED" promo-repeat-e2e BLOCKED "$STATE"
+if grep -q "identical promotion refusal repeated 3 times" .loop/journal.jsonl; then
+  ok "repeat-refusal block journaled"
+else
+  bad "repeat-refusal block missing from journal" promo-repeat-e2e
+fi
+
 echo "== observation size limit refuses evaluator stamping =="
 make_fixture aclist-obs-size
 echo fixed > value.txt

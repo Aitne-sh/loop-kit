@@ -23,6 +23,11 @@ Rules:
 - Never delete a row; the harness re-adds missing REQ ids.
 - READY_FOR_REVIEW requires every row `met` — the evaluator refuses the success
   gate otherwise.
+- A full `.loop/observations/` path may appear here ONLY if it is the exact
+  canonical citation of a verified `run` row in the acceptance checklist.
+  Mention any other capture prefix-less (`iter2-AC-xxx-probe.log`) — the
+  evaluator refuses stray full paths because the evidence report echoes them
+  and the certification gate rejects citations outside the verified checklist.
 -->
 
 ## Requirements

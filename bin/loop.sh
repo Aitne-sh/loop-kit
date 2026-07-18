@@ -2591,6 +2591,43 @@ EOF
   printf '%s' "$out"
 }
 
+stray_observation_citations() { # ledger cells + non-run checklist cells citing a
+  # .loop/observations/ path that is NOT one of the verified run rows' canonical
+  # citations -> " REQ-xxx(path) AC-xxx(path)". The evaluator's 6.6(f) refuses
+  # these at promotion time; this is the gate-window mirror (same reason
+  # checklist_multi_run_rows exists: §6.6 does not run in --final mode, and a
+  # stray path regressing into the window would surface only as an unexplainable
+  # report-validation failure after every regeneration attempt burned). Keep the
+  # row grammar in sync with evaluate.sh's 6.6(f).
+  local canonical cells cid ev tok out=""
+  canonical=$(checklist_observation_paths)
+  cells=$({ awk -F'|' '
+      /^\|[[:space:]]*REQ-[0-9]+[[:space:]]*\|/ {
+        id=$2; ev=$4
+        gsub(/^[ \t]+|[ \t]+$/, "", id)
+        gsub(/^[ \t]+|[ \t]+$/, "", ev)
+        print id "\t" ev
+      }' .loop/docs/requirements-ledger.md 2>/dev/null
+    awk -F'|' '
+      /^\|[[:space:]]*AC-[0-9]+[[:space:]]*\|/ {
+        id=$2; m=$5; st=$6; ev=$7
+        gsub(/^[ \t]+|[ \t]+$/, "", id)
+        gsub(/^[ \t]+|[ \t]+$/, "", m)
+        gsub(/^[ \t]+|[ \t]+$/, "", st)
+        gsub(/^[ \t]+|[ \t]+$/, "", ev)
+        if (!(m == "run" && st == "verified")) print id "\t" ev
+      }' .loop/docs/acceptance-checklist.md 2>/dev/null; } || true)
+  while IFS=$'\t' read -r cid ev; do
+    [ -n "$cid" ] || continue
+    for tok in $(printf '%s\n' "$ev" | observation_tokens); do
+      printf '%s\n' "$canonical" | grep -Fqx "$tok" || out="$out $cid($tok)"
+    done
+  done <<EOF
+$cells
+EOF
+  printf '%s' "$out"
+}
+
 supported_observation_path() { # strict lexical + filesystem check; no symlink traversal
   local path="${1:-}" rest oldifs part cur
   case "$path" in .loop/observations/?*) ;; *) return 1 ;; esac
@@ -2717,6 +2754,12 @@ run_evidence_step() { # $1 single|fleet, $2 journal label, $3 call-label prefix,
   # evaluator's 6.6(e) singleton check does not run in --final mode.
   bad=$(checklist_multi_run_rows)
   [ -z "$bad" ] || finish BLOCKED "acceptance checklist run row(s) cite multiple observation paths:$bad — keep exactly one canonical .loop/observations/ path per row (mention superseded captures without the path prefix), then ./loop.sh resume"
+  # same defect class from the OTHER certification cells: a full observation
+  # path leaking from a ledger row or a cmd/human checklist row is echoed by
+  # the evidence agent and rejected by the report validator — name the source
+  # cell now instead of burning every regeneration attempt on it
+  bad=$(stray_observation_citations)
+  [ -z "$bad" ] || finish BLOCKED "ledger/checklist cell(s) cite observation paths outside the verified run rows:$bad — keep full .loop/observations/ paths only in their verified run row's Evidence cell (mention them elsewhere prefix-less), then ./loop.sh resume"
   while :; do
     label="$lprefix"
     [ "$attempt" -eq 0 ] || label="$lprefix-r$attempt"

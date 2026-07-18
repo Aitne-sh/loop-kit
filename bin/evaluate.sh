@@ -512,6 +512,39 @@ fi
 promotion_subject="agent declared ready but"
 [ "$PREFLIGHT" -ne 1 ] || promotion_subject="deterministic preflight failed:"
 
+observation_tokens() { # stdin -> supported observation path tokens; mirror of
+  # loop.sh's observation_tokens() — same boundary anchoring, same charset.
+  # The grep/sed pair must stay byte-identical across both files (the suite's
+  # parser-sync check greps for the literal); 6.6(e) keeps its own inline copy.
+  grep -oE '(^|[[:space:]([`])\.loop/observations/[A-Za-z0-9_./-]*[A-Za-z0-9_-]' 2>/dev/null \
+    | sed -E 's/^[[:space:]([`]//' \
+    | LC_ALL=C sort -u || true
+}
+
+refuse_promotion() { # $1 full reason — a deterministic promotion refusal: the
+  # agent claims done but its own certification docs say otherwise. A refusal
+  # whose reason repeats byte-identically REPEAT_FAIL_N times in a row means
+  # iterating cannot close this obligation (observed in the field: the same
+  # invalid-evidence refusal looping while each iteration burned real cost) —
+  # same terminal semantics, threshold, and fingerprint file as section 8's
+  # identical-verify-failure rule, so an explicit resume resets this streak
+  # with all the others. Only the per-iteration evaluation appends: the
+  # stop-eval forced-gate preflight re-runs these checks inside the SAME
+  # iteration and would double-count every refusal.
+  local reason="$1" fp recent count uniqc
+  if [ "$PREFLIGHT" -eq 0 ]; then
+    fp=$(printf '%s' "$reason" | sha256)
+    echo "$fp" >> .loop/fail-fingerprints
+    recent=$(tail -"$REPEAT_FAIL_N" .loop/fail-fingerprints)
+    count=$(echo "$recent" | grep -c . || true)
+    uniqc=$(echo "$recent" | sort -u | grep -c . || true)
+    if [ "$count" -ge "$REPEAT_FAIL_N" ] && [ "$uniqc" -eq 1 ]; then
+      emit BLOCKED "identical promotion refusal repeated $REPEAT_FAIL_N times — needs a different approach or human help: $reason"
+    fi
+  fi
+  emit CONTINUE "$reason"
+}
+
 # ---------- 6.5 requirements-ledger self-consistency (candidate promotion only) ----------
 # The agent may not claim READY_FOR_REVIEW while its own requirements ledger
 # says work remains: every REQ id defined by a contract heading must have a
@@ -559,7 +592,7 @@ if { [ "$PREFLIGHT" -eq 1 ] \
 $req_ids
 EOF
     if [ -n "$unmet" ]; then
-      emit CONTINUE "$promotion_subject requirements ledger does not show met:$unmet"
+      refuse_promotion "$promotion_subject requirements ledger does not show met:$unmet"
     fi
   fi
 fi
@@ -590,7 +623,7 @@ if { [ "$PREFLIGHT" -eq 1 ] \
         if (st != "verified") printf " %s(%s)", id, (st == "" ? "?" : st)
       }' .loop/docs/acceptance-checklist.md 2>/dev/null || true)
     if [ -n "$unverified" ]; then
-      emit CONTINUE "$promotion_subject acceptance checklist has unverified rows:$unverified"
+      refuse_promotion "$promotion_subject acceptance checklist has unverified rows:$unverified"
     fi
   fi
   # Obligations anchor to the HASH-FROZEN contract, not to the (agent-writable)
@@ -620,7 +653,7 @@ if { [ "$PREFLIGHT" -eq 1 ] \
 $ac_ids
 EOF
     if [ -n "$missing" ]; then
-      emit CONTINUE "$promotion_subject contract acceptance criteria lack a verified checklist row:$missing"
+      refuse_promotion "$promotion_subject contract acceptance criteria lack a verified checklist row:$missing"
     fi
   fi
   # 6.6(c) — run-scoped id monotonicity: an id ever seen this run (including
@@ -637,7 +670,7 @@ EOF
       printf '%s\n' "$current_ac_ids" | grep -qx "$aid" || vanished="$vanished $aid"
     done < .loop/ac-seen
     if [ -n "$vanished" ]; then
-      emit CONTINUE "$promotion_subject previously-recorded acceptance-checklist rows disappeared:$vanished — restore them or escalate a decision request"
+      refuse_promotion "$promotion_subject previously-recorded acceptance-checklist rows disappeared:$vanished — restore them or escalate a decision request"
     fi
   fi
   # 6.6(d) — method consistency: where a contract anchor names a method
@@ -666,7 +699,7 @@ EOF
 $ac_pairs
 EOF
     if [ -n "$weakened" ]; then
-      emit CONTINUE "$promotion_subject checklist methods differ from the contract's anchors:$weakened"
+      refuse_promotion "$promotion_subject checklist methods differ from the contract's anchors:$weakened"
     fi
   fi
   # 6.6(e) — run-row evidence validity: a verified `run` row must cite either
@@ -721,8 +754,58 @@ EOF
 $run_rows
 EOF
     if [ -n "$bad_runs" ]; then
-      emit CONTINUE "$promotion_subject run-method rows lack valid observation evidence:$bad_runs"
+      refuse_promotion "$promotion_subject run-method rows lack valid observation evidence:$bad_runs"
     fi
+  fi
+  # 6.6(f) — stray observation citations: a literal .loop/observations/ path in
+  # the (agent-authored) requirements ledger or a non-run checklist cell must be
+  # one of the verified run rows' canonical citations. Any other full path — a
+  # human row's supporting capture, a superseded artifact kept for history — is
+  # the terminal evidence gate's deadlock precursor: the evidence agent echoes
+  # what the certification docs cite, the report validator binds every citation
+  # to the verified checklist, and the mismatch surfaces only after every
+  # regeneration attempt burns on an unfixable report. Refuse EARLY, naming the
+  # source cell and the fix. Reaching this check means every checklist row is
+  # verified (the unverified-rows check above emits first), so the non-run rows
+  # scanned here are exactly the verified cmd/human rows.
+  # NB: the || true guards PIPEFAIL — with the checklist absent (backcompat,
+  # fleet worker bootstrap) awk's nonzero exit would otherwise become the
+  # pipeline's status and set -e would kill the evaluator mid-promotion
+  canonical=$(awk -F'|' '
+    /^\|[[:space:]]*AC-[0-9]+[[:space:]]*\|/ {
+      m=$5; st=$6; ev=$7
+      gsub(/^[ \t]+|[ \t]+$/, "", m)
+      gsub(/^[ \t]+|[ \t]+$/, "", st)
+      gsub(/^[ \t]+|[ \t]+$/, "", ev)
+      if (m == "run" && st == "verified") print ev
+    }' .loop/docs/acceptance-checklist.md 2>/dev/null | observation_tokens || true)
+  cells=$({ awk -F'|' '
+      /^\|[[:space:]]*REQ-[0-9]+[[:space:]]*\|/ {
+        id=$2; ev=$4
+        gsub(/^[ \t]+|[ \t]+$/, "", id)
+        gsub(/^[ \t]+|[ \t]+$/, "", ev)
+        print id "\t" ev
+      }' .loop/docs/requirements-ledger.md 2>/dev/null
+    awk -F'|' '
+      /^\|[[:space:]]*AC-[0-9]+[[:space:]]*\|/ {
+        id=$2; m=$5; st=$6; ev=$7
+        gsub(/^[ \t]+|[ \t]+$/, "", id)
+        gsub(/^[ \t]+|[ \t]+$/, "", m)
+        gsub(/^[ \t]+|[ \t]+$/, "", st)
+        gsub(/^[ \t]+|[ \t]+$/, "", ev)
+        if (!(m == "run" && st == "verified")) print id "\t" ev
+      }' .loop/docs/acceptance-checklist.md 2>/dev/null; } || true)
+  stray=""
+  while IFS=$'\t' read -r cid ev; do
+    [ -n "$cid" ] || continue
+    for tok in $(printf '%s\n' "$ev" | observation_tokens); do
+      printf '%s\n' "$canonical" | grep -Fqx "$tok" || stray="$stray $cid($tok)"
+    done
+  done <<EOF
+$cells
+EOF
+  if [ -n "$stray" ]; then
+    refuse_promotion "$promotion_subject ledger/checklist cell(s) cite observation paths outside the verified run rows:$stray — a full .loop/observations/ path may appear ONLY in its verified run row's Evidence cell; mention it elsewhere prefix-less (filename only)"
   fi
 fi
 

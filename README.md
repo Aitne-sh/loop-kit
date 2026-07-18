@@ -852,7 +852,7 @@ loop until you re-approve. The key settings:
 | `MAX_RUN_SECONDS` | (empty) | Optional wall-clock budget checked at iteration/orchestration boundaries. A later resume gets a fresh window; it does not interrupt an individual `VERIFY_COMMAND`. |
 | `MAX_COST_USD` | (empty = no cap) | A hard cap on USD reported by Claude calls. Codex reports no USD amount and is therefore unbounded by this knob; see the Codex routing notes below. |
 | `STAGNATION_N` | 2 | Consecutive no-diff iterations → STALLED. |
-| `REPEAT_FAIL_N` | 3 | Identical verify failure this many times → BLOCKED. Also derives the oscillation window: ≤2 distinct failure fingerprints across `2×N` consecutive failing iterations → BLOCKED (catches the fix-A-breaks-B ping-pong the identical rule misses). |
+| `REPEAT_FAIL_N` | 3 | Identical verify failure this many times → BLOCKED. Also derives the oscillation window: ≤2 distinct failure fingerprints across `2×N` consecutive failing iterations → BLOCKED (catches the fix-A-breaks-B ping-pong the identical rule misses). The same threshold caps identical deterministic *promotion refusals* (the agent declares ready, the evaluator's ledger/checklist checks refuse with a byte-identical reason each lap) → BLOCKED instead of iterating to the budget. |
 | `FUTILE_N` | 2 | Consecutive "futile" stop-eval verdicts → STALLED. |
 | `MET_FORCE_N` | 2 | Consecutive "looks done" verdicts (with tests green) force the success gate. 0 disables. |
 | `REVIEW_MODE` | `always` | `always` / `candidate` (gate only) / `off`. |
