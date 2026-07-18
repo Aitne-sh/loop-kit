@@ -291,6 +291,33 @@ if grep -qF 'red→green' "$ROOT/kit/loop-docs/product-contract.md"; then
 else
   bad "contract template lost the red→green classification comment" unknowns-static
 fi
+# Browser/visual verification posture: browser checks are PROPOSED at
+# definition time (the defining agent's environment is not the executing
+# agent's — no intake feasibility proof for agent-browser-channel rows) and
+# enforced at runtime by an immediate stop-and-ask when the capability is
+# missing. The term "agent browser channel" anchors the posture in all four
+# skills.
+if grep -q 'agent browser channel' "$SK/loop-contract/SKILL.md" \
+   && grep -q 'stops at the first attempt' "$SK/loop-contract/SKILL.md"; then
+  ok "contract skill proposes agent-browser-channel checks with the runtime-stop caveat"
+else
+  bad "contract skill lost the agent-browser-channel proposal posture" browser-posture
+fi
+if grep -q 'agent browser channel' "$SK/loop-contract-review/SKILL.md"; then
+  ok "contract reviewer accepts unproven agent-browser-channel bindings (recorded, not silent)"
+else
+  bad "contract reviewer lost the agent-browser-channel rule" browser-posture
+fi
+if grep -q 'agent browser channel' "$SK/loop-iterate/SKILL.md"; then
+  ok "iterate skill stops immediately on a missing agent-browser capability"
+else
+  bad "iterate skill lost the agent-browser-channel stop rule" browser-posture
+fi
+if grep -q 'agent browser channel' "$SK/loop-plan/SKILL.md"; then
+  ok "plan skill schedules unproven browser observations early"
+else
+  bad "plan skill lost the agent-browser-channel scheduling rule" browser-posture
+fi
 
 echo "== static: E-series skill/engine contract invariants =="
 # E2b: the gate reviewer must know sanctioned manual side-work when the prompt
@@ -505,8 +532,9 @@ check "exit 0" codex-implement 0 "$RC"
 check "state SUCCESS" codex-implement SUCCESS "$STATE"
 if grep -q '^model=gpt-5.5 sandbox=workspace-write approval=never ' .loop/fake-codex-args \
    && grep -q 'sandbox_workspace_write.network_access=true' .loop/fake-codex-args \
-   && grep -q 'model_reasoning_effort=xhigh' .loop/fake-codex-args; then
-  ok "IMPLEMENT reached Codex with model, writable sandbox, network, and effort"
+   && grep -q 'model_reasoning_effort=xhigh' .loop/fake-codex-args \
+   && ! grep -q 'project_doc_max_bytes=0' .loop/fake-codex-args; then
+  ok "IMPLEMENT reached Codex with model, writable sandbox, network, and project instructions enabled"
 else
   bad "Codex IMPLEMENT argv wrong: $(cat .loop/fake-codex-args 2>/dev/null | tr '\n' ' ')" codex-implement
 fi
@@ -515,8 +543,9 @@ if grep -q '^--ask-for-approval never exec --json ' .loop/fake-codex-invocations
 else
   bad "Codex exec argv order wrong: $(cat .loop/fake-codex-invocations 2>/dev/null | tr '\n' ' ')" codex-implement
 fi
-if grep -q 'loop-iterate/SKILL.md' .loop/fake-codex-prompts; then
-  ok "Claude skill shorthand was expanded to a direct-file Codex prompt"
+if grep -q '\.agents/skills/loop-iterate/SKILL.md' .loop/fake-codex-prompts \
+   && ! grep -q '\.claude/skills/loop-iterate/SKILL.md' .loop/fake-codex-prompts; then
+  ok "skill shorthand was expanded to the Codex-native direct-file prompt"
 else
   bad "Codex prompt wrapper missing: $(cat .loop/fake-codex-prompts 2>/dev/null)" codex-implement
 fi
@@ -557,6 +586,24 @@ else
   bad "CODEX_COST_UNTRACKED audit row missing" codex-cost
 fi
 
+echo "== Codex JSONL normalization is independent of object key order =="
+make_fixture codex-envelope-reordered
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+RC=0
+LOOP_FAKE_CODEX=REORDER LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/codex-envelope-reordered.out" 2>&1 </dev/null || RC=$?
+check "exit 0 with reordered event keys" codex-envelope-reordered 0 "$RC"
+tid=$(json_scalar .loop/docs/certification.json task_id)
+rid=$(json_scalar .loop/docs/certification.json run_id)
+reordered_envelope=".loop/logs/$tid/$rid/iter-1.json"
+if grep -q '"session_id": "fake-codex-' "$reordered_envelope" \
+   && grep -q '"is_error": false' "$reordered_envelope"; then
+  ok "reordered thread/item events normalized into the compatibility envelope"
+else
+  bad "reordered JSONL was not normalized: $(cat "$reordered_envelope" 2>/dev/null)" codex-envelope-reordered
+fi
+
 echo "== a Codex-routed CONTRACT alone still voids the USD cap's coverage claim =="
 make_fixture codex-contract-cost
 printf 'AGENT_CONTRACT="codex"\nMODEL_CONTRACT="gpt-5.5"\n' >> loop.models.sh
@@ -576,8 +623,9 @@ run_loop "READY_NOW"
 check "exit 0" codex-reader 0 "$RC"
 if [ -s .loop/fake-codex-args ] \
    && [ "$(grep -c 'sandbox=read-only' .loop/fake-codex-args || true)" = "$(wc -l < .loop/fake-codex-args | tr -d ' ')" ] \
+   && [ "$(grep -c 'project_doc_max_bytes=0' .loop/fake-codex-args || true)" = "$(wc -l < .loop/fake-codex-args | tr -d ' ')" ] \
    && ! grep -q 'sandbox_workspace_write.network_access=true' .loop/fake-codex-args; then
-  ok "reviewer Codex calls are structurally read-only with no network override"
+  ok "reviewer Codex calls are read-only, ignore project AGENTS instructions, and have no network override"
 else
   bad "Codex reader mapping wrong: $(cat .loop/fake-codex-args 2>/dev/null | tr '\n' ' ')" codex-reader
 fi
@@ -633,9 +681,11 @@ make_fixture codex-stop-effort
 printf 'AGENT_STOP_EVAL="codex"\nMODEL_STOP_EVAL="gpt-5.5-mini"\nEFFORT_STOP_EVAL="low"\n' >> loop.models.sh
 run_loop "CONTINUE_FIX,READY_NOW"
 check "exit 0" codex-stop-effort 0 "$RC"
-if grep -q '^model=gpt-5.5-mini sandbox=read-only approval=never configs=model_reasoning_effort=low ' .loop/fake-codex-args \
+if grep -q '^model=gpt-5.5-mini sandbox=read-only approval=never ' .loop/fake-codex-args \
+   && grep -q 'model_reasoning_effort=low' .loop/fake-codex-args \
+   && grep -q 'project_doc_max_bytes=0' .loop/fake-codex-args \
    && grep -q 'loop-stop-eval/SKILL.md' .loop/fake-codex-prompts; then
-  ok "STOP_EVAL used low reasoning effort in a read-only Codex call"
+  ok "STOP_EVAL used low effort in a read-only Codex call with project instructions disabled"
 else
   bad "Codex STOP_EVAL argv wrong: $(cat .loop/fake-codex-args 2>/dev/null | tr '\n' ' ')" codex-stop-effort
 fi
@@ -685,6 +735,22 @@ LOOP_CLAUDE_CMD="$FAKE" ./loop.sh run >"$WORK/codex-config-network.out" 2>&1 </d
 check "invalid LOOP_CODEX_NETWORK exits 2" codex-config-network 2 "$RC"
 if grep -q 'LOOP_CODEX_NETWORK must be 0 or 1' "$WORK/codex-config-network.out" && grep -q '→ next:' "$WORK/codex-config-network.out"; then ok "network enum fails closed"; else bad "network enum guard missing" codex-config-network; fi
 
+make_fixture codex-skill-missing
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+rm -f .agents/skills/loop-iterate/SKILL.md
+./loop.sh approve >/dev/null
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO=READY_NOW \
+  ./loop.sh run >"$WORK/codex-skill-missing.out" 2>&1 </dev/null || RC=$?
+check "missing projected Codex skill exits 2" codex-skill-missing 2 "$RC"
+if grep -q '\.agents/skills/loop-iterate/SKILL.md' "$WORK/codex-skill-missing.out" \
+   && grep -q '→ next:' "$WORK/codex-skill-missing.out" \
+   && [ ! -e .loop/fake-codex-args ]; then
+  ok "missing Codex skill fails before exec and names a recovery"
+else
+  bad "missing-skill guard absent or late: $(tail -4 "$WORK/codex-skill-missing.out")" codex-skill-missing
+fi
+
 echo "== unknown AGENT value degrades to Claude =="
 make_fixture codex-agent-typo
 printf 'AGENT_IMPLEMENT="codexx"\n' >> loop.models.sh
@@ -704,9 +770,10 @@ RC=0
 LOOP_CLAUDE_CMD="$WORK/no-such-claude" ./loop.sh refine >"$WORK/refine-noclaude.out" 2>&1 </dev/null || RC=$?
 check "exit 2" refine-noclaude 2 "$RC"
 if grep -q "acceptance-checklist.md" "$WORK/refine-noclaude.out" \
+   && grep -q './loop.sh signoff' "$WORK/refine-noclaude.out" \
    && grep -q './loop.sh resume' "$WORK/refine-noclaude.out" \
    && grep -q '→ next:' "$WORK/refine-noclaude.out"; then
-  ok "claude-less refine recovery names the manual sign-off path"
+  ok "claude-less refine recovery names ./loop.sh signoff and the manual sign-off path"
 else
   bad "refine recovery missing: $(cat "$WORK/refine-noclaude.out")" refine-noclaude
 fi
@@ -1278,6 +1345,7 @@ check "state BLOCKED" blocked-refine BLOCKED "$STATE"
 # contract-change path (/loop-contract), plus the "rejected as drift" guard sentence
 # that would have saved the my_homepage run.
 if grep -q 'NEXT ACTION' "$WORK/last-run.out"; then ok "BLOCKED prints the NEXT ACTION box"; else bad "NEXT ACTION box missing on BLOCKED" nextaction; fi
+if grep -q './loop.sh signoff' "$WORK/last-run.out"; then ok "NEXT ACTION names the verbatim signoff command"; else bad "signoff command missing from NEXT ACTION" nextaction; fi
 if grep -q './loop.sh refine' "$WORK/last-run.out"; then ok "NEXT ACTION offers the interactive refine path"; else bad "refine path missing from NEXT ACTION" nextaction; fi
 if grep -q '/loop-contract' "$WORK/last-run.out" && grep -q 'rejected as drift' "$WORK/last-run.out"; then
   ok "NEXT ACTION separates the contract-change path and warns resume --note won't take it"
@@ -1307,6 +1375,86 @@ RC=0   # fresh fixture: no run yet, no .loop/state
 LOOP_CLAUDE_CMD="$FAKE" ./loop.sh refine 'less motion' >"$WORK/refine-guard.out" 2>&1 </dev/null || RC=$?
 check "refine on a non-BLOCKED state exits 2" refine-guard 2 "$RC"
 if grep -q 'human sign-off gate' "$WORK/refine-guard.out"; then ok "refine explains it is for a BLOCKED sign-off gate"; else bad "refine guard message missing" refine-guard; fi
+
+# ---------- setup: isolated agent/model tuning of loop.models.sh ----------
+echo "== setup edits loop.models.sh in an isolated session, deterministically validated before it reflects =="
+make_fixture setup-ok
+mkdir -p "$WORK/setup-tmp"
+# (a) a VALID edit reflects into the real file (exit 0), and the throwaway temp is cleaned
+RC=0
+TMPDIR="$WORK/setup-tmp" LOOP_CLAUDE_CMD="$FAKE" ./loop.sh setup >"$WORK/setup-ok.out" 2>&1 </dev/null || RC=$?
+check "setup (valid) exits 0" setup-ok 0 "$RC"
+if grep -q '^AGENT_IMPLEMENT="codex"' loop.models.sh && grep -q '^MODEL_IMPLEMENT="gpt-5.5"' loop.models.sh; then
+  ok "valid setup reflected the new routing into the real loop.models.sh"
+else
+  bad "valid setup did not update loop.models.sh" setup-ok
+fi
+if grep -q 'no re-approval' "$WORK/setup-ok.out"; then ok "setup states the change takes effect without re-approval"; else bad "setup missing the no-re-approval note" setup-ok; fi
+if grep -q './loop.sh start' "$WORK/setup-ok.out"; then ok "setup success names the next command"; else bad "setup success missing next-action" setup-ok; fi
+if [ -z "$(find "$WORK/setup-tmp" -maxdepth 1 -name 'loop-setup.*' 2>/dev/null)" ]; then ok "setup cleaned its throwaway temp (success)"; else bad "setup leaked its temp on success" setup-ok; fi
+
+# (b) an INVALID result is REJECTED deterministically: real file untouched, exit 2, recovery named
+make_fixture setup-reject
+setup_before=$(cat loop.models.sh)
+RC=0
+TMPDIR="$WORK/setup-tmp" LOOP_FAKE_SETUP=INVALID LOOP_CLAUDE_CMD="$FAKE" ./loop.sh setup >"$WORK/setup-bad.out" 2>&1 </dev/null || RC=$?
+check "setup (invalid) exits 2" setup-reject 2 "$RC"
+if [ "$setup_before" = "$(cat loop.models.sh)" ]; then ok "rejected setup left the real loop.models.sh untouched"; else bad "rejected setup mutated loop.models.sh" setup-reject; fi
+if grep -q 'Claude alias' "$WORK/setup-bad.out" && grep -q './loop.sh setup' "$WORK/setup-bad.out"; then
+  ok "reject explains the offending value and names the re-run"
+else
+  bad "reject message/next-action missing" setup-reject
+fi
+if [ -z "$(find "$WORK/setup-tmp" -maxdepth 1 -name 'loop-setup.*' 2>/dev/null)" ]; then ok "setup cleaned its throwaway temp (reject)"; else bad "setup leaked its temp on reject" setup-reject; fi
+
+# (c) source + help pins so the isolated session, the validator, and the help entry can't silently vanish
+if grep -q '/loop-setup' "$ROOT/bin/loop.sh" && grep -q '^validate_models()' "$ROOT/bin/loop.sh"; then
+  ok "setup session + deterministic validator present in source"
+else
+  bad "setup session/validator missing from source" setup-reject
+fi
+if ./loop.sh help 2>&1 | grep -qF 'setup [--app claude|codex]'; then ok "help pins the setup command"; else bad "setup missing from help" setup-reject; fi
+
+# (d) an unknown --app is rejected with guidance (net-new flag surface)
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" ./loop.sh setup --app banana >"$WORK/setup-app.out" 2>&1 </dev/null || RC=$?
+check "setup --app banana exits 2" setup-reject 2 "$RC"
+if grep -q 'unknown --app' "$WORK/setup-app.out"; then ok "bad --app names the fix"; else bad "bad --app guidance missing" setup-reject; fi
+
+# a Codex wrapper that leaves a DURABLE marker (absolute path) proving the Codex CLI
+# actually ran, then execs the real fake (its $0 keeps fake_codex's FAKE_CLAUDE self-resolve)
+cat > "$WORK/setup-codex-probe.sh" <<PROBE
+#!/bin/sh
+echo ran >> "$WORK/setup-codex-ran"
+exec "$FAKE_CODEX" "\$@"
+PROBE
+chmod +x "$WORK/setup-codex-probe.sh"
+
+# (e) --app codex runs the Codex CLI (headless exec here) and reflects the validated result
+make_fixture setup-codex
+rm -f "$WORK/setup-codex-ran"
+RC=0
+TMPDIR="$WORK/setup-tmp" LOOP_CODEX_CMD="$WORK/setup-codex-probe.sh" ./loop.sh setup --app codex >"$WORK/setup-codex.out" 2>&1 </dev/null || RC=$?
+check "setup --app codex exits 0" setup-codex 0 "$RC"
+if [ -f "$WORK/setup-codex-ran" ]; then ok "setup --app codex invoked the Codex CLI"; else bad "setup --app codex did not run Codex" setup-codex; fi
+if grep -q '^AGENT_IMPLEMENT="codex"' loop.models.sh && grep -q '^MODEL_IMPLEMENT="gpt-5.5"' loop.models.sh; then
+  ok "codex setup reflected the validated routing into loop.models.sh"
+else
+  bad "codex setup did not update loop.models.sh" setup-codex
+fi
+
+# (f) --app claude with the Claude CLI absent falls back to Codex (fires on pre-launch availability only)
+make_fixture setup-fallback
+rm -f "$WORK/setup-codex-ran"
+RC=0
+TMPDIR="$WORK/setup-tmp" LOOP_CLAUDE_CMD="$WORK/no-such-claude" LOOP_CODEX_CMD="$WORK/setup-codex-probe.sh" ./loop.sh setup >"$WORK/setup-fb.out" 2>&1 </dev/null || RC=$?
+check "setup falls back to Codex when Claude is absent (exit 0)" setup-fallback 0 "$RC"
+if [ -f "$WORK/setup-codex-ran" ] && grep -qi 'Codex instead' "$WORK/setup-fb.out"; then
+  ok "claude-absent setup announces and runs the Codex fallback"
+else
+  bad "claude-absent Codex fallback missing" setup-fallback
+fi
+if grep -q '^AGENT_IMPLEMENT="codex"' loop.models.sh; then ok "fallback setup reflected the validated routing"; else bad "fallback setup did not update loop.models.sh" setup-fallback; fi
 
 echo "== spec decision: NEXT ACTION warns 'approve WITHOUT editing = same stop', and headless re-approval audits (Parts A+C) =="
 make_fixture reapprove
@@ -1394,6 +1542,82 @@ if grep -q 'mode=gate' .loop/fake-review-prompts \
 else
   bad "human sign-off bypassed the gate review" signoff-resume
 fi
+
+echo "== signoff command: complete approval — confirm gate, refusal paths, auto re-certify =="
+make_fixture signoff-cmd
+cat >> .loop/docs/product-contract.md <<'EOF'
+
+## Acceptance Criteria
+- AC-001 (human): the result is acceptable to the human
+EOF
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the result is acceptable to the human | human | pending | - |
+EOF
+git add -A && git commit -q -m "signoff cmd fixture"
+./loop.sh approve >/dev/null
+run_loop "DECLARE_BLOCKED"
+check "state BLOCKED" signoff-cmd BLOCKED "$STATE"
+# (a) no TTY and no --yes: refuse with the two-channel recovery, checklist untouched
+RC=0
+./loop.sh signoff >"$WORK/signoff-notty.out" 2>&1 </dev/null || RC=$?
+check "signoff without a TTY/--yes exits 2" signoff-cmd 2 "$RC"
+if grep -q '→ next:' "$WORK/signoff-notty.out" && grep -q 'signoff --yes' "$WORK/signoff-notty.out" \
+   && grep -q "resume --note" "$WORK/signoff-notty.out"; then
+  ok "no-TTY signoff names both channels (--yes / resume --note)"
+else
+  bad "no-TTY signoff recovery missing" signoff-cmd
+fi
+if grep -q 'AC-001' "$WORK/signoff-notty.out"; then ok "signoff shows the row(s) it would sign"; else bad "pending rows not shown before the confirm" signoff-cmd; fi
+if grep -q '| human | pending | - |' .loop/docs/acceptance-checklist.md; then
+  ok "refused signoff left the checklist untouched"
+else
+  bad "no-TTY signoff mutated the checklist" signoff-cmd
+fi
+# (b) per-row signing is refused (all-or-nothing), with the sign-vs-note fork named
+RC=0
+./loop.sh signoff AC-001 >"$WORK/signoff-partial.out" 2>&1 </dev/null || RC=$?
+check "signoff <AC-id> exits 2" signoff-cmd 2 "$RC"
+if grep -q 'all-or-nothing' "$WORK/signoff-partial.out" && grep -q "resume --note" "$WORK/signoff-partial.out"; then
+  ok "per-row signoff refused with the sign-vs-note fork"
+else
+  bad "per-row refusal guidance missing" signoff-cmd
+fi
+# (c) --yes signs every pending human row and auto-resumes through the full gate
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" LOOP_FAKE_REVIEW="APPROVE" LOOP_FAKE_STOPEVAL="CONTINUE" \
+  ./loop.sh signoff --yes >"$WORK/signoff-yes.out" 2>&1 </dev/null || RC=$?
+check "signoff --yes exits 0 (signed + re-certified)" signoff-cmd 0 "$RC"
+if grep -qE '\| human \| verified \|' .loop/docs/acceptance-checklist.md \
+   && grep -q 'human sign-off (signoff)' .loop/docs/acceptance-checklist.md; then
+  ok "human row verified with the signoff-sourced evidence note"
+else
+  bad "signoff --yes did not sign the human row" signoff-cmd
+fi
+check "signoff resume has preflight PASS" signoff-cmd PASS "$(json_scalar .loop/docs/certification.json preflight)"
+if grep -q 'mode=gate' .loop/fake-review-prompts && grep -q '"state": "REVIEW_APPROVE"' .loop/journal.jsonl; then
+  ok "signoff still went through the independent gate review (no shortcut to SUCCESS)"
+else
+  bad "signoff bypassed the gate review" signoff-cmd
+fi
+if grep -q '"state": "HUMAN_SIGNOFF"' .loop/journal.jsonl && grep -q 'via signoff: AC-001' .loop/journal.jsonl; then
+  ok "sign-off journaled with its source and the signed AC id"
+else
+  bad "HUMAN_SIGNOFF journal row missing/unsourced" signoff-cmd
+fi
+# (d) idempotent: nothing pending -> no-op notice, exit 0, next named
+RC=0
+./loop.sh signoff --yes >"$WORK/signoff-noop.out" 2>&1 </dev/null || RC=$?
+check "signoff with nothing pending exits 0" signoff-cmd 0 "$RC"
+if grep -q 'nothing to sign off' "$WORK/signoff-noop.out" && grep -q '→ next:' "$WORK/signoff-noop.out"; then
+  ok "no-op signoff says so and names the next command"
+else
+  bad "no-op signoff guidance missing" signoff-cmd
+fi
+# (e) help pins the command
+if ./loop.sh help 2>&1 | grep -qF 'signoff [--yes]'; then ok "help pins the signoff command"; else bad "signoff missing from help" signoff-cmd; fi
 
 echo "== stagnation -> STALLED =="
 make_fixture stalled
@@ -1863,6 +2087,20 @@ echo "# tampered" >> .claude/skills/loop-iterate/SKILL.md
 run_loop "READY_NOW"
 check "exit code 2" harness-tamper 2 "$RC"
 
+echo "== recursive Codex skill resource tamper -> refuse to run =="
+make_fixture codex-resource-tamper
+mkdir -p .agents/skills/loop-iterate/references
+printf 'approved resource\n' > .agents/skills/loop-iterate/references/runtime-notes.md
+./loop.sh approve >/dev/null
+printf 'tampered resource\n' >> .agents/skills/loop-iterate/references/runtime-notes.md
+run_loop "READY_NOW"
+check "nested managed skill resource exits 2" codex-resource-tamper 2 "$RC"
+if grep -Eq '\.agents|provider skills' "$WORK/last-run.out"; then
+  ok "recursive Codex skill tamper is explained as harness drift"
+else
+  bad "nested Codex skill drift was not explained: $(cat "$WORK/last-run.out")" codex-resource-tamper
+fi
+
 echo "== forged .loop/approved cannot defeat contract immutability =="
 make_fixture forge-approval
 run_loop "FORGE_APPROVAL"
@@ -2221,16 +2459,133 @@ echo "== init records kit-source for later self-updates =="
 make_fixture kitsrc
 if [ -f .loop/kit-source ] && grep -qF "$ROOT" .loop/kit-source; then ok "kit-source points at the kit repo"; else bad "kit-source not recorded: $(cat .loop/kit-source 2>/dev/null)" kitsrc; fi
 
+echo "== init projects the 11 Codex-native skills with explicit invocation policy =="
+make_fixture codex-skill-projection
+codex_skills="loop-contract loop-contract-review loop-decompose loop-decompose-review loop-evidence loop-iterate loop-plan loop-review loop-setup loop-stop-eval loop-supervise"
+projection_ok=1
+projection_count=0
+for name in $codex_skills; do
+  d=".agents/skills/$name"
+  if [ ! -f "$d/SKILL.md" ] || [ ! -f "$d/.loop-kit-managed" ] || [ ! -f "$d/agents/openai.yaml" ]; then
+    projection_ok=0
+    echo "  $name: missing SKILL.md, ownership marker, or agents/openai.yaml"
+    continue
+  fi
+  projection_count=$((projection_count + 1))
+  if grep -q '^disable-model-invocation:' "$d/SKILL.md"; then
+    projection_ok=0
+    echo "  $name: Claude-only disable-model-invocation leaked into Codex frontmatter"
+  fi
+  case "$name" in
+    loop-contract|loop-plan) expected_policy=true ;;
+    *) expected_policy=false ;;
+  esac
+  if ! grep -q "allow_implicit_invocation: $expected_policy" "$d/agents/openai.yaml"; then
+    projection_ok=0
+    echo "  $name: allow_implicit_invocation is not $expected_policy"
+  fi
+  # Codex frontmatter lint (the CLAUDE.md editing invariant): only name +
+  # description survive the projection (a future Claude-only key must not
+  # silently leak past the strip), the name matches the directory, and the
+  # description is single-line, within Codex's 1024-char limit, and free of
+  # angle brackets.
+  front_lint=$(awk -v dir="$name" '
+    NR == 1 && $0 == "---" { front = 1; next }
+    front == 1 && $0 == "---" { front = 2; exit }
+    front == 1 && $0 ~ /^[A-Za-z0-9_-]+:/ {
+      key = $0; sub(/:.*$/, "", key)
+      val = $0; sub(/^[A-Za-z0-9_-]+:[[:space:]]*/, "", val)
+      if (key == "name") {
+        names++
+        if (val != dir) print "name is " val ", not " dir
+        if (val !~ /^[a-z0-9-]+$/ || length(val) > 64) print "name violates [a-z0-9-]{1,64}"
+      } else if (key == "description") {
+        descs++
+        if (val == "") print "description is empty or not single-line"
+        if (length(val) > 1024) print "description exceeds 1024 characters"
+        if (val ~ /[<>]/) print "description contains an angle bracket"
+      } else {
+        print "unexpected frontmatter key: " key
+      }
+    }
+    END {
+      if (front != 2) print "unterminated frontmatter"
+      if (names != 1) print "expected exactly one name key"
+      if (descs != 1) print "expected exactly one description key"
+    }
+  ' "$d/SKILL.md")
+  if [ -n "$front_lint" ]; then
+    projection_ok=0
+    echo "  $name: $(printf '%s' "$front_lint" | tr '\n' ';')"
+  fi
+done
+if [ "$projection_ok" -eq 1 ] && [ "$projection_count" -eq 11 ]; then
+  ok "all 11 projected skills carry valid Codex frontmatter, ownership, and policy"
+else
+  bad "Codex skill projection incomplete or invalid" codex-skill-projection
+fi
+if [ ! -e .agents/skills/loop-refine ] && [ ! -e .codex/skills/loop-refine ]; then
+  ok "Claude-only loop-refine is not projected into a Codex skill directory"
+else
+  bad "loop-refine was incorrectly projected for Codex" codex-skill-projection
+fi
+if [ -z "$(find .codex/skills -type f -name SKILL.md 2>/dev/null || true)" ]; then
+  ok "init avoids the duplicate project-local .codex/skills compatibility path"
+else
+  bad "duplicate Codex skills were generated under .codex/skills" codex-skill-projection
+fi
+
+echo "== projection copies future skill resources recursively =="
+resource_kit="$WORK/codex-resource-kit"
+resource_target="$WORK/codex-resource-target"
+mkdir -p "$resource_kit"
+cp -R "$ROOT/bin" "$resource_kit/bin"
+cp -R "$ROOT/kit" "$resource_kit/kit"
+mkdir -p "$resource_kit/kit/.claude/skills/loop-plan/references/nested"
+printf 'future resource\n' > "$resource_kit/kit/.claude/skills/loop-plan/references/nested/example.md"
+RC=0
+"$resource_kit/bin/loop.sh" init "$resource_target" >"$WORK/codex-resource-init.out" 2>&1 || RC=$?
+check "resource-kit init exits 0" codex-resource-projection 0 "$RC"
+if cmp -s "$resource_kit/kit/.claude/skills/loop-plan/references/nested/example.md" \
+          "$resource_target/.agents/skills/loop-plan/references/nested/example.md"; then
+  ok "nested canonical skill resources are copied byte-for-byte"
+else
+  bad "nested skill resource was lost during Codex projection" codex-resource-projection
+fi
+
+echo "== init refuses to overwrite an unmanaged shipped-name Codex skill =="
+collision_target="$WORK/codex-init-collision"
+mkdir -p "$collision_target/.agents/skills/loop-plan"
+printf 'user-owned sentinel\n' > "$collision_target/.agents/skills/loop-plan/SKILL.md"
+RC=0
+"$ROOT/bin/loop.sh" init "$collision_target" >"$WORK/codex-init-collision.out" 2>&1 || RC=$?
+check "collision exits 2" codex-init-collision 2 "$RC"
+if grep -q 'user-owned sentinel' "$collision_target/.agents/skills/loop-plan/SKILL.md" \
+   && [ ! -e "$collision_target/.agents/skills/loop-plan/.loop-kit-managed" ] \
+   && grep -q '→ next:' "$WORK/codex-init-collision.out"; then
+  ok "unmanaged skill is preserved and the collision names a recovery"
+else
+  bad "init overwrote or poorly reported the unmanaged skill collision" codex-init-collision
+fi
+
 echo "== update refreshes a diverged harness (kit -> project) + --approve re-approves -> runs green =="
 make_fixture upd-refresh
 # the deployed harness diverged from the kit and was approved in that state;
 # `update` pulls the kit version back, so the old approval no longer matches
 echo "# LOCAL-DIVERGENCE" >> .claude/skills/loop-iterate/SKILL.md
+echo "# CODEX-LOCAL-DIVERGENCE" >> .agents/skills/loop-iterate/SKILL.md
+printf 'policy:\n  allow_implicit_invocation: true\n' > .agents/skills/loop-iterate/agents/openai.yaml
 ./loop.sh approve >/dev/null
-sha_before=$(cat loop.sh .loop/bin/evaluate.sh .claude/skills/loop-*/SKILL.md | sha256)
+sha_before=$(cat loop.sh .loop/bin/evaluate.sh .claude/skills/loop-*/SKILL.md .agents/skills/loop-*/SKILL.md .agents/skills/loop-*/agents/openai.yaml | sha256)
 "$ROOT/bin/loop.sh" update "$WORK/upd-refresh" --approve >"$WORK/upd.out" 2>&1 || true
-sha_after=$(cat loop.sh .loop/bin/evaluate.sh .claude/skills/loop-*/SKILL.md | sha256)
+sha_after=$(cat loop.sh .loop/bin/evaluate.sh .claude/skills/loop-*/SKILL.md .agents/skills/loop-*/SKILL.md .agents/skills/loop-*/agents/openai.yaml | sha256)
 if ! grep -q 'LOCAL-DIVERGENCE' .claude/skills/loop-iterate/SKILL.md; then ok "diverged skill reconciled to kit"; else bad "skill not refreshed" upd-refresh; fi
+if ! grep -q 'CODEX-LOCAL-DIVERGENCE' .agents/skills/loop-iterate/SKILL.md \
+   && grep -q 'allow_implicit_invocation: false' .agents/skills/loop-iterate/agents/openai.yaml; then
+  ok "Codex projection and explicit policy were regenerated from the kit"
+else
+  bad "Codex projection was not refreshed" upd-refresh
+fi
 if [ "$sha_before" != "$sha_after" ]; then ok "harness hash changed by the refresh"; else bad "harness unchanged after refresh" upd-refresh; fi
 if grep -qi 're-approved' "$WORK/upd.out"; then ok "stale approval triggered re-approval"; else bad "no re-approval note: $(cat "$WORK/upd.out")" upd-refresh; fi
 run_loop "READY_NOW"
@@ -2261,24 +2616,90 @@ else
   bad "commented agent-routing keys were invisible to update drift detection: $out" upd-noop
 fi
 
-echo "== .codex/config.toml participates in approval and update hash parity =="
-make_fixture upd-codex-config
-mkdir -p .codex
+echo "== update preserves user .agents content and self-heals the Codex gitignore block =="
+make_fixture codex-update-preserve
+mkdir -p .agents/skills/my-skill
+printf '# user skill\n' > .agents/skills/my-skill/SKILL.md
+printf '# user project instructions\n' > AGENTS.md
+printf 'node_modules/\n' > .gitignore
+RC=0
+./loop.sh update --from "$ROOT" >"$WORK/codex-update-preserve.out" 2>&1 || RC=$?
+check "update exits 0" codex-update-preserve 0 "$RC"
+if grep -q '# user skill' .agents/skills/my-skill/SKILL.md \
+   && grep -q '# user project instructions' AGENTS.md; then
+  ok "update preserves user skills and root AGENTS.md"
+else
+  bad "update clobbered user-owned .agents content" codex-update-preserve
+fi
+check "Codex skill ignore rule restored exactly once" codex-update-preserve 1 \
+  "$(grep -cFx '/.agents/skills/loop-*/' .gitignore || true)"
+if grep -qFx 'node_modules/' .gitignore; then
+  ok "gitignore self-heal preserves user entries"
+else
+  bad "gitignore self-heal dropped user content" codex-update-preserve
+fi
+
+echo "== update sweeps stale projection staging leftovers from an interrupted refresh =="
+make_fixture codex-update-stale-stage
+mkdir -p .agents/skills/.loop-plan.loop-kit-new.99999 \
+         .agents/skills/.loop-review.loop-kit-old.4242 \
+         .agents/skills/my-skill
+printf 'orphaned stage\n' > .agents/skills/.loop-plan.loop-kit-new.99999/SKILL.md
+printf 'orphaned backup\n' > .agents/skills/.loop-review.loop-kit-old.4242/SKILL.md
+printf '# user skill\n' > .agents/skills/my-skill/SKILL.md
+RC=0
+./loop.sh update --from "$ROOT" >"$WORK/codex-update-stale-stage.out" 2>&1 || RC=$?
+check "update exits 0" codex-update-stale-stage 0 "$RC"
+if [ ! -e .agents/skills/.loop-plan.loop-kit-new.99999 ] \
+   && [ ! -e .agents/skills/.loop-review.loop-kit-old.4242 ]; then
+  ok "stale staging/backup leftovers are swept (a run's git add -A can no longer commit them)"
+else
+  bad "stale staging leftovers survived update: $(find .agents/skills -mindepth 1 -maxdepth 1 | tr '\n' ' ')" codex-update-stale-stage
+fi
+if grep -q '# user skill' .agents/skills/my-skill/SKILL.md \
+   && [ -f .agents/skills/loop-plan/.loop-kit-managed ] \
+   && [ -f .agents/skills/loop-review/SKILL.md ]; then
+  ok "sweep leaves user skills and managed projections intact"
+else
+  bad "sweep damaged neighboring skill content" codex-update-stale-stage
+fi
+
+echo "== update refuses an unmanaged shipped-name Codex skill collision =="
+make_fixture codex-update-collision
+rm -f .agents/skills/loop-review/.loop-kit-managed
+printf '\n# user-owned collision sentinel\n' >> .agents/skills/loop-review/SKILL.md
+RC=0
+./loop.sh update --from "$ROOT" >"$WORK/codex-update-collision.out" 2>&1 || RC=$?
+check "collision exits 2" codex-update-collision 2 "$RC"
+if grep -q 'user-owned collision sentinel' .agents/skills/loop-review/SKILL.md \
+   && [ ! -e .agents/skills/loop-review/.loop-kit-managed ] \
+   && grep -q '→ next:' "$WORK/codex-update-collision.out"; then
+  ok "update preserves and reports the unmanaged collision"
+else
+  bad "update overwrote or poorly reported the unmanaged collision" codex-update-collision
+fi
+
+echo "== the full .codex control tree participates in approval and update hash parity =="
+make_fixture upd-codex-tree
+mkdir -p .codex/hooks .codex/rules
 printf 'model_reasoning_effort = "high"\n' > .codex/config.toml
+printf '{"hooks":[]}\n' > .codex/hooks.json
+printf '#!/bin/sh\nexit 0\n' > .codex/hooks/pre-tool.sh
+printf 'prefix_rule(pattern=["git", "status"], decision="allow")\n' > .codex/rules/default.rules
 ./loop.sh approve >/dev/null
 out=$(./loop.sh update --from "$ROOT" 2>&1) || true
 if echo "$out" | grep -qi 'up to date' && ! echo "$out" | grep -qi 'approval.*stale'; then
-  ok "update hash matches the approved harness when Codex project config is unchanged"
+  ok "update hash matches the approved harness when nested Codex controls are unchanged"
 else
-  bad "target_harness_sha drifted from harness_hash: $out" codex-config-hash
+  bad "target_harness_sha drifted from harness_hash: $out" codex-tree-hash
 fi
-printf 'model_reasoning_effort = "low"\n' > .codex/config.toml
+printf '# tampered\n' >> .codex/hooks/pre-tool.sh
 run_loop "READY_NOW"
-check "Codex project-config mutation refuses the run" codex-config-hash 2 "$RC"
-if grep -q '.codex/config.toml' "$WORK/last-run.out"; then
-  ok "approval failure names the changed Codex session config"
+check "nested Codex control mutation refuses the run" codex-tree-hash 2 "$RC"
+if grep -q '.codex' "$WORK/last-run.out"; then
+  ok "approval failure names the changed Codex control tree"
 else
-  bad "Codex config tamper was not explained: $(cat "$WORK/last-run.out")" codex-config-hash
+  bad "Codex control tamper was not explained: $(cat "$WORK/last-run.out")" codex-tree-hash
 fi
 
 echo "== evaluator diff policy classifies .codex/config.toml as a harness path =="
@@ -2292,6 +2713,18 @@ check "verdict RISK_REQUIRES_APPROVAL" codex-eval-diff RISK_REQUIRES_APPROVAL "$
 case "$out" in
   *"harness file(s) modified by the loop: .codex/config.toml"*) ok "diff policy names the Codex project config" ;;
   *) bad "evaluator did not classify .codex/config.toml as harness: $out" codex-eval-diff ;;
+esac
+
+echo "== evaluator diff policy classifies .agents managed skills as harness paths =="
+make_fixture codex-agents-eval-diff
+git add -f .agents/skills/loop-iterate/SKILL.md
+git commit -q -m "track projected Codex skill"
+printf '\n# changed by agent\n' >> .agents/skills/loop-iterate/SKILL.md
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "verdict RISK_REQUIRES_APPROVAL" codex-agents-eval-diff RISK_REQUIRES_APPROVAL "${out%% *}"
+case "$out" in
+  *"harness file(s) modified by the loop:"*".agents/skills/loop-iterate/SKILL.md"*) ok "diff policy names the projected Codex skill" ;;
+  *) bad "evaluator did not classify .agents as harness: $out" codex-agents-eval-diff ;;
 esac
 
 echo "== update refuses an unknown kit source (deployed, no recorded source, no --from) =="
@@ -2498,6 +2931,62 @@ unset LOOP_FAKE_EVIDENCE
 check "exit code 4" report-alias 4 "$RC"
 check "state BLOCKED" report-alias BLOCKED "$STATE"
 if grep -q "report omits checklist observation" "$WORK/last-run.out"; then ok "prefix-aliased citation rejected as an omission"; else bad "alias citation accepted" report-alias; fi
+
+echo "== an invalid evidence report is regenerated with the rejection reason =="
+# EVIDENCE_RETRY_N (code fallback 2): a CONTENT-invalid report is deleted and
+# /loop-evidence re-invoked with rejected='<deterministic reason>'; the fake's
+# first call invents a non-checklist citation, its second comes out clean.
+make_fixture evidence-retry
+mkdir -p .loop/observations
+printf 'screenshot bytes\n' > .loop/observations/shot.png
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the page visibly renders | run | verified | .loop/observations/shot.png |
+EOF
+git add -A && git commit -q -m "verified run row with real observation"
+./loop.sh approve >/dev/null
+export LOOP_FAKE_EVIDENCE=BAD_THEN_GOOD
+run_loop "READY_NOW"
+unset LOOP_FAKE_EVIDENCE
+check "exit code 0" evidence-retry 0 "$RC"
+check "state SUCCESS" evidence-retry SUCCESS "$STATE"
+if grep -q '"state": "EVIDENCE_RETRY"' .loop/journal.jsonl; then ok "regeneration journaled"; else bad "EVIDENCE_RETRY missing from journal" evidence-retry; fi
+if grep -q "outside the verified checklist" .loop/journal.jsonl; then ok "retry carried the deterministic rejection reason"; else bad "rejection reason missing from journal" evidence-retry; fi
+if grep -q "rejected='" .loop/fake-evidence-prompts; then ok "regeneration prompt received rejected='...'"; else bad "rejected= not passed to the regeneration" evidence-retry; fi
+check "exactly one regeneration (two evidence calls)" evidence-retry 2 "$(grep -c '/loop-evidence' .loop/fake-evidence-prompts)"
+
+echo "== the historical-path deadlock shape now fails EARLY at iteration time =="
+# Regression for the shape that deadlocked a real run: canonical path in
+# backticks + CJK punctuation glued on + a second historical literal path in
+# the same cell. Preflight used to pass (first token only) and the run died
+# terminally at the evidence gate; now 6.6(e) refuses at iteration time with
+# the fix in the reason, and the terminal gate is never reached.
+make_fixture gate-deadlock
+mkdir -p .loop/observations
+printf 'probe ok\n' > .loop/observations/iter15-AC-001-probe.log
+printf 'old probe\n' > .loop/observations/iter2-AC-001-probe.log
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the probe answers | run | verified | `.loop/observations/iter15-AC-001-probe.log`。（履歴: .loop/observations/iter2-AC-001-probe.log） |
+EOF
+git add -A && git commit -q -m "deadlock-shape evidence cell"
+./loop.sh approve >/dev/null
+run_loop "READY_NOW,NO_DIFF,NO_DIFF"
+check "exit code 4 (stalls; the gate is never reached)" gate-deadlock 4 "$RC"
+check "state STALLED" gate-deadlock STALLED "$STATE"
+if grep -q "cites 2 observation paths" .loop/journal.jsonl; then ok "deadlock shape refused at iteration time"; else bad "singleton refusal missing from journal" gate-deadlock; fi
+if ! grep -q "current evidence report is invalid" "$WORK/last-run.out" \
+   && ! grep -q '"state": "SUCCESS"' .loop/journal.jsonl; then
+  ok "failure moved off the terminal evidence gate"
+else
+  bad "deadlock still reaches the terminal gate or SUCCESS" gate-deadlock
+fi
 
 echo "== same-second fresh restarts get distinct run ids and prevrun archives =="
 make_fixture same-second
@@ -3029,6 +3518,70 @@ else
 fi
 if [ "$(cat "$archive_dir/task-id" 2>/dev/null || true)" = "$old_task" ]; then ok "prior task-id archived before rotation"; else bad "archived task-id missing or wrong" aclist-obs; fi
 
+echo "== run rows citing multiple observation paths are refused (singleton canonical citation) =="
+# 6.6(e): the manifest stamps exactly ONE artifact per run row and the gate's
+# report validator demands checklist⇄report⇄manifest equality per token, so a
+# second literal path (usually an honest historical mention) would deadlock at
+# the terminal evidence gate. It must be refused HERE, at iteration time, with
+# the fix in the reason.
+make_fixture aclist-single
+echo fixed > value.txt
+seed_ledger_met
+mkdir -p .loop/observations
+printf 'observed\n' > .loop/observations/iter1-AC-001.png
+printf 'old capture\n' > .loop/observations/iter0-AC-001.png
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the page visibly renders | run | verified | .loop/observations/iter1-AC-001.png (superseded: .loop/observations/iter0-AC-001.png) |
+EOF
+printf 'READY_FOR_REVIEW fixture agent\n' > .loop/agent-state
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "multi-path run row refused (CONTINUE)" aclist-single CONTINUE "${out%% *}"
+case "$out" in
+  *"AC-001(cites 2 observation paths"*) ok "singleton violation named with its count" ;;
+  *) bad "singleton refusal absent: $out" aclist-single ;;
+esac
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the page visibly renders | run | verified | .loop/observations/iter1-AC-001.png (superseded: iter0-AC-001.png) |
+EOF
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "prefix-less history restores promotion" aclist-single SUCCESS_CANDIDATE "${out%% *}"
+
+echo "== CJK punctuation glued to an observation path parses cleanly =="
+# The real-world failure shape: prose punctuation directly after the path with
+# alphanumerics later in the suffix (`...png。（iter0 ...）`). The old loose
+# parser merged the CJK bytes into the token and refused the row with a
+# garbled "invalid observation path"; the strict char class ends the token at
+# the first non-path byte.
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the page visibly renders | run | verified | .loop/observations/iter1-AC-001.png。（iter0 版は差し替え済み） |
+EOF
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD 2>&1) || true
+check "CJK-glued citation accepted" aclist-single SUCCESS_CANDIDATE "${out%% *}"
+out=$(.loop/bin/evaluate.sh --pre-ref HEAD --preflight 2>&1) || true
+check "preflight stamps the CJK-glued citation" aclist-single SUCCESS_CANDIDATE "${out%% *}"
+if grep -Fq '"artifact_path":".loop/observations/iter1-AC-001.png"' .loop/observations-manifest.jsonl; then
+  ok "manifest stamped the clean path"
+else
+  bad "manifest missing the clean path: $(cat .loop/observations-manifest.jsonl 2>/dev/null)" aclist-single
+fi
+if LC_ALL=C grep -q '"artifact_path":"[^"]*[^ -~][^"]*"' .loop/observations-manifest.jsonl; then
+  bad "manifest artifact_path contains non-ASCII bytes" aclist-single
+else
+  ok "no non-ASCII bytes in stamped paths"
+fi
+
 echo "== observation size limit refuses evaluator stamping =="
 make_fixture aclist-obs-size
 echo fixed > value.txt
@@ -3485,10 +4038,14 @@ qcount()      { find ".loop/fleet/queue/$1" -name '*.md' 2>/dev/null | wc -l | t
 echo "== fleet: Codex role selection propagates into the worker worktree =="
 make_fleet_fixture fleet-codex-route
 printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
-mkdir -p .codex
-printf '\n.codex/config.toml\n' >> .gitignore
+mkdir -p .codex/hooks .codex/rules .agents/skills/loop-iterate/references
+printf '\n.codex/\n' >> .gitignore
 git add .gitignore && git commit -q -m "ignore local Codex project config"
 printf 'model_reasoning_effort = "high"\n' > .codex/config.toml
+printf '{"hooks":[]}\n' > .codex/hooks.json
+printf '#!/bin/sh\nexit 0\n' > .codex/hooks/pre-tool.sh
+printf 'prefix_rule(pattern=["git", "status"], decision="allow")\n' > .codex/rules/default.rules
+printf 'approved managed resource\n' > .agents/skills/loop-iterate/references/fleet.md
 RC=0
 LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" LOOP_FAKE_REVIEW=APPROVE \
   LOOP_FAKE_STOPEVAL=CONTINUE \
@@ -3504,10 +4061,22 @@ if [ -s "$wt/.loop/fake-codex-args" ] \
 else
   bad "Codex worker routing missing in $wt" fleet-codex-route
 fi
-if cmp -s .codex/config.toml "$wt/.codex/config.toml"; then
-  ok "gitignored approved Codex project config propagated byte-for-byte to the worker"
+if cmp -s .codex/config.toml "$wt/.codex/config.toml" \
+   && cmp -s .codex/hooks.json "$wt/.codex/hooks.json" \
+   && cmp -s .codex/hooks/pre-tool.sh "$wt/.codex/hooks/pre-tool.sh" \
+   && cmp -s .codex/rules/default.rules "$wt/.codex/rules/default.rules"; then
+  ok "the full approved .codex control tree propagated byte-for-byte to the worker"
 else
-  bad "Codex worker lost the parent project config" fleet-codex-route
+  bad "Codex worker lost part of the parent control tree" fleet-codex-route
+fi
+if cmp -s .agents/skills/loop-iterate/references/fleet.md \
+          "$wt/.agents/skills/loop-iterate/references/fleet.md" \
+   && cmp -s .agents/skills/loop-iterate/agents/openai.yaml \
+            "$wt/.agents/skills/loop-iterate/agents/openai.yaml" \
+   && [ -f "$wt/.agents/skills/loop-iterate/.loop-kit-managed" ]; then
+  ok "managed Codex skill resources, policy, and ownership propagated to the worker"
+else
+  bad "worker lost the managed Codex skill projection" fleet-codex-route
 fi
 
 echo "== fleet: an all-Codex fleet (CONTRACT included) runs Claude-less end to end =="
@@ -4978,7 +5547,9 @@ if ! grep -qE '^SEED_BRANCH=' .loop/fleet/runs/half-a.env 2>/dev/null \
 else
   bad "SEED_BRANCH recorded despite the two-root fork" fleet-supforkjoin
 fi
-base_jc=$(grep -E '^BASE_REF=' ".loop/fleet/runs/join-c.env" | tail -1 | cut -d= -f2-)
+# guarded: when the diamond scenario itself failed, join-c.env never exists —
+# that must surface as this block's own bad-assertions, not abort the suite
+base_jc=$(grep -E '^BASE_REF=' ".loop/fleet/runs/join-c.env" 2>/dev/null | tail -1 | cut -d= -f2- || true)
 if [ "$(git log --format=%s "$base_jc" 2>/dev/null | grep -c '^fleet: merge half-a' || true)" -ge 1 ] \
    && [ "$(git log --format=%s "$base_jc" 2>/dev/null | grep -c '^fleet: merge half-b' || true)" -ge 1 ]; then
   ok "join-c branched from both merged halves"
@@ -7271,10 +7842,22 @@ echo keep > user-file.txt
 printf 'node_modules/\n' >> .gitignore
 mkdir -p .claude/skills/my-skill
 printf '# mine\n' > .claude/skills/my-skill/SKILL.md
+mkdir -p .agents/skills/my-skill
+printf '# my Codex skill\n' > .agents/skills/my-skill/SKILL.md
+printf '# keep project instructions\n' > AGENTS.md
+# An unmarked shipped-name directory is user-owned. Uninstall must remove only
+# projections whose explicit ownership marker is still present.
+rm -f .agents/skills/loop-review/.loop-kit-managed
+printf '\n# user adopted this skill\n' >> .agents/skills/loop-review/SKILL.md
 git add -A && git commit -q -m "user content"
 RC=0
 ./loop.sh uninstall --force </dev/null >"$WORK/uninstall.out" 2>&1 || RC=$?
 check "exit code 0" uninstall-basic 0 "$RC"
+if grep -q '\.agents/skills/loop-' "$WORK/uninstall.out"; then
+  ok "uninstall preview reports the managed Codex projection scope"
+else
+  bad "uninstall preview omitted managed Codex skills: $(cat "$WORK/uninstall.out")" uninstall-basic
+fi
 if [ ! -f loop.sh ] && [ ! -f fleet.sh ] && [ ! -f loop.config.sh ] \
    && [ ! -f loop.models.sh ] && [ ! -f fleet.config.sh ] && [ ! -d .loop ]; then
   ok "kit files and .loop removed"
@@ -7283,11 +7866,36 @@ else
 fi
 if [ -z "$(ls -d .claude/skills/loop-* 2>/dev/null)" ]; then ok "loop-* skills removed"; else bad "loop-* skills left" uninstall-basic; fi
 if [ -f .claude/skills/my-skill/SKILL.md ]; then ok "user skill kept"; else bad "user skill deleted" uninstall-basic; fi
+managed_codex_left=0
+for d in .agents/skills/loop-*/; do
+  [ -f "$d/.loop-kit-managed" ] && managed_codex_left=$((managed_codex_left + 1))
+done
+check "managed Codex projections removed" uninstall-basic 0 "$managed_codex_left"
+if [ -f .agents/skills/my-skill/SKILL.md ] \
+   && grep -q 'user adopted this skill' .agents/skills/loop-review/SKILL.md \
+   && [ -f AGENTS.md ]; then
+  ok "user .agents skills, adopted shipped-name skill, and AGENTS.md are kept"
+else
+  bad "uninstall deleted user-owned Codex content" uninstall-basic
+fi
 if [ -f user-file.txt ] && [ -f value.txt ] && [ -d .git ]; then ok "project files + git kept"; else bad "project content deleted" uninstall-basic; fi
 if grep -q 'node_modules/' .gitignore && ! grep -q 'loop-kit' .gitignore; then
   ok "gitignore: kit blocks stripped, user entries kept"
 else
   bad "gitignore scrub wrong: $(cat .gitignore 2>/dev/null)" uninstall-basic
+fi
+
+echo "== uninstall sweeps stale projection staging leftovers so .agents/ itself goes away =="
+make_fixture uninstall-stale-stage
+mkdir -p .agents/skills/.loop-plan.loop-kit-new.99999
+printf 'orphaned stage\n' > .agents/skills/.loop-plan.loop-kit-new.99999/SKILL.md
+RC=0
+./loop.sh uninstall --force </dev/null >"$WORK/uninstall-stale-stage.out" 2>&1 || RC=$?
+check "exit code 0" uninstall-stale-stage 0 "$RC"
+if [ ! -e .agents ]; then
+  ok "stale staging leftover removed and the emptied .agents/ pruned"
+else
+  bad ".agents left behind: $(find .agents | tr '\n' ' ')" uninstall-stale-stage
 fi
 
 echo "== uninstall without --force and no TTY refuses (nothing removed) =="
@@ -7353,6 +7961,27 @@ if [ -z "$unclassified" ]; then
   ok "every .loop/ artifact is lifecycle-classified"
 else
   bad "unclassified .loop/ artifacts — add each to tests/artifact-lifecycle.txt with a scope (run|contract|persistent|liveness): $(echo "$unclassified" | tr '\n' ' ')" lifecycle-lint
+fi
+
+echo "== observation tokenizer is byte-identical in loop.sh and evaluate.sh =="
+# loop.sh observation_tokens() and evaluate.sh 6.6(e) parse the same evidence
+# cells; if their extraction ever drifts (char class, boundary set, or token
+# count semantics), a citation can pass preflight and still deadlock the
+# terminal evidence gate — the exact bug class this pins. Comments alone did
+# not hold the invariant; this grep does.
+TOK_RE='(^|[[:space:]([`])\.loop/observations/[A-Za-z0-9_./-]*[A-Za-z0-9_-]'
+n_tok_loop=$(grep -cF "$TOK_RE" "$ROOT/bin/loop.sh" || true)
+n_tok_eval=$(grep -cF "$TOK_RE" "$ROOT/bin/evaluate.sh" || true)
+if [ "$n_tok_loop" -ge 1 ] && [ "$n_tok_eval" -ge 1 ]; then
+  ok "shared tokenizer regex literal present in both parsers"
+else
+  bad "tokenizer regex drifted (loop.sh: $n_tok_loop, evaluate.sh: $n_tok_eval) — observation_tokens() and 6.6(e) must stay byte-identical" parser-sync
+fi
+STRIP_RE='s/^[[:space:]([`]//'
+if grep -qF "$STRIP_RE" "$ROOT/bin/loop.sh" && grep -qF "$STRIP_RE" "$ROOT/bin/evaluate.sh"; then
+  ok "shared boundary-strip sed present in both parsers"
+else
+  bad "boundary-strip sed drifted between loop.sh and evaluate.sh" parser-sync
 fi
 
 echo "== shellcheck =="

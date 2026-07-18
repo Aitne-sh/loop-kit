@@ -1,6 +1,6 @@
 ---
 name: loop-contract-review
-description: Independent read-only review of a loop definition (product contract + stop conditions) BEFORE it is approved — judge whether the contract faithfully covers the instruction and whether VERIFY_COMMANDS is a real, discriminating gate. Invoked by loop.sh/fleet.sh on the unattended (auto) approval path.
+description: Independent read-only review of a loop definition (product contract + stop conditions) BEFORE it is approved — judge whether the contract faithfully covers the instruction and whether VERIFY_COMMANDS is a real, discriminating gate. Invoked by loop.sh on the unattended (auto) approval path.
 disable-model-invocation: true
 ---
 
@@ -72,10 +72,21 @@ Read, in this order:
   observable only at runtime (rendering, animation, interaction,
   environment-dependent behavior) has at least one `run` or `human` row in
   the acceptance checklist — a runtime-observable REQ verified ONLY by
-  static commands ⇒ REVISE. A `run` method with no feasibility record in
-  unknowns.md (was the observation channel proven to work headlessly, in
-  the loop's own execution mode?) ⇒ REVISE. A binding gate that depends on
-  an interactive-only tool a headless loop cannot use ⇒ REVISE.
+  static commands ⇒ REVISE. A browser-rendered or visually-judged
+  deliverable with no direct browser check anywhere — no browser-test
+  command, no browser `run` row, no user-chosen `human` row — ⇒ REVISE.
+  Every `run` row needs a channel record in unknowns.md, judged BY
+  channel: a scripted probe (project tooling) needs its feasibility spike
+  result (was the channel proven to work headlessly, in the loop's own
+  execution mode?) — missing ⇒ REVISE; an agent browser channel row (the
+  executing agent's own browser skill/MCP connector) is instead
+  acceptable UNPROVEN when unknowns.md records it as
+  `unproven — agent-environment dependent` with the declared runtime
+  consequence (the loop stops with a decision request if the capability
+  is missing) — definition-time unprovability is not a defect there, but
+  a silent binding with no record at all ⇒ REVISE. A binding gate
+  (VERIFY_COMMANDS) that depends on an interactive-only tool, or on an
+  agent skill the evaluator's /bin/sh re-run cannot invoke ⇒ REVISE.
 - **Checklist consistency**: `.loop/docs/acceptance-checklist.md` is filled
   in (not the template) for any non-trivial contract, covers the Acceptance
   Criteria and the "Must-be baseline" of unknowns.md (no expectation stated

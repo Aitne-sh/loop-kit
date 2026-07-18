@@ -9,6 +9,7 @@
 # LOOP_FAKE_CODEX=FAIL:   emit turn.failed + error events and exit 1.
 # LOOP_FAKE_CODEX=NOMSG: emit a successful JSONL turn but do not write -o.
 # LOOP_FAKE_CODEX=TURNFAIL: write -o and exit 0, but emit turn.failed.
+# LOOP_FAKE_CODEX=REORDER: emit valid JSONL with "type" after other keys.
 # LOOP_FAKE_CODEX=OLD:   exec --help omits --json (capability-probe fixture).
 # LOOP_FAKE_CODEX=NOAUTH: login status exits 1; actual exec still succeeds.
 
@@ -137,7 +138,7 @@ run_exec() {
   fi
 
   skill=$(printf '%s\n' "$prompt" \
-    | sed -nE 's|.*\.claude/skills/loop-([a-z-]+)/SKILL\.md.*|\1|p')
+    | sed -nE 's#.*\.(claude|agents)/skills/loop-([a-z-]+)/SKILL\.md.*#\2#p')
   if [ -n "$skill" ]; then
     reconstructed="/loop-$skill"
     case "$prompt" in
@@ -161,10 +162,17 @@ run_exec() {
   if [ "${LOOP_FAKE_CODEX:-}" != NOMSG ]; then
     printf '%s\n' "$result" > "$output"
   fi
-  printf '{"type":"thread.started","thread_id":"%s"}\n' "$thread"
-  printf '{"type":"turn.started"}\n'
-  printf '{"type":"item.completed","item":{"type":"agent_message","text":"fake"}}\n'
-  printf '{"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}\n'
+  if [ "${LOOP_FAKE_CODEX:-}" = REORDER ]; then
+    printf '{"thread_id":"%s","type":"thread.started"}\n' "$thread"
+    printf '{"sequence":1,"type":"turn.started"}\n'
+    printf '{"item":{"type":"agent_message","text":"fake"},"type":"item.completed"}\n'
+    printf '{"usage":{"input_tokens":0,"output_tokens":0},"type":"turn.completed"}\n'
+  else
+    printf '{"type":"thread.started","thread_id":"%s"}\n' "$thread"
+    printf '{"type":"turn.started"}\n'
+    printf '{"type":"item.completed","item":{"type":"agent_message","text":"fake"}}\n'
+    printf '{"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}\n'
+  fi
 }
 
 approval=""

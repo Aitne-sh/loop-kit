@@ -33,6 +33,12 @@ record any classification inferred without executing the command under
 with a verification method per row, record method assignments made without a
 user under `## Assumptions (auto mode)`, and prefer `run` probes the loop can
 execute headlessly over `human` rows — there is no human present to look.
+A browser-rendered deliverable keeps its direct browser check on this path:
+prefer a deterministic browser-test command the repository already supports;
+otherwise bind the agent browser channel `run` row (see Step 2) with its
+`unproven — agent-environment dependent` record and note the binding under
+`## Assumptions (auto mode)` — never silently drop the check or demote it
+to `human`.
 Still run the Step 1 survey and the Step 1.5 diagnosis (skipping only the
 questions): every question you would have asked becomes both an
 `## Assumptions (auto mode)` entry and a "Deferred with defaults" entry in
@@ -89,9 +95,10 @@ medium per interaction — this decision is yours to make each time:
   confirmations → text.
 
 Either way, the HTML only helps the user **understand** — it never collects
-input. Collect the answer in the session: via the **AskUserQuestion tool** for
-structured choices (one question at a time, 2–4 concrete options; free-form
-"Other" is built in), or plain chat for open-ended answers.
+input. Collect the answer in the session through the client's structured-question
+interaction when one is available (`AskUserQuestion` in Claude Code), or plain
+chat otherwise. Ask one question at a time with 2–4 concrete options; permit a
+free-form answer.
 
 Any HTML you write MUST be self-contained and fully offline: inline all CSS, make
 no external requests (no CDN, fonts, images, `fetch`), prefer no JavaScript, and use
@@ -408,9 +415,10 @@ Approval Required If — plus the config-derived policy/budgets below.
    later demonstrate. Distinct from the verify gate below (criteria are what must be
    true; the gate is the commands that prove it) — mirror the contract, do not drop.
    Include the acceptance-checklist view: each AC id | REQ | expectation |
-   verification method (`cmd`/`run`/`human`), with any `human` rows called out —
-   the reader is approving these as the loop's closure obligations (the run cannot
-   end until every row is `verified`).
+   verification method (`cmd`/`run`/`human`), with any `human` rows and any
+   unproven agent-browser-channel `run` rows called out (the latter carry the
+   stop-on-missing-capability caveat) — the reader is approving these as the
+   loop's closure obligations (the run cannot end until every row is `verified`).
 7. **Verify gate & what it proves** (Data) — table: each `VERIFY_COMMAND` | what
    passing it demonstrates | expected baseline (red→green: fails now, must pass
    when done; stays-green: regression guard). This is the deterministic success
@@ -546,16 +554,18 @@ rather than dropping a section.
 
 **Mandatory acceptance-gate question (always ask on the interactive path).**
 However much Step 1 settled, ask the user exactly ONE acceptance-gate question
-via AskUserQuestion before writing the contract: what commands the loop must
-stop on (the future VERIFY_COMMANDS), what a pass proves, and which test tool
-runs them. The options MUST lead with a concrete proposal you authored from
-the Step 1 exploration — the exact commands, what passing each proves, the
-test tool — marked "(Recommended)", so a user with no opinion accepts it
-unchanged. If the instruction already specified acceptance criteria, the
-question confirms them and offers your supplement (e.g. an extra regression
-guard) as an option. Record the outcome in the "Interview decision log" of
-unknowns.md like any other question. (`auto:` mode has no user — it records
-assumptions instead, per its rules above.)
+through the client's structured-question interaction when available
+(`AskUserQuestion` in Claude Code), otherwise in plain chat, before writing the
+contract: what commands the loop must stop on (the future VERIFY_COMMANDS),
+what a pass proves, and which test tool runs them. The options MUST lead with
+a concrete proposal you authored from the Step 1 exploration — the exact
+commands, what passing each proves, the test tool — marked "(Recommended)", so
+a user with no opinion accepts it unchanged. If the instruction already
+specified acceptance criteria, the question confirms them and offers your
+supplement (e.g. an extra regression guard) as an option. Record the outcome
+in the "Interview decision log" of unknowns.md like any other question.
+(`auto:` mode has no user — it records assumptions instead, per its rules
+above.)
 
 The same question assigns every acceptance criterion its **verification
 method** — `cmd` (a deterministic command proves it), `run` (only runtime
@@ -566,13 +576,47 @@ loop stops for it instead of waiving it). If any requirement is observable
 only at runtime (rendering, animation, interaction), the recommended
 proposal MUST include at least one `run` criterion: a static gate
 (build/lint/unit tests) cannot discriminate a broken runtime, and "the code
-reads correct" is analysis, never a substitute for demonstration. Before
-making a `run` method binding, prove the observation channel works in the
-loop's own execution mode (headless, non-interactive) with a Step 1.5
-feasibility spike — a probe must launch, observe, and exit by itself; an
-interactive-only browser tool that cannot attach to a headless run is NOT a
-usable channel for the loop (classify that item `human` instead). Record
-the spike result under "Feasibility probes" in unknowns.md.
+reads correct" is analysis, never a substitute for demonstration.
+
+A `run` row's observation travels one of two channels, with different
+intake duties:
+
+- **Scripted probe channel** — the project's own tooling proves it (a
+  probe script, a Playwright/driver test installed in the repository,
+  typically wired into the verify gate). Before making such a binding,
+  prove the channel works in the loop's own execution mode (headless,
+  non-interactive) with a Step 1.5 feasibility spike — a probe must
+  launch, observe, and exit by itself. Record the spike result under
+  "Feasibility probes" in unknowns.md.
+- **Agent browser channel** — the executing agent drives a browser
+  directly through its own browser-automation skill or MCP connector (a
+  Playwright skill, a browser extension) and saves screenshots under
+  `.loop/observations/`. Do NOT feasibility-probe this channel at
+  definition time, and never demote such an item to `human` merely
+  because THIS session cannot drive a browser: the defining agent's
+  environment is not the executing agent's environment (different
+  session, possibly a different agent entirely), so a definition-time
+  probe proves nothing about the run — and the skill may simply not be
+  enabled here. Bind the row as a PROPOSAL: record it under "Feasibility
+  probes" in unknowns.md as `unproven — agent-environment dependent`,
+  together with the declared runtime consequence: if the executing agent
+  lacks the capability, the loop stops at the first attempt with a
+  decision request for the human — it never silently reclassifies or
+  skips the check.
+
+**Browser-rendered deliverables demand a direct browser check.** When a
+requirement's output renders in a browser or must be judged visually (web
+UI, layout/CSS, canvas/visual output), the recommended proposal MUST
+include at least one direct browser check, preferring in order: (1) a
+deterministic browser-test command (`cmd` — e.g. Playwright already in
+the repository, or added as an in-scope red→green deliverable the
+contract explicitly licenses, dev-dependency included); (2) a `run` row
+on the agent browser channel; (3) a `human` row — only when the user
+declines browser automation. Present the channel caveat with the
+proposal, in the user's language: if the executing agent has no browser
+skill or connector enabled, the check cannot run and the loop will stop
+at that point to ask how to proceed. By approving, the user is choosing
+that stop behavior as part of the gate.
 
 Beyond that, ask the minimum set of questions (typically 2-4), such as:
 - Scope boundaries: what is explicitly OUT (Non-goals)?
@@ -591,9 +635,11 @@ Interview discipline:
 - Order questions by architectural blast radius — data model > interfaces >
   user-visible behavior > style — and state with each question why the answer
   matters (what it changes).
-- Ask structured questions via the **AskUserQuestion tool**, one at a time.
-  After each answer, re-rank what is still worth asking — answers kill and
-  spawn questions; stop when the remainder no longer changes the contract.
+- Ask structured questions through the client's available question interaction
+  (`AskUserQuestion` in Claude Code), or plain chat when none is exposed, one
+  at a time. After each answer, re-rank what is still worth asking — answers
+  kill and spawn questions; stop when the remainder no longer changes the
+  contract.
 - A question you decide NOT to ask becomes a "Deferred with defaults" entry in
   unknowns.md: the conservative default you adopted and what would make it wrong.
 - Record every answer in the "Interview decision log" of unknowns.md before
@@ -727,6 +773,13 @@ Update `loop.config.sh` consistently with the contract:
   as drift). Probes must be self-contained and self-terminating (start
   server → wait → observe → kill), and their feasibility in headless mode
   was proven by the Step 1.5 spike before being made binding.
+  VERIFY_COMMANDS are re-run via /bin/sh by the external evaluator — an
+  agent skill or MCP connector can never appear here, so an
+  agent-browser-channel check exists only as a `run` checklist row, never
+  as a VERIFY_COMMAND. A browser-test command (e.g. Playwright) belongs
+  here only as project tooling; when adding it needs a new dev-dependency,
+  the contract must explicitly license that addition (otherwise the loop
+  hits ESCALATE_PATHS mid-run on the manifest).
 - `DENIED_PATHS`: secrets, prod config, anything requiring approval before touching
 - `ESCALATE_PATHS`: dependency manifests, migrations, public API surface. Also
   consider agent-instruction files the task does not explicitly target (e.g.
@@ -768,7 +821,10 @@ Show the COMPLETE loop definition in the conversation:
 - The unknowns summary: questions asked, what was deferred on defaults, any
   spike results (details: `.loop/docs/unknowns.md`)
 - The acceptance checklist: row count per REQ and the verification-method
-  split (cmd / run / human), with any `human` rows called out explicitly
+  split (cmd / run / human), with any `human` rows AND any unproven
+  agent-browser-channel `run` rows called out explicitly — the latter with
+  their runtime consequence: if the executing agent has no browser
+  skill/connector, the loop stops there and asks
   (details: `.loop/docs/acceptance-checklist.md`)
 
 If the definition is large or the user is visual, also render it as one

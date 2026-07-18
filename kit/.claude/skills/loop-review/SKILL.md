@@ -97,6 +97,9 @@ Code quality is judged only after requirements. On every review:
   artifact, including image contents, and judge it against the expectation. A
   `run` row `verified` on code reading alone, with a missing artifact, or with an
   artifact that does not actually show the behavior ⇒ REVISE, naming the row.
+  A `run` row citing more than one literal `.loop/observations/` path ⇒
+  REVISE, naming the row — the harness certifies exactly one canonical
+  artifact per row; superseded captures belong in prose, prefix-less.
 
 ## Sanctioned side-work (gate mode, fleet)
 
@@ -125,13 +128,14 @@ not nitpick style or demand refactors the contract doesn't require; the loop's
 budget is finite. Observations that do not meet the REVISE bar go under
 `NOTES:` (advisory, never must-fix).
 
-The diff you receive already excludes the loop's own bookkeeping (`.loop/`,
-`.claude/`). Never reject for the loop updating its progress/plan/drift/ledger
-documents — that is harness-mandated behavior, outside the contract's scope.
-Likewise, machine-generated artifacts of the project's own tooling (lockfiles
-like `uv.lock`/`package-lock.json`, caches) that appear as a side effect of
-running the verification commands are not scope violations — flag them only if
-their content indicates a real problem (e.g. an unapproved new dependency).
+The diff you receive already excludes the loop's own bookkeeping and managed
+agent control plane (`.loop/`, `.claude/`, `.agents/`, `.codex/`). Never reject
+for the loop updating its progress/plan/drift/ledger documents — that is
+harness-mandated behavior, outside the contract's scope. Likewise,
+machine-generated artifacts of the project's own tooling (lockfiles like
+`uv.lock`/`package-lock.json`, caches) that appear as a side effect of running
+the verification commands are not scope violations — flag them only if their
+content indicates a real problem (e.g. an unapproved new dependency).
 
 ## Erosion audit (gate and scope=run reviews)
 

@@ -4,10 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-This is the **source of loop-kit**, not a deployed instance of it. loop-kit turns Claude Code
-into a contract-driven agentic loop (implement → verify → review → improve, fresh context each
-iteration, until every requirement is met or it stops for a human). You are editing the harness
-and prompts here; end users get a *copy* via `bin/loop.sh init <their-project>`.
+This is the **source of loop-kit**, not a deployed instance of it. loop-kit turns Claude Code,
+Codex, or a role-by-role mix of both into a contract-driven agentic loop (implement → verify →
+review → improve, fresh context each iteration, until every requirement is met or it stops for
+a human). You are editing the harness and prompts here; end users get a *copy* via
+`bin/loop.sh init <their-project>`.
 
 The whole product is **shell + prompt files** — there is no build step, no package manager, no
 compiled artifact. The deliverable is the scripts themselves.
@@ -51,23 +52,31 @@ Two layers, and the split is the point:
   hashing, git/worktree management, journaling, and command dispatch all live here.
   `run_claude` retains its historical name but dispatches each routable role through
   `AGENT_<ROLE>`; its Codex adapter normalizes JSONL into the existing result envelope.
+  Codex checker roles force `read-only` plus `project_doc_max_bytes=0`, preventing
+  repository `AGENTS.md` from becoming checker instructions; authoring roles retain normal
+  project guidance.
   `AGENT_CONTRACT` governs only the headless definition path — interactive `start`/`refine`
   launch the Claude TUI directly and never consult the resolver.
 - **`bin/evaluate.sh`** — the evaluator. Re-runs the user's `VERIFY_COMMANDS` *outside* the
   model. This is the maker–checker boundary: deterministic checks gate first, AI review second,
   humans see only an evidence report. No model self-grades.
-- **`kit/.claude/skills/loop-*/SKILL.md`** — the *prompts*. Each phase of the spine is a skill:
-  `loop-contract` (+`-review`), `loop-decompose` (+`-review`), `loop-plan`, `loop-iterate`,
-  `loop-review`, `loop-stop-eval`, `loop-evidence`, `loop-supervise`. Editing these changes agent
-  behavior without touching the harness.
+- **`kit/.claude/skills/loop-*/SKILL.md`** — the canonical *prompts*. Each phase of the spine
+  is a skill: `loop-contract` (+`-review`), `loop-decompose` (+`-review`), `loop-plan`,
+  `loop-iterate`, `loop-review`, `loop-stop-eval`, `loop-evidence`, `loop-supervise`, plus
+  `loop-setup` (interactive agent/model tuning, dual-projected) and Claude-only `loop-refine`.
+  `init`/`update` project the eleven headless-compatible skills into `.agents/skills` with
+  Codex-valid frontmatter and invocation metadata; never maintain a second source tree or
+  deploy `.codex/skills`.
 - **`kit/loop-docs/*.md`** — pristine templates for the working docs (`product-contract.md`,
   `implementation-plan.md`, `progress.md`, `requirements-ledger.md`, `evidence-report.md`, …).
 - **`kit/loop.config.sh` / `loop.models.sh` / `fleet.config.sh`** — user-tunable config templates
   (stop conditions/paths, per-phase agent/model routing, fleet knobs).
 
-`init`/`update` copy `bin/*` + `kit/*` into a project as `loop.sh`, `.loop/bin/evaluate.sh`,
-`.claude/skills/loop-*`, `.loop/docs/*`, and the config files. `README.md` (extensive) is the
-user manual; its "How the theory maps to the implementation" table cites the primary sources each
+`init`/`update` copy `bin/*` + `kit/*` into a project as `loop.sh`,
+`.loop/bin/evaluate.sh`, `.claude/skills/loop-*`, projected `.agents/skills/loop-*`,
+`.loop/docs/*`, and the config files. They preserve user-owned `AGENTS.md`,
+`AGENTS.override.md`, `.codex/**`, and non-managed skills. `README.md` (extensive) is the user
+manual; its "How the theory maps to the implementation" table cites the primary sources each
 mechanism implements.
 
 **The spine:** contract → approve → decompose → loop → evidence. State is once-approved and
@@ -83,16 +92,19 @@ repo itself) or inside a deployed project (`MODE=deployed`: those commands act o
 project with no dir argument).
 
 **Approval hashing.** A run is gated by `contract_hash` (contract + `loop.config.sh`) and
-`harness_hash` (`loop.sh` + evaluator + skills + settings). In a *deployed* project, changing the
-harness invalidates the recorded approval and `run` refuses until re-approval. Records live
-off-tree at `~/.loop-kit/approvals/<repo-id>/<slot-id>` (one slot per worktree; `uninstall` sweeps
-the whole repo group). This is why editing the harness in this source repo is free, but the *test
-fixtures* must re-approve after harness changes — the suite handles that.
+`harness_hash` (`loop.sh` + evaluator + both managed skill trees +
+`.claude/settings*.json` + `.mcp.json` + recursive `.codex/**`). Recursive inputs bind the
+relative path and contents, so add/remove/rename is detected. In a *deployed* project, changing
+the harness invalidates the recorded approval and `run` refuses until re-approval. Records live
+off-tree at `~/.loop-kit/approvals/<repo-id>/<slot-id>` (one slot per worktree; `uninstall`
+sweeps the whole repo group). This is why editing the harness in this source repo is free, but
+the *test fixtures* must re-approve after harness changes — the suite handles that.
 
 **Fleet (parallel).** The supervisor decomposes the contract into a queue, dispatches independent
 tasks into isolated git worktrees (siblings under `<project>-loops/`), serializes merges, gates
 the merged whole against the master contract (the integration gate ignores even `REVIEW_MODE=off`),
-and handles dependency gating, replanning, and human escalation.
+and handles dependency gating, replanning, and human escalation. Approved `.agents` skills and
+the repository `.codex/**` control plane are copied byte-for-byte into each worker.
 
 ## Editing invariants (these will fail the suite if broken)
 
@@ -119,11 +131,20 @@ and handles dependency gating, replanning, and human escalation.
   written by `ensure_gitignore`, and the `ours()` list in `strip_gitignore_blocks`.
 - **Unlinking the running `loop.sh` is intentional** (the live process keeps its inode); `update`
   and `uninstall` rely on it. Don't "fix" it.
+- **The Claude skill tree is canonical.** Codex deployment is a generated projection:
+  strip Claude-only frontmatter, add `agents/openai.yaml`, exclude `loop-refine`, and preserve
+  provider-neutral bodies. Keep frontmatter descriptions within Codex's 1024-character limit
+  and free of `<` / `>`. Never hand-maintain a second source tree. A non-managed skill-name
+  collision must stop with a recovery command instead of overwriting user content.
+- **`LOOP_CODEX_NETWORK` controls only Codex shell-sandbox networking.** It does not disable
+  MCP servers, connected apps, or hosted search exposed by the Codex client. Treat those as
+  separate environment capabilities.
 
-## Concurrent Claude Code sessions
+## Concurrent Claude Code and Codex sessions
 
-Multiple Claude Code sessions may work in this repo at the same time. Assume a peer session could
-be mid-implementation on the very files you are about to touch — do not destroy its work.
+Multiple Claude Code and Codex sessions may work in this repo at the same time. Assume a peer
+session could be mid-implementation on the very files you are about to touch — do not destroy
+its work.
 
 **Detect before you edit** shared files (`bin/loop.sh`, `bin/evaluate.sh`, `tests/**`, `kit/**`):
 

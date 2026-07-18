@@ -6,7 +6,8 @@
 #   1. contract immutability (hash vs --approved-hash from loop.sh's MEMORY,
 #      checked BEFORE sourcing config; .loop/approved is only a fallback for
 #      standalone runs — the agent can forge that file) -> NEEDS_SPEC_DECISION
-#   2. harness paths touched (loop.sh / loop.models.sh / .claude/**)            -> RISK_REQUIRES_APPROVAL
+#   2. harness paths touched (loop.sh / loop.models.sh / provider control trees)
+#                                                                                -> RISK_REQUIRES_APPROVAL
 #   3. denied paths touched                                                     -> RISK_REQUIRES_APPROVAL
 #   4. escalate paths touched                                                   -> NEEDS_ARCHITECTURE_DECISION
 #   5. verification commands re-run by the evaluator itself (or, with
@@ -164,9 +165,10 @@ contract_ac_hash() { # $1 AC id, $2 checklist expectation fallback
   fi
 }
 
-product_tree_hash() { # committed product state, excluding tracked loop memory
+product_tree_hash() { # committed product state, excluding tracked harness bookkeeping
   git ls-tree -r HEAD 2>/dev/null \
-    | awk -F '\t' '$2 !~ /^\.loop\// && $2 !~ /^\.claude\//' \
+    | awk -F '\t' '$2 !~ /^\.loop\// && $2 !~ /^\.claude\// \
+        && $2 !~ /^\.agents\// && $2 !~ /^\.codex\//' \
     | sha256
 }
 
@@ -374,7 +376,7 @@ fi
 # harness files the agent must never touch (tracked in git, so the diff sees them;
 # the untracked .loop/bin half and any gitignored session config are covered by
 # loop.sh's in-memory hash baselines)
-HARNESS_PATHS="loop.sh loop.models.sh fleet.sh fleet.config.sh .mcp.json .claude/** .codex/**"
+HARNESS_PATHS="loop.sh loop.models.sh fleet.sh fleet.config.sh .mcp.json .claude/** .agents/** .codex/**"
 
 # ---------- changed paths in this iteration (tracked diff + untracked, minus .loop) ----------
 changed=""
@@ -687,17 +689,29 @@ EOF
       [ -n "$aid" ] || continue
       case "$ev" in
         *.loop/observations/*)
-          # First relative observations token at a path boundary; absolute or
-          # prefixed aliases do not match. Trailing prose punctuation is stripped.
-          # Boundary set (start, whitespace, '(', '[', markdown backtick) is
-          # shared with loop.sh's observation_tokens() — both sides must parse
-          # a citation identically.
-          obs=$(printf '%s\n' "$ev" \
-                | grep -oE '(^|[[:space:]([`])\.loop/observations/[^[:space:]|]+' | head -1 \
+          # ALL distinct observation tokens at a path boundary; absolute or
+          # prefixed aliases do not match. This grep/sed pair must stay
+          # byte-identical to loop.sh's observation_tokens() — the suite's
+          # parser-sync check greps both files for the literal. The strict
+          # char class ends a token at any non-path byte (incl. CJK
+          # punctuation) instead of merging prose into the path.
+          obs_all=$(printf '%s\n' "$ev" \
+                | grep -oE '(^|[[:space:]([`])\.loop/observations/[A-Za-z0-9_./-]*[A-Za-z0-9_-]' \
                 | sed -E 's/^[[:space:]([`]//' \
-                | sed -E 's|[^A-Za-z0-9_./-]+$||' || true)
-          if ! validate_observation "$aid" "$obs" "$expectation"; then
-            bad_runs="$bad_runs $aid($OBS_REASON)"
+                | LC_ALL=C sort -u || true)
+          obs_n=$(printf '%s\n' "$obs_all" | grep -c . || true)
+          if [ "$obs_n" -gt 1 ]; then
+            # singleton canonical citation: the manifest stamp and the gate's
+            # report validator bind exactly ONE artifact per row, so a second
+            # literal path (usually a superseded capture kept for history)
+            # would deadlock at the terminal evidence gate — refuse EARLY,
+            # with the fix in the reason
+            bad_runs="$bad_runs $aid(cites $obs_n observation paths — cite exactly one: keep the canonical stamped path and drop the .loop/observations/ prefix from superseded mentions)"
+          else
+            obs="$obs_all"
+            if ! validate_observation "$aid" "$obs" "$expectation"; then
+              bad_runs="$bad_runs $aid($OBS_REASON)"
+            fi
           fi
           ;;
         *last-verify.log*) : ;;   # probe output cited in the gate's own log

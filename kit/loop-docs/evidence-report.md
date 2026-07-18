@@ -20,7 +20,11 @@
 
 <!-- When .loop/docs/acceptance-checklist.md is filled in, mirror its final
      state here. For `run` rows name the observation artifact
-     (.loop/observations/...) that proves the behavior was actually seen. -->
+     (.loop/observations/...) that proves the behavior was actually seen —
+     each row's SINGLE literal path, byte-for-byte as the checklist cites it.
+     Every .loop/observations/ literal in this report is validated against
+     the checklist and the evaluator manifest; mention superseded captures
+     prefix-less (iter2-AC-xxx-probe.log), never in full path form. -->
 
 | AC | REQ | Expectation | Method | Status | Evidence |
 |---|---|---|---|---|---|

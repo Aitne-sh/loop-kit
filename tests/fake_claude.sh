@@ -829,6 +829,13 @@ EOF
     if [ "${LOOP_FAKE_EVIDENCE:-}" = "BAD_REPORT_REF" ]; then
       echo '- .loop/observations/not-in-checklist.log' >> .loop/docs/evidence-report.md
     fi
+    if [ "${LOOP_FAKE_EVIDENCE:-}" = "BAD_THEN_GOOD" ] && [ ! -f .loop/fake-evidence-bad-sent ]; then
+      # first call only: invent a non-checklist citation so the harness's
+      # report validator rejects this report; the regeneration (which carries
+      # rejected='...' in its prompt) must come out clean
+      : > .loop/fake-evidence-bad-sent
+      echo '- .loop/observations/not-in-checklist.log' >> .loop/docs/evidence-report.md
+    fi
     # fleet integration gate: the harness passes merged=<id,...> and refuses a
     # master report that omits any merged task's archive — mirror the real
     # skill's per-task coverage unless a test opts into the omission
@@ -955,6 +962,25 @@ EOF
       *)
         emit_json "$cost" "STOP-EVAL: $sv - fake judgment" ;;
     esac
+    exit 0
+    ;;
+  /loop-setup*)
+    # Mimic a setup session editing the loop.models.sh COPY in the cwd (loop.sh runs
+    # us cd'd into the throwaway temp dir). LOOP_FAKE_SETUP picks the outcome:
+    #   VALID (default) routes implement->codex correctly (validator PASS);
+    #   INVALID sets a Claude-alias model on a codex role (validator REJECT);
+    #   NOOP leaves the copy untouched.
+    _sml() { # replace any (commented or live) KEY= line, append a clean KEY="value"
+      grep -vE "^#?$1=" loop.models.sh > loop.models.sh.fake 2>/dev/null || true
+      printf '%s="%s"\n' "$1" "$2" >> loop.models.sh.fake
+      mv loop.models.sh.fake loop.models.sh
+    }
+    case "${LOOP_FAKE_SETUP:-VALID}" in
+      NOOP)    : ;;
+      INVALID) _sml AGENT_IMPLEMENT codex; _sml MODEL_IMPLEMENT opus ;;
+      *)       _sml AGENT_IMPLEMENT codex; _sml MODEL_IMPLEMENT gpt-5.5 ;;
+    esac
+    emit_json "$cost" "setup: models edited (fake)"
     exit 0
     ;;
   /loop-iterate*)

@@ -107,6 +107,11 @@ GATE_RETRY_N=2             # when the GATE reviewer call itself fails (outage, n
                            # a verdict), retry up to N times with backoff before the
                            # fail-closed BLOCKED. 0 = block immediately (old behavior).
 GATE_RETRY_WAITS="60 300"  # seconds before retry 1, 2, ... (last entry repeats)
+EVIDENCE_RETRY_N=2         # regenerations of an INVALID evidence report at the gate
+                           # (content failure — the rejection reason is fed back to
+                           # the evidence agent). Tamper/authority failures never
+                           # retry. No backoff: the failure is deterministic content,
+                           # not an outage. 0 = one-shot (old behavior).
 STOP_EVAL="true"           # lightweight advisory stop evaluator each iteration
 SPLIT_NUDGE_AT=70          # fleet workers only: past this % of MAX_ITERATIONS with
                            # unmet ledger REQs, the harness nudges the agent to

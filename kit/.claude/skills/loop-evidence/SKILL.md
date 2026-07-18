@@ -1,6 +1,6 @@
 ---
 name: loop-evidence
-description: Generate .loop/docs/evidence-report.md for a completed loop run — the compressed artifact a human reviews instead of the full diff. Invoked by loop.sh when the loop reaches a reviewed success candidate; argument is baseline=<git ref> marking the task's fixed starting commit.
+description: Generate .loop/docs/evidence-report.md for a completed loop run — the compressed artifact a human reviews instead of the full diff. Invoked by loop.sh when the loop reaches a reviewed success candidate; the baseline argument names the task's fixed starting commit.
 disable-model-invocation: true
 ---
 
@@ -17,6 +17,13 @@ The skill argument contains `baseline=<ref>` — the first commit for this task 
 `logs=<path>` — the only task/run log namespace you may inspect —,
 `task=<task-id>`, and an `html=` token (`on`, `off`, or `auto`), which controls
 whether you ALSO write the HTML view (see "Write the HTML view" below).
+
+The argument may additionally carry `rejected='<reason>'`: a report generated
+earlier in this same gate was deterministically rejected for exactly that
+reason and deleted. Regenerate the FULL report, correcting precisely that
+defect — the other content requirements are unchanged, and the certification
+inputs (contract, checklist, manifest, observations) are frozen, so the fix
+is always in how the report cites them, never in editing them.
 
 At the **fleet integration gate** the argument additionally carries
 `merged=<id,id,...>` (every worker task that completed into this result —
@@ -98,7 +105,13 @@ Replace the template (remove the `<!-- TEMPLATE -->` marker):
    AC row | its REQ | method (`cmd`/`run`/`human`) | final status | evidence
    — for `run` rows name the observation artifact
    (`.loop/observations/...`) that proves it; a row without one is reported
-   as a gap, not smoothed over
+   as a gap, not smoothed over. Cite each row's single literal
+   `.loop/observations/` path byte-for-byte as the checklist cites it —
+   EVERY `.loop/observations/` literal anywhere in this report is validated
+   against the verified checklist and the evaluator manifest, so an extra
+   one (a historical capture, an invented path, a brace pattern like
+   `settings-{a,b}.png`) fails the gate. Refer to superseded captures
+   prefix-less (`iter2-AC-xxx-probe.log`), never in full path form
 4. **Starting unknowns & assumptions made** — first the unknowns the run
    STARTED with (from `.loop/docs/unknowns.md`: questions asked, deferred
    defaults, direction verdicts — so the reviewer begins where the definition

@@ -39,20 +39,34 @@ Columns:
             the code is NEVER sufficient evidence for a `run` row. An
             observation scripted into the verify gate still classifies `run` —
             cite the probe's output (in .loop/last-verify.log) as the Evidence.
+            A browser observation may ride the executing agent's own
+            browser-automation skill/MCP connector (agent browser channel);
+            if that capability is missing at runtime the loop STOPS with a
+            decision request (enable it / verify manually / revise the
+            contract) — it never silently reclassifies the row.
     human — only a human can judge it (final aesthetics). Use sparingly; the
             contract's "Human Approval Required If" must cover how the loop
             stops for it. Closure protocol: the loop stops (BLOCKED + a
             decision request naming exactly what to look at); the human looks,
-            edits the row to `verified` themselves (a note in Evidence is the
-            sign-off), then `./loop.sh resume`. To request changes instead of
-            signing off, `./loop.sh resume --note '<what to adjust>'` hands the
-            findings to the next iteration.
+            then runs `./loop.sh signoff` — it lists every pending human row,
+            asks one confirm, marks them verified (the sign-off note lands in
+            Evidence) and re-certifies. Editing the row to `verified` by hand
+            (a note in Evidence is the sign-off) then `./loop.sh resume` is
+            the manual equivalent. To request changes instead of signing off,
+            `./loop.sh resume --note '<what to adjust>'` hands the findings
+            to the next iteration.
 - Status (ASCII, exactly one of): pending | verified | failed
     verified requires concrete evidence in the Evidence column; a regression
     flips a verified row back to pending/failed — hiding it only moves the
     discovery to the reviewer.
 - Evidence — what proves it: the command and its result, a path under
             .loop/observations/ (screenshot, probe log), or `-` while pending.
+            A verified `run` row must contain EXACTLY ONE literal
+            `.loop/observations/` path — the canonical stamped artifact; the
+            evaluator refuses a row citing two or more. Mention superseded or
+            historical captures WITHOUT the `.loop/observations/` prefix
+            (filename only), and never write brace patterns
+            (`settings-{a,b}.png`) — always one full literal path.
             Observation paths are evaluator-stamped in
             .loop/observations-manifest.jsonl against this AC and the current
             product tree. A later product/AC change makes unchanged evidence

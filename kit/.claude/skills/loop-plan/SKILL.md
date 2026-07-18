@@ -47,7 +47,13 @@ Rules:
   repo in a passing state (the rule below still wins), schedule the milestones
   that exercise the riskiest decisions and feasibility unknowns EARLIEST — if
   the run is going to need a human decision, fail fast while iteration budget
-  remains.
+  remains. An acceptance-checklist `run` row recorded in unknowns.md as
+  `unproven — agent-environment dependent` (an agent browser channel: the
+  executing agent's own browser skill/MCP connector) is exactly such a
+  feasibility unknown — schedule its FIRST observation attempt in an early
+  milestone so a missing capability stops the loop for the human while
+  budget remains. The plan carries such checks as proposals: never silently
+  reclassify, weaken, or drop them because the channel might be unavailable.
 - The plan is **mutable**: later iterations may and should revise it as they learn.
   The contract is **immutable**: never edit it here.
 - Break the work into **small milestones**, each independently verifiable and

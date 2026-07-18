@@ -56,7 +56,11 @@ template — the master run's record is authoritative.
 ## Feasibility probes
 
 <!-- Time-boxed spikes run under .loop/spike/ (removed afterwards): what was
-     probed, the observed result, what it changed in the contract. "None". -->
+     probed, the observed result, what it changed in the contract. An
+     acceptance row bound to the executing agent's own browser skill/MCP
+     connector (agent browser channel) is recorded here WITHOUT a spike:
+     "AC-NNN: unproven — agent-environment dependent; the loop stops with a
+     decision request if the capability is missing at runtime". "None". -->
 
 ## Deferred with defaults
 

@@ -16,8 +16,8 @@ The skill argument (if any) is the human's opening note about what to change.
 ## Hard boundaries (never cross these)
 
 - **The contract is immutable.** Never edit `.loop/docs/product-contract.md`,
-  `loop.config.sh`, `loop.models.sh`, `loop.sh`, anything under `.claude/` or
-  `.loop/bin/`, or any `DENIED_PATHS`.
+  `loop.config.sh`, `loop.models.sh`, `loop.sh`, anything under `.claude/`,
+  `.agents/`, `.codex/`, or `.loop/bin/`, or any `DENIED_PATHS`.
 - **Touch only reversible, within-contract knobs** — the tunable constants the
   decision request calls out (e.g. drift/rate/amplitude/exponent parameters), and
   only those. Keep every change small and trivially reversible.
@@ -26,15 +26,17 @@ The skill argument (if any) is the human's opening note about what to change.
   These are what the contract froze.
 - **Never mark a `human` acceptance row `verified` yourself, never write
   `.loop/agent-state`, never declare a loop state, never run the success gate.**
-  The human signs off (via `./loop.sh refine`'s confirm, or by editing the row);
-  the closing `./loop.sh resume` re-runs the evaluator and the independent reviewer.
+  The human signs off (via `./loop.sh refine`'s confirm, `./loop.sh signoff`, or
+  by editing the row); the closing `./loop.sh resume` re-runs the evaluator and
+  the independent reviewer.
 
 If the human asks for something that would **remove or change a REQUIRED behavior**
 (a verified AC, a REQ, or a Non-goal) — for example deleting an element the contract
 mandates — **stop and say so plainly**: that is a *contract change*, not a tweak.
-Tell them to end this session (Ctrl-C / `/exit`) and run `/loop-contract` to revise
-and re-approve the contract; the loop will then implement it. Do not do it here, and
-do not re-litigate a decision the contract already settled.
+Tell them to end this session (Ctrl-C / `/exit`) and run the contract skill
+(Claude Code: `/loop-contract`; Codex: `$loop-contract`) to revise and re-approve
+the contract; the loop will then implement it. Do not do it here, and do not
+re-litigate a decision the contract already settled.
 
 ## What to do
 
@@ -61,8 +63,9 @@ that, briefly remind them of the two exits:
 
 - **Happy** → `./loop.sh refine` will offer to sign off the `human` row(s) and run
   `./loop.sh resume` to re-certify (or they mark the rows `verified` and resume).
-- **Needs a contracted behavior changed** → that's `/loop-contract`, then
-  `./loop.sh approve` — not a resume note.
+- **Needs a contracted behavior changed** → use the contract skill (Claude Code:
+  `/loop-contract`; Codex: `$loop-contract`), then `./loop.sh approve` — not a
+  resume note.
 
 Leave the working tree with your reversible tweaks in place and tests green; the
 closing resume verifies and certifies. Do not commit, and do not run the gate.

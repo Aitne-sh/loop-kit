@@ -105,9 +105,10 @@ evaluator manifest stamp still matches this contract and product tree.
 - Otherwise pick the single next incomplete milestone from the plan. Implement
   only that. Smallest change that advances the goal; no unrelated refactoring.
 - **The contract is immutable.** Never edit `.loop/docs/product-contract.md`,
-  `loop.config.sh`, `loop.models.sh`, `loop.sh`, or anything under `.claude/` or
-  `.loop/bin/`. Never touch DENIED_PATHS. Avoid ESCALATE_PATHS — if the milestone
-  genuinely requires them (e.g. a new dependency), stop and escalate (step 5).
+  `loop.config.sh`, `loop.models.sh`, `loop.sh`, or anything under `.claude/`,
+  `.agents/`, `.codex/`, or `.loop/bin/`. Never touch DENIED_PATHS. Avoid
+  ESCALATE_PATHS — if the milestone genuinely requires them (e.g. a new
+  dependency), stop and escalate (step 5).
 - If you discover the contract itself is wrong, contradictory, or must change to
   proceed — or the situation matches the contract's
   `## Human Approval Required If` section: stop implementing, write a decision
@@ -148,7 +149,14 @@ actually running the artifact and observing the behavior — launch the
 app/probe, watch the expectation hold, and save the observation artifact
 (screenshot, probe log; name it `iter<N>-AC-xxx-*`) under
 `.loop/observations/` (create the directory if needed), recording its path
-in the row's Evidence column. **Reading your own code is never evidence for
+in the row's Evidence column. The cell must contain EXACTLY ONE literal
+`.loop/observations/` path — the canonical artifact the evaluator stamps;
+a second literal path (even an honest historical one) makes the evaluator
+refuse the row. When you recapture, REPLACE the old path — never append the
+new one alongside it; if you mention prior captures at all, write them
+prefix-less (`iter2-AC-xxx-probe.log`, not the full path). Never write
+brace patterns (`settings-{a,b}.png`) — one full literal path.
+**Reading your own code is never evidence for
 a `run` row** — "the wiring looks correct" is exactly how a migration that
 renders nothing gets certified. If observation is impossible this iteration
 (channel broken, environment missing), leave the row `pending` and record
@@ -160,21 +168,44 @@ write a decision request naming the row and the broken premise, and declare
 `NEEDS_SPEC_DECISION <AC-xxx observation channel unusable>`. The verification
 method is part of the approved definition, so re-deciding it is the human's
 call — stalling on an unclosable row until the budget runs out only buries
-the real cause. If the ONLY rows still not `verified`
+the real cause. For a `run` row bound to the agent browser channel (the
+observation is YOU driving a browser through your own browser-automation
+skill or MCP connector — the contract proposed it knowing this session
+might lack it), the capability being ABSENT — the tool is not available
+in this session, or invoking it is denied — counts as channel-unusable
+IMMEDIATELY, on the first attempt of the first iteration that needs it:
+do not leave the row `pending` across iterations hoping the skill appears
+(availability cannot change without human action), and never silently
+reclassify the row or "verify" it another way. That decision request
+names the row, the missing capability, and the human's options: enable
+the browser skill/connector and `./loop.sh resume`; verify the
+expectation manually and sign it off like a `human` row; or revise the
+contract to reclassify the row. A browser check that RUNS but shows the
+expectation failing is normal iteration feedback — fix and continue;
+only a channel malfunction that resists your in-iteration attempts
+(cannot attach, connector errors out) is treated like the
+absent-capability case. If the ONLY rows still not `verified`
 are method `human`, the loop cannot close them itself: write a decision
 request describing exactly what the human must look at (link your
 observation artifacts) and declare `BLOCKED <awaiting human verification>`
-instead of iterating further. When the sign-off may need small reversible
+instead of iterating further. End that decision request with the exact
+commands the human can type verbatim — approval: `./loop.sh signoff`
+(signs every pending `human` row and re-certifies); change request:
+`./loop.sh resume --note '<what to adjust>'` — so the stop never says
+"sign AC-xxx" without saying how. When the sign-off may need small reversible
 tuning first, note that the human can adjust knobs live with
 `./loop.sh refine` before signing off — but keep listing which reversible
 constants are safe to tune (that is what refine acts on); a change that would
-alter a REQUIRED behavior remains a contract change (`/loop-contract`), never a
-refine tweak.
+alter a REQUIRED behavior remains a contract change (Claude Code:
+`/loop-contract`; Codex: `$loop-contract`), never a refine tweak.
 
 Observation evidence is contract-scoped and can survive a fresh retry, but it
 is automatically invalidated when the relevant AC anchor or product tree has
 changed. If the evaluator reports `evidence stale`, run the artifact again and
 capture new evidence; never relabel or copy an old artifact as a substitute.
+A recapture REPLACES the cited path in the Evidence cell — keep prior
+captures' names prefix-less if you mention them at all, so the row always
+cites exactly one literal `.loop/observations/` path.
 Prefer capturing `run` evidence after the implementation has stabilized,
 because any later product commit intentionally invalidates the capture.
 

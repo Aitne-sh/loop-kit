@@ -6,7 +6,8 @@
 #   loop.config.sh       contract stop conditions (hash-approved, never sourced unverified)
 #   loop.models.sh       agent/model routing per role (safe-parsed, never sourced)
 #   loop-instruction.md  optional: your task instruction for `./loop.sh` auto flow
-#   .claude/skills/      loop-* skills (the encoded process)
+#   .claude/skills/      canonical loop-* skills for Claude Code
+#   .agents/skills/      generated Codex projection (managed loop-* skills)
 #   .loop/               everything else: bin/evaluate.sh, docs/ (contract, plan,
 #                        progress, drift, evidence, decisions), logs, journal, state,
 #                        kit-source (where this was deployed from, for `update`)
@@ -17,9 +18,10 @@
 # worktrees/branches — restoring the project to its pre-kit layout (confirmed).
 #
 # The kit's own files (loop.sh, loop.config.sh, loop.models.sh, loop-instruction.md,
-# .claude/skills/loop-*/) are auto-appended to the project's .gitignore on `init` and
-# before each run, so the loop's own `git add -A` never commits the harness into your
-# project. .loop/ is self-ignored except docs/ (the tracked, auditable loop memory).
+# .claude/skills/loop-*/, .agents/skills/loop-*/) are auto-appended to the
+# project's .gitignore on `init` and before each run, so the loop's own
+# `git add -A` never commits the harness into your project. .loop/ is
+# self-ignored except docs/ (the tracked, auditable loop memory).
 #
 # A loop = trigger -> verifiable goal -> execution -> per-iteration review ->
 # external verification -> named stop state. The agent's self-report is never
@@ -108,7 +110,7 @@ fi
 
 usage() {
   cat <<'EOF'
-loop — run Claude Code as a contract-driven loop. Define what "done" means,
+loop — run Claude Code and/or Codex as a contract-driven loop. Define what "done" means,
 approve it, then let it iterate. Parallel work fans out to a fleet of task
 loops in isolated git worktrees.
 
@@ -120,6 +122,9 @@ DEFINE & APPROVE
   start <instr|file>    Define a loop interactively — you approve / revise / exit
   auto [instr|file]     Define + approve + run, fully autonomous (assumptions
                         recorded, not asked; stops only for escalations)
+  setup [--app claude|codex]
+                        Tune agents/models per phase (loop.models.sh) in an isolated,
+                        validated session — takes effect immediately, no re-approval
   approve               Approve the contract, config and harness (records hashes)
   contract-review       Independent read-only review of the loop definition
                         (auto/fleet run it before any unattended approval;
@@ -140,6 +145,10 @@ RUN
                         to adjust reversible within-contract knobs and preview live.
                         End it (Ctrl-C / /exit), then confirm to sign off + re-certify.
                         For a REQUIRED-behavior change use /loop-contract, not this.
+  signoff [--yes]       At a human sign-off gate (BLOCKED): list every pending 'human'
+                        acceptance row, confirm once, mark them verified and re-certify.
+                        All-or-nothing — to request changes instead:
+                        resume --note '<what to adjust>'
   watch [--interval s] [--max-runs n]
                         Re-run `run` on an interval until success or escalation
 
@@ -209,9 +218,11 @@ print_next_actions() {
       echo " This run is paused. Pick the path that matches your situation:"
       echo
       echo " ▸ Paused for HUMAN sign-off and it looks right → finish:"
-      echo "     mark the 'human' row(s) 'verified' in .loop/docs/acceptance-checklist.md,"
-      echo "     then:  ./loop.sh resume       (the evaluator re-checks the cmd/run rows and an"
-      echo "                                    independent reviewer certifies SUCCESS)"
+      echo "     ./loop.sh signoff             lists the pending 'human' row(s); you confirm once —"
+      echo "                                   it signs them and re-certifies (the evaluator re-checks"
+      echo "                                   the cmd/run rows; an independent reviewer certifies SUCCESS)"
+      echo "     (or by hand: mark the 'human' row(s) 'verified' in"
+      echo "      .loop/docs/acceptance-checklist.md, then ./loop.sh resume)"
       echo
       echo " ▸ Tweak WITHIN the contract (amount of motion, speed of a swirl — reversible knobs):"
       echo "     ./loop.sh refine '<what to change>'          interactive: adjust + preview live  (recommended)"
@@ -238,8 +249,9 @@ print_next_actions() {
     refine-exit)
       echo " Interactive refine session ended."
       echo
-      echo " ▸ Satisfied → sign off the 'human' row(s) 'verified' in"
-      echo "     .loop/docs/acceptance-checklist.md, then:  ./loop.sh resume   (re-verifies + certifies)"
+      echo " ▸ Satisfied → ./loop.sh signoff   (signs the 'human' row(s) + re-certifies)"
+      echo "     or by hand: mark them 'verified' in .loop/docs/acceptance-checklist.md,"
+      echo "     then:  ./loop.sh resume   (re-verifies + certifies)"
       echo
       echo " ▸ Need a REQUIRED behavior changed (a verified AC / a REQ)? That is a contract change:"
       echo "     /loop-contract → ./loop.sh approve      (not 'resume --note')"
@@ -447,14 +459,111 @@ contract_hash() {
   cat .loop/docs/product-contract.md loop.config.sh 2>/dev/null | sha256
 }
 
+CODEX_SKILL_MARKER=".loop-kit-managed"
+
+codex_skill_names() {
+  printf '%s\n' \
+    loop-contract \
+    loop-contract-review \
+    loop-decompose \
+    loop-decompose-review \
+    loop-evidence \
+    loop-iterate \
+    loop-plan \
+    loop-review \
+    loop-setup \
+    loop-stop-eval \
+    loop-supervise
+}
+
+codex_skill_supported() {
+  case "${1:-}" in
+    loop-contract|loop-contract-review|loop-decompose|loop-decompose-review|\
+    loop-evidence|loop-iterate|loop-plan|loop-review|loop-setup|loop-stop-eval|loop-supervise)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+codex_skill_implicit() {
+  case "${1:-}" in
+    loop-contract|loop-plan) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+hash_emit_file() { # $1 stable label, $2 file
+  [ -f "$2" ] || return 0
+  printf 'file:%s\n' "$1"
+  cat "$2"
+  printf '\n'
+}
+
+hash_emit_tree() { # $1 root, $2 root-relative tree; files/links in path order
+  local root="$1" rel="$2" tree="$1/$2" f
+  [ -d "$tree" ] || return 0
+  find "$tree" \( -type f -o -type l \) -print | LC_ALL=C sort | while IFS= read -r f; do
+    if [ -L "$f" ]; then
+      printf 'link:%s\n' "${f#"$root"/}"
+      readlink "$f"
+      printf '\n'
+    else
+      hash_emit_file "${f#"$root"/}" "$f"
+    fi
+  done
+}
+
+hash_emit_managed_skills() { # $1 root, $2 .claude/skills|.agents/skills, $3 require marker
+  local root="$1" rel="$2" require_marker="$3" d
+  for d in "$root/$rel"/loop-*/; do
+    [ -d "$d" ] || continue
+    if [ "$require_marker" = 1 ] && [ ! -f "$d/$CODEX_SKILL_MARKER" ]; then
+      continue
+    fi
+    hash_emit_tree "$root" "${d#"$root"/}"
+  done
+}
+
+codex_projection_problem() { # $1 root -> first missing/invalid managed path
+  local root="$1" name dir expected
+  for name in $(codex_skill_names); do
+    dir="$root/.agents/skills/$name"
+    [ -d "$dir" ] || { printf '%s' "$dir"; return 1; }
+    [ -f "$dir/$CODEX_SKILL_MARKER" ] \
+      || { printf '%s' "$dir/$CODEX_SKILL_MARKER"; return 1; }
+    [ -f "$dir/SKILL.md" ] || { printf '%s' "$dir/SKILL.md"; return 1; }
+    [ -f "$dir/agents/openai.yaml" ] \
+      || { printf '%s' "$dir/agents/openai.yaml"; return 1; }
+    if codex_skill_implicit "$name"; then expected=true; else expected=false; fi
+    grep -qF "allow_implicit_invocation: $expected" "$dir/agents/openai.yaml" \
+      || { printf '%s' "$dir/agents/openai.yaml"; return 1; }
+  done
+  return 0
+}
+
+require_codex_projection() { # $1 root (default .)
+  local root="${1:-.}" problem=""
+  problem=$(codex_projection_problem "$root") && return 0
+  die_next "Codex skill projection is missing or invalid: $problem" \
+    "run ./loop.sh update, or redeploy it: <kit>/bin/loop.sh init ."
+}
+
 harness_hash() {
   {
-    cat "$SELF" "$EVALUATOR" 2>/dev/null
-    cat .claude/skills/loop-*/SKILL.md 2>/dev/null
+    hash_emit_file "loop.sh" "$SELF"
+    hash_emit_file ".loop/bin/evaluate.sh" "$EVALUATOR"
+    # Skill directories are recursive: future references/scripts/assets and the
+    # Codex metadata/ownership marker are approval-bound, not only SKILL.md.
+    hash_emit_managed_skills "." ".claude/skills" 0
+    hash_emit_managed_skills "." ".agents/skills" 1
     # session config that changes what FUTURE agent sessions may do (permission
     # allowlists, MCP servers). These are often gitignored by the project, so
     # the evaluator's diff policy cannot see them — only this hash can.
-    cat .claude/settings.json .claude/settings.local.json .mcp.json .codex/config.toml 2>/dev/null || true
+    hash_emit_file ".claude/settings.json" ".claude/settings.json"
+    hash_emit_file ".claude/settings.local.json" ".claude/settings.local.json"
+    hash_emit_file ".mcp.json" ".mcp.json"
+    # Codex project control is a tree (config, hooks, rules and future assets).
+    hash_emit_tree "." ".codex"
   } | sha256
 }
 
@@ -632,7 +741,7 @@ verify_approval() { # dies unless both hashes match the approved ones
   [ -f .loop/approved-harness ] \
     || die "harness approval record missing (.loop/approved-harness) — re-approve: ./loop.sh approve"
   if [ "$(cat .loop/approved-harness)" != "$(harness_hash)" ]; then
-    die "harness or session config changed since approval (loop.sh / evaluate.sh / skills / .claude settings / .mcp.json / .codex/config.toml) — if intentional, re-run: ./loop.sh approve"
+    die "harness or session config changed since approval (loop.sh / evaluate.sh / provider skills / .claude settings / .mcp.json / .codex/**) — if intentional, re-run: ./loop.sh approve"
   fi
   # off-tree approval store: the trust anchor BEHIND the (agent-writable) repo
   # mirrors above. The mirrors keep their checks and messages for honest, fast
@@ -847,6 +956,19 @@ load_config() {
   # turning every retry into a zero-backoff hot loop against an outage
   [ "$_wn" -ge 1 ] || [ "$GATE_RETRY_N" -eq 0 ] \
     || die_next "GATE_RETRY_WAITS must contain at least one integer (seconds)" "fix GATE_RETRY_WAITS in loop.config.sh"
+  # bounded REGENERATION of an INVALID evidence report (a content failure —
+  # the deterministic rejection reason is handed back to the next
+  # /loop-evidence call as rejected='...'). Tamper, authority-drift and
+  # post-review-diff failures never retry. 0 = one-shot (pre-retry behavior).
+  # Unlike GATE_RETRY_N the code fallback is 2, not 0: deployments that never
+  # edit their config should self-heal a formatting slip instead of dying at
+  # the terminal gate. No backoff — the failure is deterministic content, not
+  # an outage.
+  : "${EVIDENCE_RETRY_N:=2}"
+  case "$EVIDENCE_RETRY_N" in
+    *[!0-9]*) die_next "EVIDENCE_RETRY_N must be an integer 0-5" "fix EVIDENCE_RETRY_N in loop.config.sh" ;;
+  esac
+  [ "$EVIDENCE_RETRY_N" -le 5 ] || die_next "EVIDENCE_RETRY_N must be an integer 0-5" "fix EVIDENCE_RETRY_N in loop.config.sh"
   # runaway backstop for resume: max consecutive resumes that never complete an
   # iteration. Set here (not in the contract) so it is NOT part of the approval
   # hash — a pure guard, tunable between runs without re-approval.
@@ -1000,6 +1122,7 @@ need_contract_agent() { # start/auto preflight — require the CLI the DEFINITIO
     return 0
   fi
   if [ "$(configured_agent CONTRACT)" = codex ]; then
+    require_codex_projection .
     need_codex
     local model why; model=$(configured_role_model CONTRACT)
     case "$model" in
@@ -1045,7 +1168,7 @@ warn_codex_cost_untracked() {
 }
 
 need_agents() { # run/fleet preflight; each CLI is required only when routed-to
-  local scope="${1:-}" role agent model roles why
+  local scope="${1:-}" role agent model roles why codex_needed=0
   warn_unknown_agent_values
   roles="IMPLEMENT PLAN REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE"
   # Claude is not unconditional: an all-Codex routing must be able to run on a
@@ -1064,6 +1187,7 @@ need_agents() { # run/fleet preflight; each CLI is required only when routed-to
   for role in $roles; do
     agent=$(configured_agent "$role")
     [ "$agent" = codex ] || continue
+    codex_needed=1
     need_codex "$scope"
     model=$(configured_role_model "$role")
     case "$model" in
@@ -1088,6 +1212,7 @@ need_agents() { # run/fleet preflight; each CLI is required only when routed-to
         fi ;;
     esac
   done
+  [ "$codex_needed" = 0 ] || require_codex_projection .
 }
 
 resolve_effort() { # $1 optional role key (e.g. REVIEW) — echoes the effective
@@ -1125,8 +1250,8 @@ codex_effort_opt() { # $1 optional role key -> '-c model_reasoning_effort=<v>'
   [ -z "$e" ] || printf -- '-c model_reasoning_effort=%s' "$e"
 }
 
-codex_prompt() { # Claude skill invocation -> deterministic direct-file prompt
-  local prompt="$1" call skill rest=""
+codex_prompt() { # Claude skill invocation -> deterministic Codex direct-file prompt
+  local prompt="$1" call skill rest="" skill_file
   call=${prompt%% *}
   case "$call" in
     /loop-*) skill=${call#/loop-} ;;
@@ -1134,7 +1259,9 @@ codex_prompt() { # Claude skill invocation -> deterministic direct-file prompt
   esac
   case "$skill" in ''|*[!a-z-]*) printf '%s' "$prompt"; return 0 ;; esac
   [ "$call" = "$prompt" ] || rest=${prompt#"$call" }
-  printf 'Read the file .claude/skills/loop-%s/SKILL.md and execute its instructions exactly as your current task.' "$skill"
+  skill_file=".agents/skills/loop-$skill/SKILL.md"
+  [ -f "$skill_file" ] || return 1
+  printf 'Read the file %s and execute its instructions exactly as your current task.' "$skill_file"
   [ -z "$rest" ] || printf ' Treat the following as the skill arguments: %s' "$rest"
 }
 
@@ -1200,6 +1327,7 @@ ensure_loop_dir() {
 # the user's project history. (.loop/ is handled by .loop/.gitignore above,
 # which keeps only docs/ tracked.)
 LOOP_IGNORE_MARKER="# loop-kit: harness files (do not commit into your project)"
+CODEX_SKILLS_IGNORE_MARKER="# loop-kit: Codex skill projection (managed; do not commit)"
 FLEET_IGNORE_MARKER="# loop-kit: fleet files (parallel supervisor; do not commit)"
 
 ensure_gitignore() { # $1 = project dir (default: current dir). Additive + idempotent.
@@ -1228,24 +1356,34 @@ ensure_gitignore() { # $1 = project dir (default: current dir). Additive + idemp
       printf '/fleet.config.sh\n'
     } >> "$gi"
   fi
+  # Separate marker so an existing deployment whose original harness block is
+  # already present self-heals when Codex projection support is introduced.
+  if ! grep -qF "$CODEX_SKILLS_IGNORE_MARKER" "$gi" 2>/dev/null; then
+    {
+      printf '\n%s\n' "$CODEX_SKILLS_IGNORE_MARKER"
+      printf '/.agents/skills/loop-*/\n'
+    } >> "$gi"
+  fi
 }
 
 strip_gitignore_blocks() { # $1 = project dir — exact inverse of ensure_gitignore.
-  # Removes only the lines the kit's two blocks install (plus the one blank
+  # Removes only the lines the kit's three blocks install (plus the one blank
   # separator ensure_gitignore put before each marker); the user's own entries
   # and spacing are untouched. Deletes .gitignore if nothing but whitespace is left.
   local gi="$1/.gitignore" tmp
   [ -f "$gi" ] || return 0
   tmp="$gi.uninstall.$$"
-  awk -v m1="$LOOP_IGNORE_MARKER" -v m2="$FLEET_IGNORE_MARKER" '
+  awk -v m1="$LOOP_IGNORE_MARKER" -v m2="$FLEET_IGNORE_MARKER" \
+      -v m3="$CODEX_SKILLS_IGNORE_MARKER" '
     function ours(l) {
-      return l == m1 || l == m2 || l == "/loop.sh" || l == "/loop.config.sh" \
+      return l == m1 || l == m2 || l == m3 || l == "/loop.sh" || l == "/loop.config.sh" \
           || l == "/loop.models.sh" || l == "/loop-instruction.md" \
-          || l == "/.claude/skills/loop-*/" || l == "/fleet.sh" || l == "/fleet.config.sh"
+          || l == "/.claude/skills/loop-*/" || l == "/.agents/skills/loop-*/" \
+          || l == "/fleet.sh" || l == "/fleet.config.sh"
     }
     {
       if ($0 == "") { if (held) print ""; held = 1; next }   # hold one blank line
-      if (ours($0)) { if ($0 == m1 || $0 == m2) held = 0; next }  # marker eats its separator
+      if (ours($0)) { if ($0 == m1 || $0 == m2 || $0 == m3) held = 0; next }  # marker eats its separator
       if (held) { print ""; held = 0 }
       print
     }
@@ -1463,7 +1601,8 @@ normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
   local thread="" thread_escaped="" turns=0 is_error=false result_escaped="" error_line="" error_text="" error_tmp=""
   if [ -f "$raw" ]; then
     thread=$(awk '
-      $0 ~ /^[[:space:]]*\{[[:space:]]*"type"[[:space:]]*:[[:space:]]*"thread.started"/ {
+      $0 ~ /"type"[[:space:]]*:[[:space:]]*"thread.started"/ \
+        && $0 ~ /"thread_id"[[:space:]]*:/ {
         s=$0
         sub(/^.*"thread_id"[[:space:]]*:[[:space:]]*"/, "", s)
         sub(/".*$/, "", s)
@@ -1471,8 +1610,8 @@ normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
         exit
       }
     ' "$raw" 2>/dev/null || true)
-    turns=$(awk '$0 ~ /^[[:space:]]*\{[[:space:]]*"type"[[:space:]]*:[[:space:]]*"item.completed"/ { n++ } END { print n+0 }' "$raw" 2>/dev/null || true)
-    if awk '$0 ~ /^[[:space:]]*\{[[:space:]]*"type"[[:space:]]*:[[:space:]]*"(turn.failed|error)"/ { found=1; exit } END { exit !found }' "$raw" 2>/dev/null; then
+    turns=$(awk '$0 ~ /"type"[[:space:]]*:[[:space:]]*"item.completed"/ { n++ } END { print n+0 }' "$raw" 2>/dev/null || true)
+    if awk '$0 ~ /"type"[[:space:]]*:[[:space:]]*"(turn.failed|error)"/ { found=1; exit } END { exit !found }' "$raw" 2>/dev/null; then
       is_error=true
     fi
   fi
@@ -1483,7 +1622,7 @@ normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
   if [ -s "$msg" ]; then
     result_escaped=$(json_escape < "$msg")
   elif [ -f "$raw" ]; then
-    error_line=$(awk '$0 ~ /^[[:space:]]*\{[[:space:]]*"type"[[:space:]]*:[[:space:]]*"error"/ { print; exit }' "$raw" 2>/dev/null || true)
+    error_line=$(awk '$0 ~ /"type"[[:space:]]*:[[:space:]]*"error"/ { print; exit }' "$raw" 2>/dev/null || true)
     if [ -n "$error_line" ]; then
       # json_field intentionally accepts regular files only; stage this one
       # event beside the final envelope, then remove it immediately.
@@ -1547,6 +1686,10 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
     fi
     if [ "$mode" = reader ]; then
       codex_sandbox=read-only
+      # Checker roles must not auto-load project AGENTS.md as instructions.
+      # A skill may still read repository guidance explicitly as untrusted
+      # project data when it needs conventions to judge the implementation.
+      set -- "$@" -c project_doc_max_bytes=0
     else
       codex_sandbox=${LOOP_CODEX_SANDBOX:-workspace-write}
       if [ "$codex_sandbox" = workspace-write ] && [ "${LOOP_CODEX_NETWORK:-1}" = 1 ]; then
@@ -1554,7 +1697,10 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
       fi
     fi
     # Codex v0.144 exposes approval policy globally, before the exec subcommand.
-    codex_prompt_text=$(codex_prompt "$prompt")
+    if ! codex_prompt_text=$(codex_prompt "$prompt"); then
+      die_next "Codex skill required by '${prompt%% *}' is missing from .agents/skills" \
+        "run ./loop.sh update, or redeploy it: <kit>/bin/loop.sh init ."
+    fi
     CLAUDE_RESUME_SESSION=""   # consume any stray Claude-only one-shot
     launch_agent "$CODEX_CMD" --ask-for-approval never exec --json \
       -o "$msg" \
@@ -1863,7 +2009,7 @@ check_harness() { # $1 when — compares against the run's IN-MEMORY baselines, 
   # forged .loop/approved-harness (agent-writable) cannot defeat this check.
   # RISK_REQUIRES_APPROVAL (exit 3): human decision; watch must not retry this.
   if [ "$(harness_hash)" != "$RUN_HARNESS_HASH" ]; then
-    finish RISK_REQUIRES_APPROVAL "harness or session config changed $1 (loop.sh/evaluate.sh/skills/.claude settings/.mcp.json/.codex/config.toml) — possible tampering; review the change, then ./loop.sh approve if intentional"
+    finish RISK_REQUIRES_APPROVAL "harness or session config changed $1 (loop.sh/evaluate.sh/provider skills/.claude settings/.mcp.json/.codex/**) — possible tampering; review the change, then ./loop.sh approve if intentional"
   fi
   if [ "$(models_hash)" != "$RUN_MODELS_HASH" ]; then
     finish RISK_REQUIRES_APPROVAL "loop.models.sh or fleet.config.sh changed $1 — these files are gitignored (invisible to the diff policy), so a mid-run change can only come from inside the loop; review it, revert if unintended, then re-run"
@@ -2023,7 +2169,8 @@ EOF
 }
 
 iter_diff_lines() { # $1 base ref -> changed lines (adds+dels) vs HEAD, excluding harness bookkeeping
-  git diff --numstat "$1" HEAD -- . ':(exclude).loop' ':(exclude).claude' 2>/dev/null \
+  git diff --numstat "$1" HEAD -- . \
+    ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' 2>/dev/null \
     | awk '{ if ($1 != "-") s += $1; if ($2 != "-") s += $2 } END { print s+0 }'
 }
 
@@ -2046,9 +2193,11 @@ run_review() { # $1 iter, $2 diff-base-ref, $3 mode (interim|gate), $4 scope (it
   REVIEW_VERDICT="SKIPPED"
   REVIEW_SCOPE=""
   local mode="${3:-interim}" scope="${4:-iter}" extra="${5:-}" res="" verdict="" base_prompt prompt label vpat vhint
-  # harness bookkeeping (.loop/docs, .claude) is excluded: the reviewer judges the
-  # project change only, and must never penalize the loop's own progress notes
-  git diff "$2" HEAD -- . ':(exclude).loop' ':(exclude).claude' > .loop/review-diff.patch 2>/dev/null \
+  # Harness/control bookkeeping is excluded: the reviewer judges the project
+  # change only, and must never penalize provider configuration or loop memory.
+  git diff "$2" HEAD -- . \
+    ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' \
+    > .loop/review-diff.patch 2>/dev/null \
     || : > .loop/review-diff.patch
   if [ ! -s .loop/review-diff.patch ]; then
     if [ "$mode" != "gate" ]; then return 0; fi
@@ -2393,8 +2542,9 @@ observation_tokens() { # stdin -> supported observation path tokens
   # Path-boundary anchored (start of line, whitespace, '(', '[' or a markdown
   # backtick): '/tmp/.loop/observations/x' or '../.loop/observations/x' must
   # NOT normalize to the canonical token — a report could then display one
-  # path while validation binds a different file. Keep this boundary set in
-  # sync with evaluate.sh's 6.6(e) evidence-cell parser.
+  # path while validation binds a different file. This grep/sed pair must stay
+  # byte-identical to evaluate.sh's 6.6(e) evidence-cell parser — the suite's
+  # parser-sync check greps both files for the literal.
   grep -oE '(^|[[:space:]([`])\.loop/observations/[A-Za-z0-9_./-]*[A-Za-z0-9_-]' 2>/dev/null \
     | sed -E 's/^[[:space:]([`]//' \
     | LC_ALL=C sort -u || true
@@ -2411,6 +2561,34 @@ checklist_observation_paths() { # verified run-row artifact paths only
       if (m == "run" && st == "verified") print ev
     }
   ' .loop/docs/acceptance-checklist.md 2>/dev/null | observation_tokens
+}
+
+checklist_multi_run_rows() { # verified run rows citing 2+ distinct paths -> " AC-xxx(N)"
+  # The evaluator's 6.6(e) refuses these at iteration time, but §6.6 does not
+  # run in --final mode and the gate's authority snapshot is taken only after
+  # review — a checklist regressing to a multi-path cell inside that window
+  # would otherwise surface as an unexplainable report-validation failure.
+  # The manifest stamps exactly ONE artifact per row, so this is the last
+  # deterministic point where the defect can be named actionably.
+  [ -f .loop/docs/acceptance-checklist.md ] || return 0
+  local id ev n out=""
+  while IFS='	' read -r id ev; do
+    [ -n "$id" ] || continue
+    n=$(printf '%s\n' "$ev" | observation_tokens | grep -c . || true)
+    [ "$n" -gt 1 ] && out="$out $id($n)"
+  done <<EOF
+$(awk -F'|' '
+  /^\|[[:space:]]*AC-[0-9]+[[:space:]]*\|/ {
+    id=$2; m=$5; st=$6; ev=$7
+    gsub(/^[ \t]+|[ \t]+$/, "", id)
+    gsub(/^[ \t]+|[ \t]+$/, "", m)
+    gsub(/^[ \t]+|[ \t]+$/, "", st)
+    gsub(/^[ \t]+|[ \t]+$/, "", ev)
+    if (m == "run" && st == "verified") print id "\t" ev
+  }
+' .loop/docs/acceptance-checklist.md 2>/dev/null)
+EOF
+  printf '%s' "$out"
 }
 
 supported_observation_path() { # strict lexical + filesystem check; no symlink traversal
@@ -2517,11 +2695,107 @@ EOF
   return 0
 }
 
+run_evidence_step() { # $1 single|fleet, $2 journal label, $3 call-label prefix,
+  # $4 /loop-evidence arg tail, $5 authority-before hash, $6 reviewed ref,
+  # $7 integration evidence ids (fleet only).
+  # Shared by the single-task success gate and the fleet integration gate:
+  # generate the evidence report, freeze-check every certification input, and
+  # validate the report — regenerating up to EVIDENCE_RETRY_N times when the
+  # only failure is the report's own CONTENT (validate_current_evidence_report,
+  # or a master report omitting a merged task's archive), with the
+  # deterministic rejection reason handed to the next /loop-evidence call.
+  # SECURITY failures (harness tamper, authority drift, post-review product
+  # changes, a failed agent call) keep their immediate finish BLOCKED,
+  # byte-identical to the pre-retry messages. Sets EVIDENCE_CALL_LABEL to the
+  # successful attempt's call label for record_html_decision.
+  local gate="$1" jlabel="$2" lprefix="$3" ptail="$4" auth_before="$5" reviewed_ref="$6" ids="${7:-}"
+  local attempt=0 max="$EVIDENCE_RETRY_N" fb label auth_after evidence_diff mid suffix bad
+  # a multi-path run row is a CHECKLIST defect, not a report defect: the
+  # evidence agent may not touch certification inputs, so feeding it back
+  # would burn every retry on an unfixable report. Name the rows and the fix.
+  # This is also the only deterministic guard inside the gate window — the
+  # evaluator's 6.6(e) singleton check does not run in --final mode.
+  bad=$(checklist_multi_run_rows)
+  [ -z "$bad" ] || finish BLOCKED "acceptance checklist run row(s) cite multiple observation paths:$bad — keep exactly one canonical .loop/observations/ path per row (mention superseded captures without the path prefix), then ./loop.sh resume"
+  while :; do
+    label="$lprefix"
+    [ "$attempt" -eq 0 ] || label="$lprefix-r$attempt"
+    rm -f .loop/docs/evidence-report.md
+    fb=""
+    [ "$attempt" -eq 0 ] || fb=" rejected='$EVIDENCE_REPORT_REASON'"
+    if [ "$gate" = fleet ]; then
+      note "generating the master evidence report (/loop-evidence, $MODEL_EVIDENCE)${fb:+ — regeneration $attempt/$max}"
+    else
+      note "generating evidence report (/loop-evidence, $MODEL_EVIDENCE)${fb:+ — regeneration $attempt/$max}"
+    fi
+    if ! run_claude "$label" "/loop-evidence $ptail$fb" "$MODEL_EVIDENCE" full EVIDENCE; then
+      if [ "$gate" = fleet ]; then
+        finish BLOCKED "evidence generation failed — cannot certify the merged result without evidence${AGENT_FAIL_DIAG:+ ($AGENT_FAIL_DIAG)}"
+      fi
+      finish BLOCKED "evidence generation failed — cannot certify success without evidence${AGENT_FAIL_DIAG:+ ($AGENT_FAIL_DIAG)}"
+    fi
+    if [ "$gate" = fleet ]; then
+      check_harness "during integration evidence"
+      auth_after=$(integration_authority "$ids") \
+        || finish BLOCKED "could not re-check integration certification inputs"
+      [ "$auth_after" = "$auth_before" ] \
+        || finish BLOCKED "integration evidence changed certification inputs after review (contract/ledger/checklist/verdicts/manifest/observations/worker archives)"
+    else
+      check_harness "during evidence generation"
+      auth_after=$(certification_inputs_hash) \
+        || finish BLOCKED "could not re-check certification inputs after evidence generation"
+      [ "$auth_after" = "$auth_before" ] \
+        || finish BLOCKED "evidence step changed certification inputs after review (contract/ledger/checklist/verdicts/manifest/observations)"
+    fi
+    # cumulative vs the reviewed ref, so attempt-1 residue is still caught
+    # even when a later attempt's own delta is clean
+    evidence_diff=$(post_review_product_changes "$reviewed_ref")
+    if [ -n "$evidence_diff" ]; then
+      if [ "$gate" = fleet ]; then
+        finish BLOCKED "evidence step changed code after the integration review (unreviewed): $(echo "$evidence_diff" | tr '\n' ' ')"
+      fi
+      finish BLOCKED "evidence step changed code after review (unreviewed): $(echo "$evidence_diff" | tr '\n' ' ')"
+    fi
+    if validate_current_evidence_report; then
+      EVIDENCE_REPORT_REASON=""
+      if [ "$gate" = fleet ]; then
+        # the master report must close over every merged worker's archived
+        # evidence — a report silently omitting a worker would certify
+        # SUCCESS over evidence nobody surfaced to the human. An omission is
+        # report CONTENT, so it is retryable like any validation failure.
+        for mid in $ids; do
+          if ! grep -Fq "run-archive/$mid" .loop/docs/evidence-report.md; then
+            EVIDENCE_REPORT_REASON="integration evidence report omits merged task $mid — it must cover .loop/docs/run-archive/$mid"
+            break
+          fi
+        done
+      fi
+      if [ -z "$EVIDENCE_REPORT_REASON" ]; then
+        EVIDENCE_CALL_LABEL="$label"
+        return 0
+      fi
+    fi
+    if [ "$attempt" -ge "$max" ]; then
+      suffix=""
+      [ "$max" -eq 0 ] || suffix=" (after $((attempt + 1)) generation attempts)"
+      if [ "$gate" = fleet ]; then
+        finish BLOCKED "current integration evidence report is invalid: $EVIDENCE_REPORT_REASON$suffix"
+      fi
+      finish BLOCKED "current evidence report is invalid: $EVIDENCE_REPORT_REASON$suffix"
+    fi
+    attempt=$((attempt + 1))
+    journal_append "$jlabel" "EVIDENCE_RETRY" "evidence report rejected — regenerating $attempt/$max ($EVIDENCE_REPORT_REASON)"
+    note "evidence report rejected ($EVIDENCE_REPORT_REASON) — regenerating $attempt/$max"
+  done
+}
+
 post_review_product_changes() { # $1 reviewed commit -> tracked + untracked product paths
   {
-    git diff --name-only "$1" -- . ':(exclude).loop' ':(exclude).claude' 2>/dev/null || true
+    git diff --name-only "$1" -- . \
+      ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' \
+      2>/dev/null || true
     git ls-files --others --exclude-standard 2>/dev/null \
-      | grep -Ev '^(\.loop|\.claude)(/|$)' || true
+      | grep -Ev '^(\.loop|\.claude|\.agents|\.codex)(/|$)' || true
   } | LC_ALL=C sort -u
 }
 
@@ -2678,8 +2952,9 @@ run_success_gate() { # $1 iter, $2 run-start-ref, $3 pre-ref, $4 forced (0|1)
   fi
   # 3b. EVIDENCE + FINAL RE-CHECK. The evidence agent runs AFTER the
   # reviewer, so freeze every certification input first. The report is an output
-  # view and is deliberately excluded; it is deleted before the call so a stale
-  # prior report can never satisfy the current generation requirement.
+  # view and is deliberately excluded; run_evidence_step deletes it before each
+  # generation attempt so a stale prior report can never satisfy the current
+  # generation requirement, and re-checks every frozen input per attempt.
   check_harness "during the success-gate review"
   canonicalize_live_manifest \
     || finish BLOCKED "could not canonicalize the observation manifest before evidence generation"
@@ -2687,31 +2962,12 @@ run_success_gate() { # $1 iter, $2 run-start-ref, $3 pre-ref, $4 forced (0|1)
     || finish BLOCKED "could not snapshot certification inputs before evidence generation"
   reviewed_ref=$(git rev-parse HEAD)
   evidence_logs=$(active_log_dir)
-  rm -f .loop/docs/evidence-report.md
-  note "generating evidence report (/loop-evidence, $MODEL_EVIDENCE)"
-  if ! run_claude "iter-$i-evidence" "/loop-evidence baseline=$task_base logs=$evidence_logs task=$TASK_ID$(html_arg)" "$MODEL_EVIDENCE" full EVIDENCE; then
-    finish BLOCKED "evidence generation failed — cannot certify success without evidence${AGENT_FAIL_DIAG:+ ($AGENT_FAIL_DIAG)}"
-  fi
-  check_harness "during evidence generation"
-  authority_after=$(certification_inputs_hash) \
-    || finish BLOCKED "could not re-check certification inputs after evidence generation"
-  if [ "$authority_after" != "$authority_before" ]; then
-    finish BLOCKED "evidence step changed certification inputs after review (contract/ledger/checklist/verdicts/manifest/observations)"
-  fi
-  if ! validate_current_evidence_report; then
-    finish BLOCKED "current evidence report is invalid: $EVIDENCE_REPORT_REASON"
-  fi
-  # Require the post-review product diff (tracked + untracked, excluding loop
-  # memory) to be empty BEFORE committing the report.
-  evidence_diff=$(post_review_product_changes "$reviewed_ref")
-  if [ -n "$evidence_diff" ]; then
-    finish BLOCKED "evidence step changed code after review (unreviewed): $(echo "$evidence_diff" | tr '\n' ' ')"
-  fi
+  run_evidence_step single "$i" "iter-$i-evidence" "baseline=$task_base logs=$evidence_logs task=$TASK_ID$(html_arg)" "$authority_before" "$reviewed_ref"
   commit_if_changes "loop: iter $i — evidence report"
   # the evidence call's cost was previously invisible (finish() zeroes last-cost
   # before the final journal row) — give the role its own cost-bearing row
   journal_append "$i" "EVIDENCE" "evidence report generated ($MODEL_EVIDENCE)"
-  record_html_decision "iter-$i-evidence" "$i"
+  record_html_decision "$EVIDENCE_CALL_LABEL" "$i"
   if [ "$forced" -eq 1 ]; then
     final_line=$("$evaluator" --pre-ref "$pre" --final --assume-ready --approved-hash "$RUN_CONTRACT_HASH") \
       || final_line="BLOCKED final evaluation crashed"
@@ -2733,7 +2989,9 @@ run_success_gate() { # $1 iter, $2 run-start-ref, $3 pre-ref, $4 forced (0|1)
     [ -z "$evidence_diff" ] \
       || finish BLOCKED "product tree changed after review: $(echo "$evidence_diff" | tr '\n' ' ')"
     if [ "$task_base_valid" -eq 1 ] \
-       && [ -z "$(git diff --name-only "$task_base" -- . ':(exclude).loop' ':(exclude).claude' 2>/dev/null)" ]; then
+       && [ -z "$(git diff --name-only "$task_base" -- . \
+                    ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' \
+                    2>/dev/null)" ]; then
       write_certification NO_OP "$task_base" "$base" "$reviewed_ref" PASS \
         || finish BLOCKED "failed to write or commit certification.json"
       check_harness "after certification"
@@ -3241,7 +3499,8 @@ bootstrap_worktree() { # $1 id — worktree + full harness re-deploy; nonzero on
   # verify exactly what the user approved here
   cp loop.sh "$wt/loop.sh" || return 1
   chmod +x "$wt/loop.sh"
-  mkdir -p "$wt/.loop/bin" "$wt/.loop/docs" "$wt/.loop/logs" "$wt/.claude/skills" || return 1
+  mkdir -p "$wt/.loop/bin" "$wt/.loop/docs" "$wt/.loop/logs" \
+    "$wt/.claude/skills" "$wt/.agents/skills" || return 1
   cp .loop/bin/evaluate.sh "$wt/.loop/bin/evaluate.sh" || return 1
   chmod +x "$wt/.loop/bin/evaluate.sh"
   for d in .claude/skills/loop-*/; do
@@ -3253,6 +3512,20 @@ bootstrap_worktree() { # $1 id — worktree + full harness re-deploy; nonzero on
     rm -rf "${wt:?}/.claude/skills/$name"
     cp -R "$d" "$wt/.claude/skills/$name" || return 1
   done
+  # Codex receives the generated, ownership-marked projection byte-for-byte.
+  # Prune only managed directories; a user's other .agents skills/AGENTS.md
+  # remain whatever git materialized in this worktree.
+  for d in "$wt"/.agents/skills/loop-*/; do
+    [ -d "$d" ] && [ -f "$d/$CODEX_SKILL_MARKER" ] || continue
+    name=$(basename "$d")
+    [ -f ".agents/skills/$name/$CODEX_SKILL_MARKER" ] || rm -rf "$d"
+  done
+  for d in .agents/skills/loop-*/; do
+    [ -d "$d" ] && [ -f "$d/$CODEX_SKILL_MARKER" ] || continue
+    name=$(basename "$d")
+    rm -rf "${wt:?}/.agents/skills/$name"
+    cp -R "$d" "$wt/.agents/skills/$name" || return 1
+  done
   cp loop.config.sh "$wt/loop.config.sh" || return 1          # seed; /loop-contract rewrites per task
   [ ! -f loop.models.sh ] || cp loop.models.sh "$wt/loop.models.sh" || return 1
   # Session config participates in the parent's approved harness hash, including
@@ -3262,9 +3535,12 @@ bootstrap_worktree() { # $1 id — worktree + full harness re-deploy; nonzero on
   for session_file in .claude/settings.json .claude/settings.local.json .mcp.json; do
     [ ! -f "$session_file" ] || cp "$session_file" "$wt/$session_file" || return 1
   done
-  if [ -f .codex/config.toml ]; then
-    mkdir -p "$wt/.codex" || return 1
-    cp .codex/config.toml "$wt/.codex/config.toml" || return 1
+  # `.codex` is one approval-bound project control tree (config, hooks, rules,
+  # assets). Replace the checkout copy so ignored/untracked files are not lost
+  # and stale tracked files cannot survive into a worker.
+  rm -rf "${wt:?}/.codex"
+  if [ -d .codex ]; then
+    cp -R .codex "$wt/.codex" || return 1
   fi
   printf '*\n!.gitignore\n!docs\n!docs/**\n' > "$wt/.loop/.gitignore"
   ensure_gitignore "$wt" >/dev/null   # same marker blocks; note silenced (supervisor stdout)
@@ -3577,7 +3853,12 @@ reap_task() { # $1 id — its process died; derive the outcome from the worktree
           # the trust model (and the worktree's approval hashes block a relaunch)
           task_fail "$id" "$state" "human decision required — read $(renv_get "$id" WT)/.loop/docs/decision-requests.md; after deciding: (cd $(renv_get "$id" WT) && ./loop.sh approve), then ./loop.sh fleet resume $id"
           ;;
-        BLOCKED|STALLED|BUDGET_EXCEEDED)
+        BLOCKED)
+          # a worker's BLOCKED is usually a human sign-off gate ('human' AC rows it
+          # cannot self-close) — name the verbatim sign-off command in its worktree
+          task_fail "$id" "$state" "see ./loop.sh fleet logs $id (worktree + branch kept); paused at a human sign-off? (cd $(renv_get "$id" WT) && ./loop.sh signoff), then ./loop.sh fleet resume $id"
+          ;;
+        STALLED|BUDGET_EXCEEDED)
           task_fail "$id" "$state" "see ./loop.sh fleet logs $id (worktree + branch kept)"
           ;;
         INTERRUPTED)
@@ -7099,7 +7380,9 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
 
     if [ "$REVIEW_VERDICT" = "APPROVE" ]; then
       # Evidence for the MERGED whole. Freeze the reviewer-approved authority
-      # inputs and require a newly-generated report before any report commit.
+      # inputs and require a newly-generated report before any report commit;
+      # run_evidence_step re-checks the frozen inputs on every generation
+      # attempt and enforces per-merged-task archive coverage.
       check_harness "during the integration-gate review"
       canonicalize_live_manifest \
         || finish BLOCKED "could not canonicalize the observation manifest before integration evidence"
@@ -7107,34 +7390,10 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
         || finish BLOCKED "could not snapshot integration certification inputs"
       reviewed_ref=$(git rev-parse HEAD)
       evidence_logs=$(active_log_dir)
-      rm -f .loop/docs/evidence-report.md
-      note "generating the master evidence report (/loop-evidence, $MODEL_EVIDENCE)"
-      if ! run_claude "fleet-evidence" "/loop-evidence baseline=$base logs=$evidence_logs task=$TASK_ID${merged_csv:+ merged=$merged_csv archives=.loop/docs/run-archive}$(html_arg)" "$MODEL_EVIDENCE" full EVIDENCE; then
-        finish BLOCKED "evidence generation failed — cannot certify the merged result without evidence${AGENT_FAIL_DIAG:+ ($AGENT_FAIL_DIAG)}"
-      fi
-      check_harness "during integration evidence"
-      authority_after=$(integration_authority "$evidence_ids") \
-        || finish BLOCKED "could not re-check integration certification inputs"
-      if [ "$authority_after" != "$authority_before" ]; then
-        finish BLOCKED "integration evidence changed certification inputs after review (contract/ledger/checklist/verdicts/manifest/observations/worker archives)"
-      fi
-      if ! validate_current_evidence_report; then
-        finish BLOCKED "current integration evidence report is invalid: $EVIDENCE_REPORT_REASON"
-      fi
-      # the master report must close over every merged worker's archived
-      # evidence — a report silently omitting a worker would certify SUCCESS
-      # over evidence nobody surfaced to the human
-      for mid in $evidence_ids; do
-        grep -Fq "run-archive/$mid" .loop/docs/evidence-report.md \
-          || finish BLOCKED "integration evidence report omits merged task $mid — it must cover .loop/docs/run-archive/$mid"
-      done
-      evidence_diff=$(post_review_product_changes "$reviewed_ref")
-      if [ -n "$evidence_diff" ]; then
-        finish BLOCKED "evidence step changed code after the integration review (unreviewed): $(echo "$evidence_diff" | tr '\n' ' ')"
-      fi
+      run_evidence_step fleet "fleet" "fleet-evidence" "baseline=$base logs=$evidence_logs task=$TASK_ID${merged_csv:+ merged=$merged_csv archives=.loop/docs/run-archive}$(html_arg)" "$authority_before" "$reviewed_ref" "$evidence_ids"
       commit_if_changes "fleet: integration evidence report"
       journal_append "fleet" "EVIDENCE" "integration evidence report generated ($MODEL_EVIDENCE)"
-      record_html_decision "fleet-evidence" "fleet"
+      record_html_decision "$EVIDENCE_CALL_LABEL" "fleet"
     fi
     # final deterministic re-check over the full fleet diff (--assume-ready: no
     # .loop/agent-state exists at the parent; the diff policy still runs in full)
@@ -7212,7 +7471,9 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
         } >> .loop/docs/decision-requests.md
         commit_if_changes "fleet: manual side-task merge audit"
       fi
-      if [ -z "$(git diff --name-only "$base" HEAD -- . ':(exclude).loop' ':(exclude).claude' 2>/dev/null)" ]; then
+      if [ -z "$(git diff --name-only "$base" HEAD -- . \
+                    ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' \
+                    2>/dev/null)" ]; then
         evidence_diff=$(post_review_product_changes "$reviewed_ref")
         [ -z "$evidence_diff" ] \
           || finish BLOCKED "product tree changed after the integration review: $(echo "$evidence_diff" | tr '\n' ' ')"
@@ -7273,20 +7534,115 @@ cmd_decompose() { # preview/refresh the task plan without enqueueing or running
 
 # ---------- kit deployment (init + update share these) ----------
 
-# The harness = main sh + evaluator + loop-* skills. This is exactly what the
-# approval hash (harness_hash) covers, so `update` reports "up to date" iff a
-# re-approval would not be needed.
+# The harness = main sh + evaluator + both provider skill trees + session control.
+# This is exactly what the approval hash (harness_hash) covers, so `update`
+# reports "up to date" iff a re-approval would not be needed.
+check_codex_skill_projection_target() { # $1 source assets, $2 target; no writes
+  local sassets="$1" tgt="$2" name src dst
+  for name in $(codex_skill_names); do
+    src="$sassets/.claude/skills/$name"
+    [ -d "$src" ] && [ -f "$src/SKILL.md" ] \
+      || die_next "kit is missing the canonical source for Codex skill '$name'" \
+           "restore $src/SKILL.md, then retry the init/update"
+    dst="$tgt/.agents/skills/$name"
+    if [ -e "$dst" ] || [ -L "$dst" ]; then
+      if [ -L "$dst" ] || [ ! -d "$dst" ] || [ ! -f "$dst/$CODEX_SKILL_MARKER" ]; then
+        die_next "refusing to overwrite user-owned Codex skill path: $dst" \
+          "rename or remove $dst, then retry the init/update"
+      fi
+    fi
+  done
+}
+
+project_codex_skills() { # $1 source assets, $2 target
+  local sassets="$1" tgt="$2" name src dst stage old tmp implicit d
+  mkdir -p "$tgt/.agents/skills"
+
+  # Staging/backup leftovers from an interrupted earlier refresh: the per-skill
+  # cleanup below is scoped to THIS process's $$, so an orphan from a killed
+  # run would otherwise linger forever — invisible to the loop-*/ prune and
+  # gitignore globs, and eventually swept into the user's history by the
+  # loop's `git add -A`. The dot-prefixed loop-kit-new/old names are reserved
+  # by this function and are never user content.
+  for d in "$tgt"/.agents/skills/.loop-*.loop-kit-new.* \
+           "$tgt"/.agents/skills/.loop-*.loop-kit-old.*; do
+    [ -e "$d" ] || continue
+    rm -rf "$d"
+  done
+
+  # Removed projections are pruned only when their ownership marker proves the
+  # directory belongs to loop-kit. User skills, root AGENTS.md and other files
+  # under .agents are never enumerated for deletion.
+  for d in "$tgt"/.agents/skills/loop-*/; do
+    [ -d "$d" ] && [ -f "$d/$CODEX_SKILL_MARKER" ] || continue
+    name=$(basename "$d")
+    if ! codex_skill_supported "$name" \
+       || [ ! -d "$sassets/.claude/skills/$name" ]; then
+      rm -rf "$d"
+    fi
+  done
+
+  for name in $(codex_skill_names); do
+    src="$sassets/.claude/skills/$name"
+    dst="$tgt/.agents/skills/$name"
+    stage="$tgt/.agents/skills/.$name.loop-kit-new.$$"
+    old="$tgt/.agents/skills/.$name.loop-kit-old.$$"
+    rm -rf "$stage" "$old"
+    cp -R "$src" "$stage"
+
+    # Claude's frontmatter-only invocation switch is not a Codex SKILL.md key.
+    # Remove it only while inside the leading YAML frontmatter.
+    tmp="$stage/.SKILL.md.codex.$$"
+    awk '
+      NR == 1 && $0 == "---" { front=1; print; next }
+      front && $0 == "---" { front=0; print; next }
+      front && $0 ~ /^[[:space:]]*disable-model-invocation:[[:space:]]*true[[:space:]]*$/ { next }
+      { print }
+    ' "$stage/SKILL.md" > "$tmp"
+    mv -f "$tmp" "$stage/SKILL.md"
+
+    if codex_skill_implicit "$name"; then implicit=true; else implicit=false; fi
+    mkdir -p "$stage/agents"
+    {
+      printf 'policy:\n'
+      printf '  allow_implicit_invocation: %s\n' "$implicit"
+    } > "$stage/agents/openai.yaml"
+    printf 'managed by loop-kit; generated from kit/.claude/skills/%s\n' "$name" \
+      > "$stage/$CODEX_SKILL_MARKER"
+
+    # Swap only a preflight-verified managed directory. Keeping the old name
+    # beside it makes an interrupted refresh recoverable without touching users.
+    if [ -d "$dst" ]; then mv "$dst" "$old"; fi
+    if mv "$stage" "$dst"; then
+      rm -rf "$old"
+    else
+      [ ! -d "$old" ] || mv "$old" "$dst"
+      die_next "failed to install the Codex skill projection at $dst" \
+        "fix the filesystem error, then retry the init/update"
+    fi
+  done
+}
+
 target_harness_sha() { # $1 target dir
   {
-    cat "$1/loop.sh" "$1/.loop/bin/evaluate.sh" 2>/dev/null
-    cat "$1"/.claude/skills/loop-*/SKILL.md 2>/dev/null
-    cat "$1/.claude/settings.json" "$1/.claude/settings.local.json" "$1/.mcp.json" "$1/.codex/config.toml" 2>/dev/null || true
+    hash_emit_file "loop.sh" "$1/loop.sh"
+    hash_emit_file ".loop/bin/evaluate.sh" "$1/.loop/bin/evaluate.sh"
+    hash_emit_managed_skills "$1" ".claude/skills" 0
+    hash_emit_managed_skills "$1" ".agents/skills" 1
+    hash_emit_file ".claude/settings.json" "$1/.claude/settings.json"
+    hash_emit_file ".claude/settings.local.json" "$1/.claude/settings.local.json"
+    hash_emit_file ".mcp.json" "$1/.mcp.json"
+    hash_emit_tree "$1" ".codex"
   } | sha256
 }
 
 refresh_harness() { # $1 src-bin, $2 src-assets, $3 target — copy harness + pristine doc templates
   local sbin="$1" sassets="$2" tgt="$3" d name f base
-  mkdir -p "$tgt/.loop/bin" "$tgt/.loop/docs" "$tgt/.claude/skills"
+  # Collision/source preflight runs before loop.sh, evaluator, docs or skills
+  # are touched, so an unowned shipped-name Codex skill fails without damage.
+  check_codex_skill_projection_target "$sassets" "$tgt"
+  mkdir -p "$tgt/.loop/bin" "$tgt/.loop/docs" \
+    "$tgt/.claude/skills" "$tgt/.agents/skills"
 
   # main sh: stage then atomically rename, so refreshing loop.sh's own file while
   # it is the running script is safe (the live process keeps the old inode).
@@ -7301,14 +7657,22 @@ refresh_harness() { # $1 src-bin, $2 src-assets, $3 target — copy harness + pr
   # standalone fleet.sh so a stale copy can never be run against the new layout
   rm -f "$tgt/fleet.sh"
 
-  # skills: manage only loop-* (leave the user's own skills untouched) and prune
-  # any loop-* skill that was removed from the kit, so stale process files go away.
+  # Canonical Claude skills: manage only loop-* and replace each directory as a
+  # full resource tree, so removed references/scripts/assets cannot linger.
   for d in "$tgt"/.claude/skills/loop-*/; do
     [ -d "$d" ] || continue
     name=$(basename "$d")
     [ -d "$sassets/.claude/skills/$name" ] || rm -rf "$d"
   done
-  cp -R "$sassets/.claude/skills/." "$tgt/.claude/skills/"
+  for d in "$sassets"/.claude/skills/loop-*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    rm -rf "$tgt/.claude/skills/$name"
+    cp -R "$d" "$tgt/.claude/skills/$name"
+  done
+
+  # Codex-native projection: eleven shared skills, no Claude-only loop-refine.
+  project_codex_skills "$sassets" "$tgt"
 
   # doc templates: refresh only those still pristine (TEMPLATE marker) or absent —
   # never clobber a contract/plan/progress the loop or the user has filled in.
@@ -7425,6 +7789,7 @@ cmd_init() {
     note "kit files copied into existing repo — review and commit them when ready"
   fi
   note "kit deployed into $target"
+  note "skills: Claude Code -> .claude/skills/loop-* | Codex -> .agents/skills/loop-*"
   note "next: cd $target && ./loop.sh            (auto flow: reads loop-instruction.md)"
   note "  or: cd $target && ./loop.sh start \"<instruction>\""
   note "later, to pull kit fixes:  cd $target && ./loop.sh update"
@@ -7464,23 +7829,20 @@ cmd_update() {
   target=$(cd "$target" && pwd)
   { [ -f "$target/loop.sh" ] || [ -f "$target/loop.config.sh" ] || [ -d "$target/.loop" ]; } \
     || die "$target is not a loop project yet — deploy first: <kit>/bin/loop.sh init \"$target\""
-  # record where the update came from (only now that the kit is confirmed valid),
-  # so a later bare `./loop.sh update` finds it (git-ignored, machine-local)
-  mkdir -p "$target/.loop"
-  printf '%s\n' "${KIT_ROOT:-$(cd "$src_bin/.." && pwd)}" > "$target/.loop/kit-source"
-
   local before after
   before=$(target_harness_sha "$target")
   refresh_harness "$src_bin" "$src_assets" "$target"
   ensure_gitignore "$target"   # also brings pre-gitignore deployments up to date
+  # Record the source only after the collision-safe refresh succeeds.
+  printf '%s\n' "${KIT_ROOT:-$(cd "$src_bin/.." && pwd)}" > "$target/.loop/kit-source"
   after=$(target_harness_sha "$target")
 
   note "updated $target from kit at ${src_bin%/bin}"
   if [ "$before" = "$after" ]; then
-    note "harness already up to date (loop.sh / evaluate.sh / skills unchanged)"
+    note "harness already up to date (engine / provider skills / session control unchanged)"
   else
-    note "harness refreshed: loop.sh, .loop/bin/evaluate.sh, .claude/skills/loop-*"
-    note "preserved: loop.config.sh, loop.models.sh, and any filled-in .loop/docs/*"
+    note "harness refreshed: loop.sh, evaluator, .claude/skills/loop-*, .agents/skills/loop-*"
+    note "preserved: loop.config.sh, loop.models.sh, filled-in .loop/docs/*, and user-owned .agents content"
     note "review the change: (cd \"$target\" && git status && git diff -- loop.sh .claude/skills)"
   fi
 
@@ -7576,7 +7938,7 @@ cmd_uninstall() { # remove everything init/update deployed + run state + fleet a
   done
 
   echo "loop: this removes the loop-kit deployment from $target:"
-  local f
+  local f d codex_managed=0
   for f in loop.sh fleet.sh loop.config.sh loop.models.sh fleet.config.sh; do
     if [ -f "$target/$f" ]; then echo "  $f"; fi
   done
@@ -7584,7 +7946,15 @@ cmd_uninstall() { # remove everything init/update deployed + run state + fleet a
     echo "  .loop/  (contract, evidence, plan/progress docs, logs, journal, fleet queue)"
   fi
   if ls -d "$target"/.claude/skills/loop-*/ >/dev/null 2>&1; then
-    echo "  .claude/skills/loop-*/  (your own skills are kept)"
+    echo "  .claude/skills/loop-*/  (other Claude skill names are kept)"
+  fi
+  for d in "$target"/.agents/skills/loop-*/; do
+    [ -d "$d" ] && [ -f "$d/$CODEX_SKILL_MARKER" ] || continue
+    codex_managed=1
+    break
+  done
+  if [ "$codex_managed" = 1 ]; then
+    echo "  managed .agents/skills/loop-*/  (AGENTS.md and user-owned skills are kept)"
   fi
   if [ -f "$target/.gitignore" ]; then
     echo "  the loop-kit blocks in .gitignore (your own entries are kept)"
@@ -7645,12 +8015,23 @@ cmd_uninstall() { # remove everything init/update deployed + run state + fleet a
   fi
 
   rm -rf "${target:?}/.loop"
-  local d
   for d in "$target"/.claude/skills/loop-*/; do
     [ -d "$d" ] || continue
     rm -rf "$d"
   done
   rmdir "$target/.claude/skills" "$target/.claude" 2>/dev/null || true
+  for d in "$target"/.agents/skills/loop-*/; do
+    [ -d "$d" ] && [ -f "$d/$CODEX_SKILL_MARKER" ] || continue
+    rm -rf "$d"
+  done
+  # kit-reserved staging/backup leftovers from an interrupted init/update —
+  # without this the rmdir below silently fails and .agents/ stays behind
+  for d in "$target"/.agents/skills/.loop-*.loop-kit-new.* \
+           "$target"/.agents/skills/.loop-*.loop-kit-old.*; do
+    [ -e "$d" ] || continue
+    rm -rf "$d"
+  done
+  rmdir "$target/.agents/skills" "$target/.agents" 2>/dev/null || true
   strip_gitignore_blocks "$target"
   rm -f "$target/fleet.sh" "$target/loop.config.sh" "$target/loop.models.sh" "$target/fleet.config.sh"
   # loop.sh last — unlinking the running script is safe (the live process keeps
@@ -8521,8 +8902,8 @@ cmd_approve() {
   fi
   note "approved: contract + config ($(cut -c1-12 < .loop/approved)…), harness ($(cut -c1-12 < .loop/approved-harness)…)"
   print_agent_routing
-  note "any change to the contract, loop.config.sh, loop.sh, evaluate.sh, the skills,"
-  note "or the session config (.claude settings, .mcp.json, .codex/config.toml) now stops the loop until you re-approve."
+  note "any change to the contract, loop.config.sh, loop.sh, evaluate.sh, provider skills,"
+  note "or session control (.claude settings, .mcp.json, .codex/**) now stops the loop until you re-approve."
   # ---- decision rebind: re-approving after a decision stop re-binds the run
   # checkpoint to the NEW hashes so `run` resumes with counters/cost intact.
   # Same trust move as the budget-only exception: the human is present and is
@@ -8678,7 +9059,9 @@ cmd_run() {
   if ! declare -p VERIFY_COMMANDS >/dev/null 2>&1 || [ "${#VERIFY_COMMANDS[@]}" -eq 0 ]; then
     die_next "loop.config.sh defines no VERIFY_COMMANDS — a loop needs a verifiable goal" "add VERIFY_COMMANDS=(...) to loop.config.sh, then ./loop.sh approve"
   fi
-  [ -f .claude/skills/loop-iterate/SKILL.md ] || die "loop skills missing in .claude/skills/ — redeploy the kit"
+  [ -f .claude/skills/loop-iterate/SKILL.md ] \
+    || die_next "loop skills missing in .claude/skills/" \
+         "run ./loop.sh update, or redeploy it: <kit>/bin/loop.sh init ."
   local evaluator="$EVALUATOR"
   if [ -f .loop/bin/evaluate.sh ]; then evaluator="$(pwd)/.loop/bin/evaluate.sh"; fi
 
@@ -9188,35 +9571,346 @@ cmd_resume() { # resume | resume --list | resume <id> [--auto]
   esac
 }
 
-signoff_human_rows() { # flip every not-yet-verified 'human' acceptance row to
-  # verified with a sign-off note. The HUMAN is certifying (they answered the [y]
-  # confirm) — this is their call, exactly the manual "mark the row verified" the
-  # decision request describes, NOT the model self-grading. cmd/run rows are still
-  # re-verified by the evaluator, and the independent reviewer still certifies, on
-  # the closing resume — so the maker/checker boundary holds. Echoes the count.
-  local f=.loop/docs/acceptance-checklist.md ts tmp n
+signoff_human_rows() { # [source-cmd] flip every not-yet-verified 'human' acceptance
+  # row to verified with a sign-off note. The HUMAN is certifying (they confirmed —
+  # refine's [y], or signoff's [y]/--yes) — this is their call, exactly the manual
+  # "mark the row verified" the decision request describes, NOT the model
+  # self-grading. cmd/run rows are still re-verified by the evaluator, and the
+  # independent reviewer still certifies, on the closing resume — so the
+  # maker/checker boundary holds. Echoes the count.
+  local src="${1:-refine}" f=.loop/docs/acceptance-checklist.md ts tmp out n ids
   [ -f "$f" ] || { note "no acceptance checklist to sign off ($f)"; return 1; }
   ts=$(utcnow)
   tmp="$f.tmp.$$"
   # POSIX/BSD-awk safe: no gsub backslash grammar, ASCII replacement, [[:space:]] ok.
-  n=$(awk -v ts="$ts" -v TMP="$tmp" '
+  # $2 under default FS is the row's AC id ("| AC-011 | ..."), captured BEFORE the
+  # rewrite so the journal names exactly what was signed.
+  out=$(awk -v ts="$ts" -v src="$src" -v TMP="$tmp" '
     /^\| *AC-[0-9]+ / && /\| *human *\|/ && $0 !~ /\| *human *\| *verified *\|/ {
+      ids = ids " " $2
       sub(/\| *human *\| *[A-Za-z-]+ *\|/, "| human | verified |")
-      sub(/ *\|[[:space:]]*$/, " - human sign-off (refine) " ts " |")
+      sub(/ *\|[[:space:]]*$/, " - human sign-off (" src ") " ts " |")
       c++
     }
     { print > TMP }
-    END { print c+0 }
+    END { print c+0 ids }
   ' "$f") || { rm -f "$tmp"; note "sign-off failed (awk error)"; return 1; }
+  n=${out%% *}
+  ids=${out#"$n"}
   if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
     mv -f "$tmp" "$f"
-    journal_append "refine" "HUMAN_SIGNOFF" "$n human acceptance row(s) signed off via refine confirm"
+    journal_append "$src" "HUMAN_SIGNOFF" "$n human acceptance row(s) signed off via $src:$ids"
     note "signed off $n human acceptance row(s) as verified (evidence noted in the checklist)."
     return 0
   fi
   rm -f "$tmp"
   note "no pending human rows to sign off (already verified?)."
   return 0
+}
+
+pending_human_acs() { # list the not-yet-verified 'human' acceptance rows as
+  # "AC-NNN<TAB>expectation" — the SAME line-level match signoff_human_rows flips,
+  # so "what you are about to sign" can never drift from "what gets signed".
+  # Returns 1 when the checklist file itself is missing, so callers can tell
+  # "no checklist" from "none pending".
+  local f=.loop/docs/acceptance-checklist.md
+  [ -f "$f" ] || return 1
+  awk -F'|' '
+    /^\| *AC-[0-9]+ / && /\| *human *\|/ && $0 !~ /\| *human *\| *verified *\|/ {
+      # NOTE: "exp" is a reserved awk built-in (exponential) — BSD awk rejects it
+      # as a variable name, so the expectation cell is "want" here.
+      id = $2; want = $4
+      gsub(/^ +/, "", id);   gsub(/ +$/, "", id)
+      gsub(/^ +/, "", want); gsub(/ +$/, "", want)
+      printf "%s\t%s\n", id, want
+    }
+  ' "$f"
+}
+
+cmd_signoff() { # ./loop.sh signoff [--yes] — COMPLETE human approval of the
+  # sign-off gate: certify every pending 'human' acceptance row in one confirmed
+  # step, then immediately re-certify via resume (the evaluator re-checks the
+  # cmd/run rows and the independent reviewer still gates SUCCESS — signing never
+  # grants SUCCESS by itself). Deliberately all-or-nothing: the closing call is
+  # binary — everything looks right (signoff), or something does not
+  # (./loop.sh resume --note). Per-row pre-signing is refused because a later
+  # iteration can change what an earlier signature attested (stale signature);
+  # the human signs the FINAL state only.
+  need_project
+  need_awk
+  local yes=0 a st="" pending="" n ans=""
+  for a in "$@"; do
+    case "$a" in
+      --yes) yes=1 ;;
+      AC-*|ac-*)
+        die_next "signoff is all-or-nothing: it certifies EVERY pending 'human' acceptance row at once (a per-row signature goes stale when a later iteration changes the result)" \
+          "happy with everything → ./loop.sh signoff   |   want a change first → ./loop.sh resume --note '<what to adjust>'" ;;
+      *) die_next "unknown option for signoff: $a" "./loop.sh signoff [--yes]" ;;
+    esac
+  done
+  # never mutate the checklist under a LIVE loop (same verified-live probe as run)
+  if [ "$(cat .loop/state 2>/dev/null)" = "RUNNING" ] && single_loop_alive; then
+    die_next "a run is active in this repo (pid $(cat .loop/run.pid 2>/dev/null)) — signing now would race it" \
+      "wait for it to stop (or Ctrl-C it), then: ./loop.sh signoff"
+  fi
+  st=$(cat .loop/state 2>/dev/null || echo "")
+  pending=$(pending_human_acs) \
+    || die_next "no acceptance checklist to sign (.loop/docs/acceptance-checklist.md missing)" "./loop.sh status"
+  if [ -z "$pending" ]; then
+    note "no pending 'human' acceptance rows — nothing to sign off."
+    if [ "$st" = "BLOCKED" ]; then
+      note "this run is BLOCKED for another reason — read the decision request."
+      note "  → next: ./loop.sh report   (full guidance), then ./loop.sh resume"
+    else
+      note "  → next: ./loop.sh status"
+    fi
+    exit 0
+  fi
+  n=$(printf '%s\n' "$pending" | grep -c .)
+  note "sign-off gate — $n pending 'human' acceptance row(s):"
+  printf '%s\n' "$pending" | awk -F'\t' '{ printf "  %-8s %s\n", $1, $2 }'
+  [ "$st" = "BLOCKED" ] || note "(current state is ${st:-<none>} — signoff normally answers a BLOCKED sign-off gate)"
+  if [ "$yes" != 1 ]; then
+    [ -t 0 ] || die_next "signoff needs a confirmation and there is no interactive terminal" \
+      "sure it all looks right → ./loop.sh signoff --yes   |   want a change first → ./loop.sh resume --note '<what to adjust>'"
+    printf 'loop: sign off ALL row(s) above as verified and re-certify now? [y/N] '
+    read -r ans || ans=n
+    case "$ans" in
+      y|Y) ;;
+      *)
+        note "nothing signed off."
+        note "  → next: ./loop.sh signoff   (when it looks right) — or ./loop.sh resume --note '<what to adjust>'"
+        exit 0 ;;
+    esac
+  fi
+  signoff_human_rows signoff \
+    || die_next "sign-off failed — the checklist was left unchanged" "check .loop/docs/acceptance-checklist.md, then: ./loop.sh signoff"
+  note "re-certifying via ./loop.sh resume (evaluator re-checks cmd/run rows; independent reviewer certifies) ..."
+  cmd_resume
+}
+
+# ---------- setup: isolated interactive tuning of loop.models.sh ----------
+
+# validate_models <file> — the deterministic checker (maker-checker gate) for a
+# candidate loop.models.sh. PARSES the file, never sources it; prints one reason per
+# violation to stdout and returns 1 on any problem. Nothing a setup session produces
+# reaches the real loop.models.sh unless this passes. Rules mirror kit/loop.models.sh:
+# plain KEY="value" only, known keys/roles, legal agent/effort enums, and the same
+# agent<->model consistency the run preflight enforces (need_agents / run_claude).
+validate_models() {
+  awk '
+    BEGIN {
+      split("CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE", r, " ")
+      for (i in r) role[r[i]] = 1
+      split("low medium high xhigh max", e, " ")
+      for (i in e) eff[e[i]] = 1
+      bad = 0
+    }
+    /^[[:space:]]*#/ { next }                       # comment
+    /^[[:space:]]*$/ { next }                       # blank
+    $0 !~ /^[A-Za-z_][A-Za-z0-9_]*="[^"]*"[[:space:]]*(#.*)?$/ {
+      print "line " NR ": not a plain KEY=\"value\" (optionally with a trailing # comment): " $0; bad = 1; next
+    }
+    {
+      p    = index($0, "=\"")
+      key  = substr($0, 1, p - 1)
+      rest = substr($0, p + 2)                       # everything after ="
+      q    = index(rest, "\"")                        # the closing quote (value has no embedded ")
+      val  = substr(rest, 1, q - 1)                   # value between the quotes
+    }
+    # Value must be a clean token. get_model strips whitespace and truncates at a
+    # '#' (loop.sh get_model: s/#.*$//; s/[[:space:]]//g), so a value carrying either
+    # would validate here but read back DIFFERENTLY at run time. Reject those, plus
+    # command substitution/expansion — so what setup validates is exactly what the
+    # harness will parse. (The file is never executed; this is defense in depth.)
+    val ~ /[[:space:]`#]|\$\(|\$\{/ {
+      print "line " NR ": value has whitespace, #, or a shell metacharacter: " $0; bad = 1; next
+    }
+    {
+      if (key == "LOOP_EFFORT") {
+        if (val != "" && !(val in eff)) { print "line " NR ": LOOP_EFFORT must be low|medium|high|xhigh|max: " $0; bad = 1 }
+        next
+      }
+      if (key == "TURNS_NUDGE_AT") {
+        if (val != "" && val !~ /^[0-9]+$/) { print "line " NR ": TURNS_NUDGE_AT must be digits (or empty): " $0; bad = 1 }
+        next
+      }
+      if (key ~ /^AGENT_/) {
+        ro = substr(key, 7)
+        if (!(ro in role)) { print "line " NR ": unknown role in key " key; bad = 1; next }
+        if (val != "claude" && val != "codex" && val != "") { print "line " NR ": AGENT_" ro " must be claude|codex|empty: " $0; bad = 1; next }
+        agent[ro] = val; next
+      }
+      if (key ~ /^MODEL_/) {
+        ro = substr(key, 7)
+        if (!(ro in role)) { print "line " NR ": unknown role in key " key; bad = 1; next }
+        model[ro] = val; modelset[ro] = 1; next
+      }
+      if (key ~ /^EFFORT_/) {
+        ro = substr(key, 8)
+        if (!(ro in role)) { print "line " NR ": unknown role in key " key; bad = 1; next }
+        if (val != "" && !(val in eff)) { print "line " NR ": EFFORT_" ro " must be low|medium|high|xhigh|max: " $0; bad = 1 }
+        next
+      }
+      print "line " NR ": unknown key " key; bad = 1
+    }
+    END {
+      n = split("CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE", rr, " ")
+      for (i = 1; i <= n; i++) {
+        ro = rr[i]
+        a = (ro in agent) ? agent[ro] : ""
+        m = ""; mset = 0
+        if (ro in modelset) { m = model[ro]; mset = 1 }
+        if (ro == "REVIEW_INTERIM") {                # inherits REVIEW when unset
+          if (a == "") a = ("REVIEW" in agent) ? agent["REVIEW"] : ""
+          if (!mset && ("REVIEW" in modelset)) { m = model["REVIEW"]; mset = 1 }
+        }
+        if (a == "") a = "claude"
+        if (a == "codex") {
+          if (!mset || m == "") { print "config: AGENT_" ro "=codex but MODEL_" ro " is unset (defaults to a Claude alias) — set it to a Codex slug"; bad = 1 }
+          else if (m ~ /^(opus|sonnet|haiku|claude-)/) { print "config: AGENT_" ro "=codex but MODEL_" ro "=\"" m "\" is a Claude alias — use a Codex slug"; bad = 1 }
+        } else if (mset && m ~ /^gpt/) {
+          print "config: " ro " runs on Claude but MODEL_" ro "=\"" m "\" is a Codex slug"; bad = 1
+        }
+      }
+      exit bad ? 1 : 0
+    }
+  ' "$1"
+}
+
+cmd_setup() { # ./loop.sh setup [--app claude|codex] — isolated interactive model/agent tuning
+  # Tune loop.models.sh (per-phase agent+model routing) inside a THROWAWAY directory
+  # that holds only a COPY of it. The session can write only in that dir (CWD=temp,
+  # no Bash, minimal tools, MCP off); the harness then validates the copy with
+  # validate_models and reflects it into the real file ONLY if it passes. The session
+  # sandbox is defense-in-depth — validate_models is the hard gate. loop.models.sh is
+  # outside the approval hash, so a successful setup takes effect immediately with no
+  # re-approval. This is the evaluate.sh maker-checker boundary applied to setup itself.
+  need_project
+  [ -f loop.models.sh ] \
+    || die_next "no loop.models.sh in this project" "deploy the kit first: <kit>/bin/loop.sh init . — then ./loop.sh setup"
+  local app="claude"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --app)     app="${2:-}"; shift 2 ;;
+      --app=*)   app="${1#--app=}"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die_next "unknown option for setup: $1" "see ./loop.sh -h" ;;
+    esac
+  done
+  case "$app" in claude|codex) ;; *) die_next "unknown --app '$app' (use claude or codex)" "./loop.sh setup --app claude" ;; esac
+
+  # never retune routing under a live loop — loop.models.sh feeds every in-loop call
+  if single_loop_alive; then
+    die_next "a loop run is active in this repo (pid $(cat .loop/run.pid 2>/dev/null)) — setup would change agent/model routing mid-run" "wait for it to finish or stop it (Ctrl-C), then: ./loop.sh setup"
+  fi
+
+  # resolve the setup agent. Fallback fires ONLY on pre-launch availability: a mid-
+  # session /exit is indistinguishable from a normal end, so never treat it as
+  # 'claude missing' (keeps the boundary deterministic and testable).
+  local agent="$app"
+  if [ "$app" = claude ] && ! command -v "$CLAUDE_CMD" >/dev/null 2>&1; then
+    need_codex
+    agent=codex
+    note "claude CLI not found ('$CLAUDE_CMD') — running setup on Codex instead"
+  fi
+
+  # provision the throwaway workspace: a COPY to edit + the loop-setup skill bundle
+  # (skill + dictionary + session-guidance) + the guidance as the session's always-on
+  # doc (CLAUDE.md for Claude, AGENTS.md for Codex).
+  # LOOP_SETUP_TMP is GLOBAL on purpose: the EXIT trap fires after cmd_setup returns,
+  # when a `local` would be out of scope (and would trip set -u). Guarded + `|| true`
+  # so cleanup can never flip a success exit to non-zero. mktemp -d is outside .loop/,
+  # so it needs no tests/artifact-lifecycle.txt entry.
+  LOOP_SETUP_TMP=""
+  trap 'rm -rf "${LOOP_SETUP_TMP:-}" 2>/dev/null || true' EXIT
+  LOOP_SETUP_TMP=$(mktemp -d "${TMPDIR:-/tmp}/loop-setup.XXXXXX") \
+    || die_next "could not create a temp workspace for setup" "check TMPDIR and disk space, then re-run: ./loop.sh setup"
+  local tmp="$LOOP_SETUP_TMP"
+  cp loop.models.sh "$tmp/loop.models.sh"
+
+  local rc=0
+  if [ "$agent" = claude ]; then
+    [ -f .claude/skills/loop-setup/SKILL.md ] \
+      || die_next "loop-setup skill is not deployed (.claude/skills/loop-setup)" "re-deploy the kit: <kit>/bin/loop.sh update . --approve"
+    mkdir -p "$tmp/.claude/skills"
+    cp -R .claude/skills/loop-setup "$tmp/.claude/skills/loop-setup"
+    cp .claude/skills/loop-setup/session-guidance.md "$tmp/CLAUDE.md"
+    if [ -t 0 ]; then
+      note "launching isolated setup session (Claude, model=haiku; writes confined to a throwaway copy) ..."
+      trap ':' INT TERM
+      ( cd "$tmp" && "$CLAUDE_CMD" --model haiku --permission-mode acceptEdits \
+          --allowedTools "Read,Edit,Write,Glob,Grep" --strict-mcp-config "/loop-setup" ) || rc=$?
+      trap - INT TERM
+      # non-blocking degrade: if the launch failed AND nothing was edited, the flags
+      # may be unsupported on this CLI — retry once minimally (validate_models still
+      # gates the result either way).
+      if [ "$rc" -ne 0 ] && cmp -s "$tmp/loop.models.sh" loop.models.sh; then
+        note "setup session failed to launch (rc=$rc) — retrying once without the isolation flags"
+        ( cd "$tmp" && "$CLAUDE_CMD" --model haiku --permission-mode acceptEdits "/loop-setup" ) || true
+      fi
+    else
+      # non-interactive (tests / no TTY): a one-shot headless session, still validated
+      ( cd "$tmp" && "$CLAUDE_CMD" -p "/loop-setup" --model haiku --permission-mode acceptEdits \
+          --allowedTools "Read,Edit,Write,Glob,Grep" --strict-mcp-config --output-format json ) >/dev/null 2>&1 || true
+    fi
+  else
+    need_codex
+    [ -f .agents/skills/loop-setup/SKILL.md ] \
+      || die_next "loop-setup is not projected for Codex (.agents/skills/loop-setup)" "re-deploy the kit: <kit>/bin/loop.sh update . --approve"
+    mkdir -p "$tmp/.agents/skills"
+    cp -R .agents/skills/loop-setup "$tmp/.agents/skills/loop-setup"
+    cp .agents/skills/loop-setup/session-guidance.md "$tmp/AGENTS.md"
+    # §9: hardcode a real, config-independent Codex slug (avoids the chicken-and-egg of
+    # setup depending on the value it sets). Overridable, and swap for a lighter slug
+    # if one is confirmed. The prompt mirrors codex_prompt's direct-file form.
+    local slug="${LOOP_SETUP_CODEX_MODEL:-gpt-5.5}"
+    local cprompt="Read the file .agents/skills/loop-setup/SKILL.md and execute its instructions exactly as your current task."
+    if [ -t 0 ]; then
+      # Interactive Codex TUI — the harness's first non-exec Codex launch. The exact
+      # invocation is verified at implementation time against the installed CLI; either
+      # way validate_models below is the hard gate. No CODEX_HOME isolation on purpose:
+      # it would also hide the user's auth. Writes are confined by --sandbox
+      # workspace-write (CWD=temp) and, ultimately, by the validator.
+      note "launching isolated setup session (Codex, model=$slug; writes confined to a throwaway copy) ..."
+      trap ':' INT TERM
+      ( cd "$tmp" && "$CODEX_CMD" --ask-for-approval never --sandbox workspace-write -m "$slug" \
+          -c model_reasoning_effort=low -c sandbox_workspace_write.network_access=false \
+          "$cprompt" ) || rc=$?
+      trap - INT TERM
+    else
+      # non-interactive (tests / no TTY / claude-absent fallback): headless `codex exec`,
+      # the existing well-understood path; still fully validated below.
+      ( cd "$tmp" && "$CODEX_CMD" --ask-for-approval never exec --json \
+          -o "$tmp/.codex-msg" -m "$slug" --sandbox workspace-write \
+          -c model_reasoning_effort=low -c sandbox_workspace_write.network_access=false \
+          "$cprompt" ) >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # THE GATE: validate the copy deterministically. Nothing reaches the real file otherwise.
+  local reasons vrc=0
+  reasons=$(validate_models "$tmp/loop.models.sh") || vrc=$?
+  if [ "$vrc" -ne 0 ]; then
+    printf '%s\n' "$reasons" >&2
+    die_next "setup left loop.models.sh invalid — your real file was NOT changed" "re-run and fix the flagged line(s): ./loop.sh setup --app $app"
+  fi
+
+  # reflect only real changes, via a same-FS atomic rename (temp may be another FS)
+  if cmp -s loop.models.sh "$tmp/loop.models.sh"; then
+    note "no changes — loop.models.sh left as it was."
+  else
+    note "applying your changes to loop.models.sh:"
+    diff -u loop.models.sh "$tmp/loop.models.sh" 2>/dev/null || true
+    local wb="loop.models.sh.new.$$"
+    if cp "$tmp/loop.models.sh" "$wb" && mv "$wb" loop.models.sh; then
+      note "loop.models.sh updated — takes effect immediately (no re-approval needed)."
+    else
+      rm -f "$wb"
+      die_next "could not write loop.models.sh" "check file permissions and re-run: ./loop.sh setup"
+    fi
+  fi
+  note "next: define or run a loop — ./loop.sh start \"<instruction>\""
 }
 
 cmd_refine() { # ./loop.sh refine ['<opening note>'] — interactive design-gate session.
@@ -9231,7 +9925,7 @@ cmd_refine() { # ./loop.sh refine ['<opening note>'] — interactive design-gate
   # refine is an interactive Claude surface; without the CLI the same outcome
   # is reachable by hand — name that path instead of a bare install hint.
   command -v "$CLAUDE_CMD" >/dev/null 2>&1 \
-    || die_next "refine needs the Claude CLI ('$CLAUDE_CMD') for its interactive session" "install Claude Code (or set LOOP_CLAUDE_CMD) — or without Claude: mark the 'human' row(s) 'verified' in .loop/docs/acceptance-checklist.md, then ./loop.sh resume"
+    || die_next "refine needs the Claude CLI ('$CLAUDE_CMD') for its interactive session" "install Claude Code (or set LOOP_CLAUDE_CMD) — or without Claude: ./loop.sh signoff (signs the 'human' row(s) + re-certifies), or by hand: mark them 'verified' in .loop/docs/acceptance-checklist.md, then ./loop.sh resume"
   local st note_arg="${1:-}" rc=0 ans=""
   st=$(cat .loop/state 2>/dev/null || echo "")
   if [ "$st" != "BLOCKED" ]; then
@@ -9248,6 +9942,7 @@ cmd_refine() { # ./loop.sh refine ['<opening note>'] — interactive design-gate
   if [ ! -t 0 ]; then
     note "refine needs an interactive terminal (no TTY). Steer headlessly instead:"
     note "  ./loop.sh resume --note '<what to change>'"
+    note "  or, if it already looks right: ./loop.sh signoff --yes"
     exit 2
   fi
   local pmode="${LOOP_REFINE_PERMISSION_MODE:-auto}"
@@ -9482,7 +10177,7 @@ cmd_status() {
   # `status` alone never leaves the user wondering what to run next.
   local hint=""
   case "$st" in
-    BLOCKED)          hint="./loop.sh resume (sign off), ./loop.sh refine '<change>', or ./loop.sh resume --note '<change>'  — full guidance: ./loop.sh report" ;;
+    BLOCKED)          hint="./loop.sh signoff (sign off + re-certify), ./loop.sh refine '<change>', or ./loop.sh resume --note '<change>'  — full guidance: ./loop.sh report" ;;
     STALLED)          hint="./loop.sh resume --note '<what to try differently>', or ./loop.sh run --fresh" ;;
     BUDGET_EXCEEDED)  hint="raise MAX_ITERATIONS/MAX_COST_USD in loop.config.sh, then ./loop.sh approve && ./loop.sh resume" ;;
     NEEDS_*|RISK_REQUIRES_APPROVAL|PENDING_APPROVAL) hint="decide (.loop/docs/decision-requests.md), then ./loop.sh approve && ./loop.sh run  — full guidance: ./loop.sh report" ;;
@@ -9675,6 +10370,7 @@ case "$cmd" in
     ;;
   auto)    AUTO_MODE=1; cmd_auto "$@" ;;
   start)   cmd_start "$@" ;;
+  setup)   cmd_setup "$@" ;;
   fleet)   cmd_fleet "$@" ;;
   add)     cmd_fleet_add "$@" ;;
   init)    cmd_init "$@" ;;
@@ -9686,6 +10382,7 @@ case "$cmd" in
   run)     cmd_run "$@" ;;
   resume)  cmd_resume "$@" ;;
   refine)  cmd_refine "$@" ;;
+  signoff) cmd_signoff "$@" ;;
   watch)   cmd_watch "$@" ;;
   status)  cmd_status "$@" ;;
   report)  cmd_report "$@" ;;

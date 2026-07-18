@@ -5,7 +5,8 @@
 This repository is the source distribution of **loop-kit**, not a project with
 loop-kit already deployed. The product is a Bash harness plus prompt and document
 templates; there is no package manager, build step, server, or compiled artifact.
-`bin/loop.sh init <target>` copies the managed files into a target project.
+`bin/loop.sh init <target>` copies the managed files into a target project,
+including provider-native skill trees for Claude Code and Codex.
 
 Read `CLAUDE.md` before changing behavior. Use `README.md` as the user-facing
 manual, but confirm implementation claims against the scripts and tests.
@@ -16,8 +17,10 @@ manual, but confirm implementation claims against the scripts and tests.
   journaling, command dispatch, and Fleet supervisor.
 - `bin/evaluate.sh`: maker-checker boundary; independently reruns the approved
   `VERIFY_COMMANDS` before model review.
-- `kit/.claude/skills/loop-*/SKILL.md`: prompts for contract, planning,
+- `kit/.claude/skills/loop-*/SKILL.md`: canonical prompts for contract, planning,
   implementation, review, decomposition, supervision, and evidence phases.
+  Deployment projects ten of them into `.agents/skills` for Codex; `loop-refine`
+  remains Claude-only.
 - `kit/loop-docs/`: pristine templates copied into deployed projects.
 - `kit/*.config.sh` and `kit/loop.models.sh`: shipped configuration defaults.
 - `tests/run_tests.sh`: authoritative zero-token behavioral suite using
@@ -59,6 +62,11 @@ Assume Claude Code and Codex sessions may be implementing concurrently.
   `ensure_gitignore`, and `strip_gitignore_blocks` together.
 - Do not “fix” unlinking the currently running `loop.sh`; update and uninstall
   intentionally rely on the live inode.
+- Keep `kit/.claude/skills` as the only authored prompt tree. Codex skills are a
+  generated `.agents/skills` projection with provider-specific frontmatter and
+  invocation metadata; do not add a second canonical copy or `.codex/skills`.
+- Preserve user-owned `AGENTS.md`, `AGENTS.override.md`, `.codex/**`, and
+  non-managed skills during init, update, Fleet propagation, and uninstall.
 - Preserve the success boundary: deterministic verification, success-gate
   review, per-requirement approval, evidence generation, and final no-drift
   checks must all pass. Errors, timeouts, outages, or spent budgets never become
