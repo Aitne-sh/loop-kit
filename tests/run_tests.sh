@@ -517,6 +517,15 @@ check "exit 0" roleeffbad 0 "$RC"
 paste -d' ' .loop/fake-models .loop/fake-effort > "$WORK/roleeffbad.calls" 2>/dev/null || true
 if grep -q '^fake-stop xhigh$' "$WORK/roleeffbad.calls"; then ok "invalid override degraded to the global effort"; else bad "bogus override leaked: $(grep fake-stop "$WORK/roleeffbad.calls")" roleeffbad; fi
 
+echo "== Codex-only effort tiers down-map for Claude roles (ultra->max, minimal->low) =="
+make_fixture roleeffmap
+printf 'EFFORT_IMPLEMENT="ultra"\nEFFORT_REVIEW="minimal"\n' >> loop.models.sh
+run_loop "CONTINUE_FIX,READY_NOW"
+check "exit 0" roleeffmap 0 "$RC"
+paste -d' ' .loop/fake-models .loop/fake-effort > "$WORK/roleeffmap.calls" 2>/dev/null || true
+if grep -q '^fake-imp max$' "$WORK/roleeffmap.calls"; then ok "ultra down-mapped to --effort max for the Claude implement call"; else bad "ultra not down-mapped: $(grep fake-imp "$WORK/roleeffmap.calls")" roleeffmap; fi
+if grep -q '^fake-rev low$' "$WORK/roleeffmap.calls"; then ok "minimal down-mapped to --effort low for Claude review calls"; else bad "minimal not down-mapped: $(grep fake-rev "$WORK/roleeffmap.calls")" roleeffmap; fi
+
 echo "== Codex routing is lazy: a pure-Claude run starts no Codex process =="
 if [ ! -e .loop/fake-codex-invocations ]; then
   ok "no Codex help/auth/exec process was started"
@@ -660,6 +669,30 @@ if grep -q 'codex login status failed' "$WORK/codex-network-off.out"; then
   ok "failed login-status probe warns but defers authority to exec"
 else
   bad "advisory Codex auth warning missing" codex-network-off
+fi
+
+echo "== Codex ultra effort passes through on gpt-5.6-sol, clamps to xhigh elsewhere =="
+make_fixture codex-ultra-effort
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.6-sol"\nLOOP_EFFORT="ultra"\n' >> loop.models.sh
+run_loop "READY_NOW"
+check "exit 0" codex-ultra-effort 0 "$RC"
+if grep -q '^model=gpt-5.6-sol ' .loop/fake-codex-args \
+   && grep -q 'model_reasoning_effort=ultra' .loop/fake-codex-args \
+   && ! grep -q 'model_reasoning_effort=xhigh' .loop/fake-codex-args; then
+  ok "ultra effort passed through verbatim to a gpt-5.6-sol Codex call"
+else
+  bad "Codex ultra pass-through wrong: $(cat .loop/fake-codex-args 2>/dev/null | tr '\n' ' ')" codex-ultra-effort
+fi
+
+make_fixture codex-ultra-clamp
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\nLOOP_EFFORT="ultra"\n' >> loop.models.sh
+run_loop "READY_NOW"
+check "exit 0" codex-ultra-clamp 0 "$RC"
+if grep -q 'model_reasoning_effort=xhigh' .loop/fake-codex-args \
+   && ! grep -q 'model_reasoning_effort=ultra' .loop/fake-codex-args; then
+  ok "ultra effort clamped to xhigh on a Codex model that caps below it (gpt-5.5)"
+else
+  bad "Codex ultra clamp wrong: $(cat .loop/fake-codex-args 2>/dev/null | tr '\n' ' ')" codex-ultra-clamp
 fi
 
 echo "== Codex danger-full-access is accepted without workspace network widening =="

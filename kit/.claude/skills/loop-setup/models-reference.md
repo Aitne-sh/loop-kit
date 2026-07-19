@@ -40,9 +40,10 @@ its stop conditions live in `loop.config.sh`, which setup does **not** touch.)
   `./loop.sh start` and `./loop.sh refine` always launch Claude Code.
 
 ### `MODEL_<ROLE>` — which model runs the role
-- A **Claude alias/name** (`opus`, `sonnet`, `haiku`, or a full `claude-*` name) when
-  the role is on Claude, **or** a **Codex model slug** (e.g. `gpt-5.5`, `gpt-5.6-sol`)
-  when the role is on Codex.
+- A **Claude alias/name** (`opus` = Opus 4.8, `sonnet` = Sonnet 5, `haiku` = Haiku 4.5,
+  `fable` = Fable 5 (most capable), or a full `claude-*` name) when the role is on
+  Claude, **or** a **Codex model slug** (e.g. `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`,
+  `gpt-5.6-luna`) when the role is on Codex.
 - **Agent/model consistency is enforced.** If `AGENT_<ROLE>="codex"`, its
   `MODEL_<ROLE>` must be a Codex slug — a Claude alias is rejected at setup/preflight.
   Conversely a Claude role must use a Claude alias, not a `gpt-*` slug.
@@ -53,13 +54,22 @@ its stop conditions live in `loop.config.sh`, which setup does **not** touch.)
   against a shared blind spot, point `MODEL_REVIEW` at a different family/tier.
 
 ### `LOOP_EFFORT` and `EFFORT_<ROLE>` — reasoning effort
-- Legal values: `low | medium | high | xhigh | max` (`max` maps to Codex `xhigh`).
+- Legal values: `minimal | low | medium | high | xhigh | max | ultra`. This is the
+  union of what both CLIs accept; each value is translated to what the role's agent
+  actually supports, so one global is safe across a mixed Claude/Codex fleet.
+  - **Claude** `--effort` takes `low|medium|high|xhigh|max`; the Codex-only tiers are
+    down-mapped for Claude roles (`ultra`→`max`, `minimal`→`low`).
+  - **Codex** `model_reasoning_effort` takes `minimal|low|medium|high|xhigh` on every
+    model, and additionally `max|ultra` **only on `gpt-5.6-sol` / `gpt-5.6-terra`**. On
+    any other Codex model a `max`/`ultra` request is clamped down to `xhigh` (it
+    degrades, never errors). `ultra` also spawns parallel Codex subagents and is
+    preview-only — expect substantially higher token use.
 - `LOOP_EFFORT` is the global default for every role and the interactive sessions.
 - `EFFORT_<ROLE>` overrides `LOOP_EFFORT` for one role. Empty/removed/unrecognized =
   inherit `LOOP_EFFORT` (a typo here can never break a running loop — it falls back).
-- Claude receives `--effort`; Codex receives `model_reasoning_effort`. Higher = more
-  thinking per call = more cost. Ship clerical roles (`STOP_EVAL`, `EVIDENCE`) cheaper;
-  `EFFORT_IMPLEMENT` is the biggest lever — measure quality before lowering it.
+- Higher = more thinking per call = more cost. Ship clerical roles (`STOP_EVAL`,
+  `EVIDENCE`) cheaper; `EFFORT_IMPLEMENT` is the biggest lever — measure quality before
+  lowering it.
 
 ### `TURNS_NUDGE_AT` — runaway-context signal
 - Digits only; empty or removed = off. When one implement call consumes at least this
@@ -82,4 +92,5 @@ its stop conditions live in `loop.config.sh`, which setup does **not** touch.)
 4. `AGENT_<ROLE>` that is not `claude`, `codex`, or empty.
 5. A Codex role (`AGENT_<ROLE>="codex"`) whose `MODEL_<ROLE>` is a Claude alias — or a
    Claude role whose model is a `gpt-*` slug.
-6. An effort value outside `low|medium|high|xhigh|max`, or a non-numeric `TURNS_NUDGE_AT`.
+6. An effort value outside `minimal|low|medium|high|xhigh|max|ultra`, or a non-numeric
+   `TURNS_NUDGE_AT`.

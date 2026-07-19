@@ -42,7 +42,7 @@ The skill argument (if any) is the human's opening note.
    the human can scan. Present it as a table with columns: **Key**, **Legal values**,
    **What it controls**. Cover the knob families: `AGENT_<ROLE>` (claude | codex),
    `MODEL_<ROLE>` (a Claude alias or a Codex slug), `EFFORT_<ROLE>` / `LOOP_EFFORT`
-   (low..max), and `TURNS_NUDGE_AT`. List the phase roles (contract, plan, implement,
+   (minimal..ultra), and `TURNS_NUDGE_AT`. List the phase roles (contract, plan, implement,
    review, review-interim, stop-eval, evidence, decompose, supervise) and show the
    current value from the copy alongside each, so they see what they have now.
 
@@ -56,7 +56,7 @@ The skill argument (if any) is the human's opening note.
      uncomment it and set the value.
    - **Enforce agent/model consistency as you go:** if you set `AGENT_<ROLE>="codex"`,
      `MODEL_<ROLE>` must be a **Codex slug** (e.g. `gpt-5.5`), never a Claude alias
-     (`opus`/`sonnet`/`haiku`). If a role stays on Claude, its model must be a Claude
+     (`opus`/`sonnet`/`haiku`/`fable`). If a role stays on Claude, its model must be a Claude
      alias. Getting this wrong makes the harness reject the whole file.
    - Read the edited value back to the human and confirm it matches their intent.
 

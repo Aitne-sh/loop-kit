@@ -896,10 +896,22 @@ by default and falls back to Codex when the Claude CLI is absent; `--app codex` 
 | `MODEL_DECOMPOSE` | Supervisor: contract → task plan | **opus** |
 | `MODEL_SUPERVISE` | Supervisor: mid-run decisions on tasks | **opus** |
 
-The same file also sets reasoning effort (`low | medium | high | xhigh | max`):
-`LOOP_EFFORT` (default `xhigh`) is the global value, and `EFFORT_<ROLE>` (for example,
-`EFFORT_STOP_EVAL` or `EFFORT_IMPLEMENT`) overrides it per role. Claude receives
-`--effort`; Codex receives `model_reasoning_effort`, with `max` mapped to `xhigh`.
+Each `MODEL_<ROLE>` takes a Claude alias — `opus` (Opus 4.8), `sonnet` (Sonnet 5),
+`haiku` (Haiku 4.5), or `fable` (Fable 5, the most capable) — or a full `claude-*`
+name; a Codex-routed role takes a Codex slug instead (`gpt-5.5`, `gpt-5.6-sol`,
+`gpt-5.6-terra`, `gpt-5.6-luna`, …).
+
+The same file also sets reasoning effort
+(`minimal | low | medium | high | xhigh | max | ultra`): `LOOP_EFFORT` (default `xhigh`)
+is the global value, and `EFFORT_<ROLE>` (for example, `EFFORT_STOP_EVAL` or
+`EFFORT_IMPLEMENT`) overrides it per role. The value is translated to what each role's CLI
+accepts, so one global is safe across a mixed fleet: Claude `--effort` takes
+`low|medium|high|xhigh|max` (the Codex-only tiers down-map — `ultra`→`max`, `minimal`→`low`),
+while Codex `model_reasoning_effort` takes `minimal|low|medium|high|xhigh` on every model
+and additionally `max|ultra` **only on `gpt-5.6-sol` / `gpt-5.6-terra`** (on any other Codex
+model a `max`/`ultra` request is clamped to `xhigh`, so it degrades rather than errors).
+`ultra` also spawns parallel Codex subagents and is preview-only — expect much higher token
+use.
 The kit ships `EFFORT_STOP_EVAL="low"` and `EFFORT_EVIDENCE="medium"` so clerical roles
 do not use maximum reasoning by default. An empty or unrecognized override falls back
 to `LOOP_EFFORT` (a typo can never break a running loop). Model support still decides
@@ -975,7 +987,7 @@ The routable keys are `AGENT_IMPLEMENT`, `AGENT_PLAN`, `AGENT_REVIEW`,
 `AGENT_SUPERVISE`, and `AGENT_CONTRACT` (headless definition only — interactive sessions
 stay on Claude). Unset or unrecognized values safely fall back to `claude`;
 `AGENT_REVIEW_INTERIM` inherits `AGENT_REVIEW` when empty. A Codex-routed role must use a
-Codex model slug rather than `opus`, `sonnet`, `haiku`, or a `claude-*` model name.
+Codex model slug rather than `opus`, `sonnet`, `haiku`, `fable`, or a `claude-*` model name.
 Agent inheritance does not overwrite the independently tiered
 `MODEL_REVIEW_INTERIM`: when routing `AGENT_REVIEW` to Codex, also set
 `MODEL_REVIEW_INTERIM` to a Codex slug (or explicitly route interim review elsewhere).

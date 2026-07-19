@@ -1126,7 +1126,7 @@ need_contract_agent() { # start/auto preflight — require the CLI the DEFINITIO
     need_codex
     local model why; model=$(configured_role_model CONTRACT)
     case "$model" in
-      opus|sonnet|haiku|claude-*)
+      opus|sonnet|haiku|fable|claude-*)
         why="AGENT_CONTRACT=codex"
         if [ -z "$(get_model MODEL_CONTRACT "")" ]; then
           why="$why but MODEL_CONTRACT is unset (defaults to '$model', a Claude alias)"
@@ -1191,7 +1191,7 @@ need_agents() { # run/fleet preflight; each CLI is required only when routed-to
     need_codex "$scope"
     model=$(configured_role_model "$role")
     case "$model" in
-      opus|sonnet|haiku|claude-*)
+      opus|sonnet|haiku|fable|claude-*)
         # Name the key the user actually wrote: REVIEW_INTERIM inherits its
         # agent from AGENT_REVIEW, and an unset MODEL_<role> arrives here as a
         # Claude-alias default — a bare "MODEL_X='opus'" would accuse a line
@@ -1224,14 +1224,20 @@ resolve_effort() { # $1 optional role key (e.g. REVIEW) — echoes the effective
   # this resolves lazily inside every call, so a between-runs typo must degrade
   # to the inherited effort, never kill a mid-run loop (unlike the loop.config.sh
   # enums, which are whitelist-validated once at load and may die loudly).
+  # The accepted set is the UNION of Claude and Codex efforts; the per-agent
+  # emitters below translate it (effort_opt for Claude, codex_effort_opt for
+  # Codex) so each CLI only ever receives a value it actually accepts:
+  #   Claude --effort:            low|medium|high|xhigh|max
+  #   Codex model_reasoning_effort: minimal|low|medium|high|xhigh (all models),
+  #                                 plus max|ultra on gpt-5.6-sol/terra.
   local e
   if [ -n "${1:-}" ]; then
     e=$(get_model "EFFORT_$1" "")
-    case "$e" in low|medium|high|xhigh|max) printf '%s' "$e"; return 0 ;; esac
+    case "$e" in minimal|low|medium|high|xhigh|max|ultra) printf '%s' "$e"; return 0 ;; esac
   fi
   e=$(get_model LOOP_EFFORT "")
   case "$e" in
-    low|medium|high|xhigh|max) printf '%s' "$e" ;;
+    minimal|low|medium|high|xhigh|max|ultra) printf '%s' "$e" ;;
     *) : ;;
   esac
 }
@@ -1240,14 +1246,32 @@ effort_opt() { # $1 optional role key — echoes '--effort <level>' for that rol
   # effective effort, else nothing. Unquoted expansion at the call site
   # word-splits this into two args (the level has no spaces); when empty it
   # vanishes, adding no argument.
+  # Claude --effort accepts only low|medium|high|xhigh|max, so down-map the
+  # Codex-only tiers (ultra->max, minimal->low): a Claude role that inherits a
+  # Codex-oriented global effort still gets a valid flag, never an error.
   local e; e=$(resolve_effort "${1:-}")
-  [ -z "$e" ] || printf -- '--effort %s' "$e"
+  [ -n "$e" ] || return 0
+  case "$e" in ultra) e=max ;; minimal) e=low ;; esac
+  printf -- '--effort %s' "$e"
 }
 
-codex_effort_opt() { # $1 optional role key -> '-c model_reasoning_effort=<v>'
+codex_effort_opt() { # $1 role key, $2 optional resolved Codex model slug ->
+  # '-c model_reasoning_effort=<v>'. Codex accepts minimal|low|medium|high|xhigh
+  # on all models, and additionally max|ultra only on gpt-5.6-sol/terra. Clamp an
+  # above-ceiling request down to xhigh so a portable/global effort value (or a
+  # typo like max on gpt-5.5) degrades instead of erroring the call — the same
+  # fail-safe posture as resolve_effort.
   local e; e=$(resolve_effort "${1:-}")
-  [ "$e" != max ] || e=xhigh
-  [ -z "$e" ] || printf -- '-c model_reasoning_effort=%s' "$e"
+  [ -n "$e" ] || return 0
+  case "$e" in
+    max|ultra)
+      local m="${2:-}"; [ -n "$m" ] || m=$(configured_role_model "${1:-}")
+      case "$m" in
+        gpt-5.6-sol*|gpt-5.6-terra*) : ;;  # supports max/ultra -> pass through
+        *) e=xhigh ;;                       # every other Codex model caps at xhigh
+      esac ;;
+  esac
+  printf -- '-c model_reasoning_effort=%s' "$e"
 }
 
 codex_prompt() { # Claude skill invocation -> deterministic Codex direct-file prompt
@@ -1663,7 +1687,7 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
     # cmd_fleet's broader preflight.
     need_codex
     case "$model" in
-      opus|sonnet|haiku|claude-*)
+      opus|sonnet|haiku|fable|claude-*)
         die_next "AGENT_${role:-UNKNOWN}=codex but MODEL_${role:-UNKNOWN}='$model' is a Claude alias" "set MODEL_${role:-UNKNOWN} to a Codex model slug (e.g. gpt-5.5) in loop.models.sh" ;;
     esac
   fi
@@ -1678,7 +1702,7 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
     msg="$logdir/${label}.msg"
     set --
     local codex_eff="" codex_sandbox
-    codex_eff=$(codex_effort_opt "$role")
+    codex_eff=$(codex_effort_opt "$role" "$model")
     if [ -n "$codex_eff" ]; then
       # codex_effort_opt only emits two whitelist-derived words.
       # shellcheck disable=SC2086
@@ -1717,8 +1741,9 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
     else
       set --
     fi
-    local eff; eff=$(resolve_effort "$role")
-    [ -z "$eff" ] || set -- "$@" --effort "$eff"
+    local eff; eff=$(effort_opt "$role")
+    # shellcheck disable=SC2086  # effort_opt emits '--effort <level>' or nothing
+    [ -z "$eff" ] || set -- "$@" $eff
     if [ -n "${CLAUDE_RESUME_SESSION:-}" ]; then
       set -- "$@" --resume "$CLAUDE_RESUME_SESSION"
     fi
@@ -9745,7 +9770,7 @@ validate_models() {
     BEGIN {
       split("CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE", r, " ")
       for (i in r) role[r[i]] = 1
-      split("low medium high xhigh max", e, " ")
+      split("minimal low medium high xhigh max ultra", e, " ")
       for (i in e) eff[e[i]] = 1
       bad = 0
     }
@@ -9771,7 +9796,7 @@ validate_models() {
     }
     {
       if (key == "LOOP_EFFORT") {
-        if (val != "" && !(val in eff)) { print "line " NR ": LOOP_EFFORT must be low|medium|high|xhigh|max: " $0; bad = 1 }
+        if (val != "" && !(val in eff)) { print "line " NR ": LOOP_EFFORT must be minimal|low|medium|high|xhigh|max|ultra: " $0; bad = 1 }
         next
       }
       if (key == "TURNS_NUDGE_AT") {
@@ -9792,7 +9817,7 @@ validate_models() {
       if (key ~ /^EFFORT_/) {
         ro = substr(key, 8)
         if (!(ro in role)) { print "line " NR ": unknown role in key " key; bad = 1; next }
-        if (val != "" && !(val in eff)) { print "line " NR ": EFFORT_" ro " must be low|medium|high|xhigh|max: " $0; bad = 1 }
+        if (val != "" && !(val in eff)) { print "line " NR ": EFFORT_" ro " must be minimal|low|medium|high|xhigh|max|ultra: " $0; bad = 1 }
         next
       }
       print "line " NR ": unknown key " key; bad = 1
@@ -9811,7 +9836,7 @@ validate_models() {
         if (a == "") a = "claude"
         if (a == "codex") {
           if (!mset || m == "") { print "config: AGENT_" ro "=codex but MODEL_" ro " is unset (defaults to a Claude alias) — set it to a Codex slug"; bad = 1 }
-          else if (m ~ /^(opus|sonnet|haiku|claude-)/) { print "config: AGENT_" ro "=codex but MODEL_" ro "=\"" m "\" is a Claude alias — use a Codex slug"; bad = 1 }
+          else if (m ~ /^(opus|sonnet|haiku|fable|claude-)/) { print "config: AGENT_" ro "=codex but MODEL_" ro "=\"" m "\" is a Claude alias — use a Codex slug"; bad = 1 }
         } else if (mset && m ~ /^gpt/) {
           print "config: " ro " runs on Claude but MODEL_" ro "=\"" m "\" is a Codex slug"; bad = 1
         }
@@ -10209,7 +10234,7 @@ cmd_status() {
   local _eo="" _r _v
   for _r in IMPLEMENT REVIEW PLAN CONTRACT EVIDENCE STOP_EVAL DECOMPOSE SUPERVISE; do
     _v=$(get_model "EFFORT_$_r" "")
-    case "$_v" in low|medium|high|xhigh|max) _eo="$_eo $(printf '%s' "$_r" | tr '[:upper:]_' '[:lower:]-')=$_v" ;; esac
+    case "$_v" in minimal|low|medium|high|xhigh|max|ultra) _eo="$_eo $(printf '%s' "$_r" | tr '[:upper:]_' '[:lower:]-')=$_v" ;; esac
   done
   echo "effort:   $(resolve_effort | grep . || echo 'cli-default')${_eo:+ (overrides:${_eo})}"
   if [ -f .loop/journal.jsonl ]; then

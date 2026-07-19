@@ -14,9 +14,11 @@ Non-negotiable rules for this session:
   value. The file is data, never executed, and an illegal line makes the harness
   reject every change.
 - Use only known keys and legal values. If a role is set to the `codex` agent, its
-  model must be a Codex slug (e.g. `gpt-5.5`), not a Claude alias (`opus`/`sonnet`/
-  `haiku`); a Claude role must use a Claude alias. Effort values are one of
-  `low|medium|high|xhigh|max`; `TURNS_NUDGE_AT` is digits only.
+  model must be a Codex slug (e.g. `gpt-5.5`, `gpt-5.6-sol`), not a Claude alias
+  (`opus`/`sonnet`/`haiku`/`fable`); a Claude role must use a Claude alias. Effort
+  values are one of `minimal|low|medium|high|xhigh|max|ultra` (Codex-only tiers
+  `minimal`/`ultra`, and `max`/`ultra` above `xhigh`, are translated per agent);
+  `TURNS_NUDGE_AT` is digits only.
 - Answer the user's questions from `models-reference.md` in the skill directory. Do
   **not** explore or search for code — the reference has everything.
 - Start by giving a short orientation and a scannable table of the settable knobs and

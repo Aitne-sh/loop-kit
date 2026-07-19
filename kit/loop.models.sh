@@ -2,6 +2,10 @@
 # Edit freely (no re-approval needed); parsed as plain key=value, never executed.
 # Format: MODEL_<ROLE>="model-name"  (a Claude alias/full name or Codex slug)
 #
+# Claude aliases: opus (Opus 4.8), sonnet (Sonnet 5), haiku (Haiku 4.5),
+#   fable (Fable 5, most capable) — or any full "claude-*" model name.
+# Codex slugs: gpt-5.5, gpt-5.6-sol / -terra / -luna, etc.
+#
 # Defaults: heavyweight model for the important work (implementation, review,
 # planning, contract), lightweight model for stop evaluation.
 
@@ -36,7 +40,7 @@ MODEL_REVIEW_INTERIM="sonnet"
 # AGENT_<ROLE> = "claude" (default) | "codex". Unset/typo -> claude (a typo
 # can never kill a running loop; same degrade posture as EFFORT_*).
 # When a role routes to codex, set MODEL_<ROLE> to a Codex model slug
-# (e.g. gpt-5.5, gpt-5.6-sol) — Claude aliases (opus/sonnet/haiku) are
+# (e.g. gpt-5.5, gpt-5.6-sol) — Claude aliases (opus/sonnet/haiku/fable) are
 # rejected at run preflight.
 # Recipe — plan/review on Claude, implementation on Codex:
 #   AGENT_IMPLEMENT="codex"
@@ -57,10 +61,19 @@ MODEL_REVIEW_INTERIM="sonnet"
 # route AGENT_REVIEW_INTERIM to another agent).
 
 # Reasoning effort for every in-loop agent call. Claude receives `--effort`;
-# Codex receives `model_reasoning_effort` (`max` maps to Codex's `xhigh`).
-# One of: low | medium | high | xhigh | max. Applies to all roles above
-# (implement, review, plan, contract, evidence, stop-eval, decompose, supervise)
-# and to the interactive contract sessions. Higher = more thinking per call.
+# Codex receives `model_reasoning_effort`. One of:
+#   minimal | low | medium | high | xhigh | max | ultra
+# The value is translated to what each CLI actually accepts, so a single global
+# is safe across a mixed Claude/Codex fleet:
+#   * Claude --effort takes low|medium|high|xhigh|max; the Codex-only tiers are
+#     down-mapped for Claude roles (ultra->max, minimal->low).
+#   * Codex takes minimal|low|medium|high|xhigh on every model, and additionally
+#     max|ultra ONLY on gpt-5.6-sol / gpt-5.6-terra. On any other Codex model a
+#     max/ultra request is clamped down to xhigh (so it degrades, never errors).
+# Applies to all roles above (implement, review, plan, contract, evidence,
+# stop-eval, decompose, supervise) and to the interactive contract sessions.
+# Higher = more thinking per call. `ultra` additionally spawns parallel Codex
+# subagents and is preview-only — expect substantially higher token use.
 #
 # Claude routing requires a Claude Code CLI that supports --effort (>= ~2.1).
 # Whether an effort level changes behavior ultimately depends on the model.
