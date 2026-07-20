@@ -1622,31 +1622,104 @@ agent_log_path() { # $1 label, $2 json|err
 
 normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
   local raw="$1" msg="$2" out="$3" status="$4"
-  local thread="" thread_escaped="" turns=0 is_error=false result_escaped="" error_line="" error_text="" error_tmp=""
+  local summary="" thread="" thread_escaped="" turns=0 failed=0 error_nr=0 fatal_type=""
+  local is_error=false result_escaped="" error_line="" error_text="" error_tmp=""
+  CODEX_FAIL_CAUSE=""
   if [ -f "$raw" ]; then
-    thread=$(awk '
-      $0 ~ /"type"[[:space:]]*:[[:space:]]*"thread.started"/ \
-        && $0 ~ /"thread_id"[[:space:]]*:/ {
-        s=$0
-        sub(/^.*"thread_id"[[:space:]]*:[[:space:]]*"/, "", s)
-        sub(/".*$/, "", s)
-        print s
-        exit
+    # One pass over the event stream, TOP-LEVEL fields only. An item payload
+    # that merely contains the text "type":"error" (a lint finding, a quoted
+    # transcript) must not fail the call — only a real top-level turn.failed/
+    # error event may. LC_ALL=C keeps byte indexing locale-independent.
+    summary=$(LC_ALL=C awk '
+      function skip_ws(s, i, n) { while (i <= n && substr(s, i, 1) ~ /[ \t\r]/) i++; return i }
+      function read_string(s, i, n,   c) {   # s[i] is the opening quote; value in STR
+        STR = ""; STR_OK = 0
+        i++
+        while (i <= n) {
+          c = substr(s, i, 1)
+          if (c == "\\") { i += 2; continue }   # skip every escape pair verbatim
+          if (c == "\"") { STR_OK = 1; return i + 1 }
+          STR = STR c; i++
+        }
+        return i
       }
-    ' "$raw" 2>/dev/null || true)
-    turns=$(awk '$0 ~ /"type"[[:space:]]*:[[:space:]]*"item.completed"/ { n++ } END { print n+0 }' "$raw" 2>/dev/null || true)
-    if awk '$0 ~ /"type"[[:space:]]*:[[:space:]]*"(turn.failed|error)"/ { found=1; exit } END { exit !found }' "$raw" 2>/dev/null; then
-      is_error=true
-    fi
+      function skip_container(s, i, n,   c, depth, instr) {
+        depth = 0; instr = 0
+        while (i <= n) {
+          c = substr(s, i, 1)
+          if (instr) { if (c == "\\") { i += 2; continue } if (c == "\"") instr = 0; i++; continue }
+          if (c == "\"") { instr = 1; i++; continue }
+          if (c == "{" || c == "[") { depth++; i++; continue }
+          if (c == "}" || c == "]") { depth--; i++; if (depth == 0) return i; continue }
+          i++
+        }
+        return i
+      }
+      function top_fields(s,   n, i, c, key) {   # LTYPE/LTHREAD from top-level keys only
+        LTYPE = ""; LTHREAD = ""
+        n = length(s)
+        i = skip_ws(s, 1, n)
+        if (substr(s, i, 1) != "{") return
+        i++
+        while (i <= n) {
+          i = skip_ws(s, i, n)
+          if (substr(s, i, 1) != "\"") return
+          i = read_string(s, i, n); key = STR
+          if (!STR_OK) return
+          i = skip_ws(s, i, n)
+          if (substr(s, i, 1) != ":") return
+          i = skip_ws(s, i + 1, n); c = substr(s, i, 1)
+          if (c == "\"") {
+            i = read_string(s, i, n)
+            if (!STR_OK) return
+            if (key == "type") LTYPE = STR
+            else if (key == "thread_id") LTHREAD = STR
+          } else if (c == "{" || c == "[") {
+            i = skip_container(s, i, n)
+          } else {
+            while (i <= n) { c = substr(s, i, 1); if (c == "," || c == "}" || c ~ /[ \t\r]/) break; i++ }
+          }
+          i = skip_ws(s, i, n); c = substr(s, i, 1)
+          if (c == ",") { i++; continue }
+          return
+        }
+      }
+      {
+        top_fields($0)
+        if (LTYPE == "item.completed") turns++
+        else if (LTYPE == "thread.started") { if (thread == "" && LTHREAD != "") thread = LTHREAD }
+        else if (LTYPE == "turn.failed" || LTYPE == "error") {
+          if (LTYPE == "error" && error_nr == 0) error_nr = NR
+          if (!failed) { failed = 1; fatal_type = LTYPE }
+        }
+      }
+      END { printf "%d|%d|%d|%s|%s\n", turns+0, failed+0, error_nr+0, fatal_type, thread }
+    ' "$raw" 2>/dev/null) || summary=""
+    # thread reads last: an exotic thread_id containing "|" folds into the
+    # final field instead of shifting the numeric ones.
+    IFS='|' read -r turns failed error_nr fatal_type thread <<EOF
+$summary
+EOF
   fi
   case "$turns" in ''|*[!0-9]*) turns=0 ;; esac
+  case "$error_nr" in ''|*[!0-9]*) error_nr=0 ;; esac
+  [ "$failed" = 1 ] || failed=0
+  if [ "$failed" = 1 ]; then
+    is_error=true
+    CODEX_FAIL_CAUSE="${fatal_type:-fatal} event"
+  fi
   [ "$status" -eq 0 ] || is_error=true
-  [ -s "$msg" ] || is_error=true
+  if [ ! -s "$msg" ]; then
+    is_error=true
+    CODEX_FAIL_CAUSE="${CODEX_FAIL_CAUSE:+$CODEX_FAIL_CAUSE; }no final message"
+  fi
 
   if [ -s "$msg" ]; then
     result_escaped=$(json_escape < "$msg")
-  elif [ -f "$raw" ]; then
-    error_line=$(awk '$0 ~ /"type"[[:space:]]*:[[:space:]]*"error"/ { print; exit }' "$raw" 2>/dev/null || true)
+  elif [ "$error_nr" -gt 0 ] && [ -f "$raw" ]; then
+    # no final message: surface the first top-level error event's message
+    # (turn.failed nests its message one level down — json_field skips it)
+    error_line=$(sed -n "${error_nr}p" "$raw" 2>/dev/null || true)
     if [ -n "$error_line" ]; then
       # json_field intentionally accepts regular files only; stage this one
       # event beside the final envelope, then remove it immediately.
@@ -1676,6 +1749,7 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
   rm -f "$out" "$err" "$logdir/${label}.codex.jsonl" "$logdir/${label}.msg"
   local pid status elapsed cost is_err timed_out=0
   AGENT_FAIL_DIAG=""   # set on failure; consumed by journal reasons + terminal messages
+  CODEX_FAIL_CAUSE=""  # per-call; set by normalize_codex_envelope, never carried over
   agent=$(resolve_agent "$role")
   # resolve_agent runs in command substitution (a subshell), so consume the
   # parent-shell one-shot explicitly here; clearing inside the resolver alone
@@ -1818,9 +1892,12 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
     # NOT on stderr — surface both, and preserve the evidence before the next
     # run's identically-labeled call overwrites it
     local result_preview="" errtail=""
-    result_preview=$(json_field "$out" result "" | head -c 200 | tr '\n' ' ')
-    [ ! -s "$err" ] || errtail=$(tail -c 200 "$err" | tr '\n' ' ')
+    # LC_ALL=C: head/tail -c may split a UTF-8 char and BSD tr aborts on the
+    # partial sequence in a multibyte locale ("tr: Illegal byte sequence").
+    result_preview=$(json_field "$out" result "" | head -c 200 | LC_ALL=C tr '\n' ' ')
+    [ ! -s "$err" ] || errtail=$(tail -c 200 "$err" | LC_ALL=C tr '\n' ' ')
     AGENT_FAIL_DIAG="exit=$status is_error=$is_err"
+    [ -z "${CODEX_FAIL_CAUSE:-}" ] || AGENT_FAIL_DIAG="$AGENT_FAIL_DIAG (cause: $CODEX_FAIL_CAUSE)"
     [ "$timed_out" = 0 ] || AGENT_FAIL_DIAG="$AGENT_FAIL_DIAG (watchdog kill after ${iter_timeout}s)"
     [ -z "$result_preview" ] || AGENT_FAIL_DIAG="$AGENT_FAIL_DIAG; msg: $result_preview"
     [ -z "$errtail" ] || AGENT_FAIL_DIAG="$AGENT_FAIL_DIAG; stderr: $errtail"

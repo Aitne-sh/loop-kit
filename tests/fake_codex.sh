@@ -9,7 +9,12 @@
 # LOOP_FAKE_CODEX=FAIL:   emit turn.failed + error events and exit 1.
 # LOOP_FAKE_CODEX=NOMSG: emit a successful JSONL turn but do not write -o.
 # LOOP_FAKE_CODEX=TURNFAIL: write -o and exit 0, but emit turn.failed.
+# LOOP_FAKE_CODEX=TURNFAIL_UTF8: TURNFAIL with a long multibyte -o message
+#   (exercises UTF-8-safe failure diagnostics under a multibyte locale).
 # LOOP_FAKE_CODEX=REORDER: emit valid JSONL with "type" after other keys.
+# LOOP_FAKE_CODEX=NESTED_ERROR: successful turn whose item payloads contain
+#   "type":"error" / "turn.failed" as DATA (nested objects and string text) —
+#   the adapter must classify by top-level event type only.
 # LOOP_FAKE_CODEX=OLD:   exec --help omits --json (capability-probe fixture).
 # LOOP_FAKE_CODEX=NOAUTH: login status exits 1; actual exec still succeeds.
 
@@ -136,6 +141,14 @@ run_exec() {
     printf '{"type":"turn.failed","error":{"message":"fake codex turn failure"}}\n'
     return 0
   fi
+  if [ "${LOOP_FAKE_CODEX:-}" = TURNFAIL_UTF8 ]; then
+    # >200 bytes of 3-byte UTF-8 chars: the harness's 200-byte diagnostic
+    # truncation is guaranteed to land mid-character.
+    printf '%s\n' "偽のコーデックス障害:マルチバイト診断テキストが二百バイトを超えて続き、切断点が必ず文字の途中に来ることを保証します。さらに続く日本語テキストで長さを確保します。" > "$output"
+    printf '{"type":"thread.started","thread_id":"%s"}\n' "$thread"
+    printf '{"type":"turn.failed","error":{"message":"偽のマルチバイト障害"}}\n'
+    return 0
+  fi
 
   skill=$(printf '%s\n' "$prompt" \
     | sed -nE 's#.*\.(claude|agents)/skills/loop-([a-z-]+)/SKILL\.md.*#\2#p')
@@ -167,6 +180,16 @@ run_exec() {
     printf '{"sequence":1,"type":"turn.started"}\n'
     printf '{"item":{"type":"agent_message","text":"fake"},"type":"item.completed"}\n'
     printf '{"usage":{"input_tokens":0,"output_tokens":0},"type":"turn.completed"}\n'
+  elif [ "${LOOP_FAKE_CODEX:-}" = NESTED_ERROR ]; then
+    # the delegated work already ran and -o holds its real result; only the
+    # event stream is adversarial: fatal-looking markers as nested DATA
+    printf '{"type":"thread.started","thread_id":"%s"}\n' "$thread"
+    printf '{"type":"turn.started"}\n'
+    # nested object whose FIRST key is a type:error, before the top-level type
+    printf '{"item":{"type":"error","text":"lint said \\"type\\":\\"error\\" somewhere"},"type":"item.completed"}\n'
+    # string data carrying the exact fatal markers the old line-regex matched
+    printf '{"type":"item.completed","item":{"type":"agent_message","text":"transcript quotes \\"type\\": \\"turn.failed\\" as data"}}\n'
+    printf '{"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}\n'
   else
     printf '{"type":"thread.started","thread_id":"%s"}\n' "$thread"
     printf '{"type":"turn.started"}\n'

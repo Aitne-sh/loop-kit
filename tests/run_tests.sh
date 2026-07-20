@@ -1893,6 +1893,48 @@ else
   bad "NOMSG did not fail closed with preserved JSONL" codex-nomsg
 fi
 
+echo "== nested \"type\":\"error\" item data stays diagnostic (top-level classification) =="
+make_fixture codex-nested-error
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+RC=0
+LOOP_FAKE_CODEX=NESTED_ERROR LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/codex-nested-error.out" 2>&1 </dev/null || RC=$?
+check "exit 0 despite nested error/turn.failed strings in item payloads" codex-nested-error 0 "$RC"
+if [ "$RC" = 0 ]; then
+  tid=$(json_scalar .loop/docs/certification.json task_id)
+  rid=$(json_scalar .loop/docs/certification.json run_id)
+  nested_envelope=".loop/logs/$tid/$rid/iter-1.json"
+  if grep -q '"is_error": false' "$nested_envelope" \
+     && grep -q '"num_turns": 2' "$nested_envelope"; then
+    ok "only top-level events counted: success envelope, both items as turns"
+  else
+    bad "nested item data leaked into classification: $(cat "$nested_envelope" 2>/dev/null)" codex-nested-error
+  fi
+else
+  bad "nested-error fixture run failed; envelope left unchecked" codex-nested-error
+fi
+
+echo "== Codex failure diagnostics survive a multibyte locale (no tr crash) =="
+make_fixture codex-utf8-diag
+printf 'AGENT_IMPLEMENT="codex"\nMODEL_IMPLEMENT="gpt-5.5"\n' >> loop.models.sh
+utf8_locale=$(locale -a 2>/dev/null | grep -iEm1 '^(en_US\.utf-?8|C\.utf-?8)$' || true)
+RC=0
+LC_ALL="${utf8_locale:-C}" LOOP_FAKE_CODEX=TURNFAIL_UTF8 LOOP_CLAUDE_CMD="$FAKE" \
+  LOOP_FAKE_SCENARIO="READY_NOW" LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/codex-utf8-diag.out" 2>&1 </dev/null || RC=$?
+check "exit code 4 (turn.failed stays authoritative)" codex-utf8-diag 4 "$RC"
+if ! grep -q 'Illegal byte sequence' "$WORK/codex-utf8-diag.out"; then
+  ok "no tr locale crash while truncating a multibyte failure preview"
+else
+  bad "diagnostic truncation still crashes on split UTF-8" codex-utf8-diag
+fi
+if grep '"state": "AGENT_ERROR"' .loop/journal.jsonl | grep -q 'cause: turn.failed event'; then
+  ok "failure cause names the fatal event"
+else
+  bad "cause tag missing: $(grep AGENT_ERROR .loop/journal.jsonl | head -1)" codex-utf8-diag
+fi
+
 echo "== API-level failure (is_error JSON, exit 0): diagnosed + cost still tracked =="
 make_fixture errjson
 run_loop "ERRJSON,ERRJSON"
