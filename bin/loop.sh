@@ -1681,14 +1681,21 @@ normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
     # error event may. LC_ALL=C keeps byte indexing locale-independent.
     summary=$(LC_ALL=C awk '
       function skip_ws(s, i, n) { while (i <= n && substr(s, i, 1) ~ /[ \t\r]/) i++; return i }
-      function read_string(s, i, n,   c) {   # s[i] is the opening quote; value in STR
+      function read_string(s, i, n, capture,   c) {   # s[i] is the opening quote
+        # value in STR. Accumulate ONLY when the caller needs it (authority keys
+        # and their values), capped at 256 bytes: per-char string concat is
+        # quadratic in awk, and item payloads legally carry entire agent
+        # messages — building those strings just to discard them would make
+        # this scan O(payload²) per event line. A capped-out value simply never
+        # equals a short authority token, which is the correct outcome.
         STR = ""; STR_OK = 0
         i++
         while (i <= n) {
           c = substr(s, i, 1)
           if (c == "\\") { i += 2; continue }   # skip every escape pair verbatim
           if (c == "\"") { STR_OK = 1; return i + 1 }
-          STR = STR c; i++
+          if (capture && length(STR) < 256) STR = STR c
+          i++
         }
         return i
       }
@@ -1713,13 +1720,13 @@ normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
         while (i <= n) {
           i = skip_ws(s, i, n)
           if (substr(s, i, 1) != "\"") return
-          i = read_string(s, i, n); key = STR
+          i = read_string(s, i, n, 1); key = STR
           if (!STR_OK) return
           i = skip_ws(s, i, n)
           if (substr(s, i, 1) != ":") return
           i = skip_ws(s, i + 1, n); c = substr(s, i, 1)
           if (c == "\"") {
-            i = read_string(s, i, n)
+            i = read_string(s, i, n, (key == "type" || key == "thread_id"))
             if (!STR_OK) return
             if (key == "type") LTYPE = STR
             else if (key == "thread_id") LTHREAD = STR
@@ -1734,7 +1741,24 @@ normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
         }
       }
       {
-        top_fields($0)
+        # Shrink the line at C speed BEFORE the per-char structural scan: item
+        # payloads legally carry megabytes of message text, and awk per-char
+        # substr walks over them cost ~10s/MB on BSD awk. Collapsing escape
+        # pairs first makes every string body quote-free, so string boundaries
+        # become plain "..." regions; replacing long bodies with "~" then
+        # leaves a tiny line with IDENTICAL top-level structure (string
+        # contents cannot affect structure once escapes are collapsed), and
+        # authority values (event types, thread ids) are far below the 64-byte
+        # keep threshold.
+        line = $0
+        gsub(/\\./, "~", line)
+        m = split(line, parts, "\"")
+        line = ""
+        for (k = 1; k <= m; k++) {
+          if (k % 2 == 1) line = line parts[k]
+          else line = line "\"" (length(parts[k]) <= 64 ? parts[k] : "~") "\""
+        }
+        top_fields(line)
         if (LTYPE == "item.completed") turns++
         else if (LTYPE == "thread.started") { if (thread == "" && LTHREAD != "") thread = LTHREAD }
         else if (LTYPE == "turn.failed" || LTYPE == "error") {
@@ -2131,9 +2155,10 @@ finish() { # $1 state, $2 reason
       # read (a `human` checklist row awaiting sign-off, 3 failed fix attempts
       # on one error) — show it like the NEEDS_* states do, or the "what should
       # I look at" the loop wrote stays buried in .loop/docs. Gate on a real
-      # actionable entry, not the template marker: agents may append entries
-      # without stripping the pristine marker.
-      if decision_requests_present; then
+      # AGENT-numbered entry (deliberately narrower than the NEEDS_*/PENDING
+      # gate): harness-authored DR-CONTRACT/DR-FLEET blocks persist after they
+      # are answered, and reprinting one here as "from this run" misleads.
+      if grep -qE '^## DR-[0-9]' .loop/docs/decision-requests.md 2>/dev/null; then
         echo
         echo "── Decision request(s) from this run ──"
         print_decision_requests

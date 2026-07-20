@@ -160,9 +160,11 @@ the repository `.codex/**` control plane are copied byte-for-byte into each work
   `read-only` is a local-filesystem boundary only.
 - **`RISK_REQUIRES_APPROVAL` is a guard verdict, not a decision request.** finish() shows
   the dedicated risk box (`print_next_actions risk`) and never the decision-request file;
-  agents must not author DRs or decision HTML for RISK. `decision_requests_present()`
-  gates every DR display on a real heading (the pristine `## DR-N:` template example is
-  not actionable).
+  agents must not author DRs or decision HTML for RISK. NEEDS_*/PENDING displays gate on
+  `decision_requests_present()` (any real DR heading; the pristine `## DR-N:` template
+  example is not actionable); BLOCKED/STALLED keep the deliberately narrower
+  `^## DR-[0-9]` gate — answered DR-CONTRACT/DR-FLEET blocks persist in the file and must
+  not reprint there as "from this run".
 
 ## Concurrent Claude Code and Codex sessions
 
