@@ -34,8 +34,20 @@ the trust boundary.
 
 ---
 
+## Demo
+
+https://github.com/user-attachments/assets/493626dd-8671-4abf-857b-24ede90cae65
+
+82 seconds — the shift from reviewing diffs to authoring intent: the definition
+interview that surfaces the missing requirement *before* implementation starts, and
+the evidence report you read in place of a diff. Runs on Claude Code, Codex, or a
+role-by-role mix of both.
+
+---
+
 ## Table of contents
 
+- [Demo](#demo)
 - [How it works at a glance](#how-it-works-at-a-glance)
 - [What you need](#what-you-need)
 - [Quickstart](#quickstart)
