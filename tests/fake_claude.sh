@@ -48,6 +48,11 @@
 #                      (part-d ∥ part-e) — no single completing owner, rejected)
 # LOOP_FAKE_DECOMPOSE_REVIEW: verdicts per /loop-decompose-review call
 #                     (APPROVE | REVISE | NOVERDICT)
+# LOOP_FAKE_IMPL_PLAN_REVIEW: verdicts per /loop-plan-review call — the
+#                     iteration-0 implementation-plan review; distinct from
+#                     LOOP_FAKE_PLAN_REVIEW, which drives the fleet
+#                     phase-boundary /loop-supervise mode=plan-review
+#                     (APPROVE | REVISE | NOVERDICT)
 # LOOP_FAKE_SUPERVISE: decisions per /loop-supervise call
 #                     (ANSWER | REPLAN | REPLAN_DROP | REPLAN_CHAIN | REPLAN_FORK
 #                      | REPLAN_FORKJOIN | REPLAN_FORKJOIN_CARRY | REPLAN_CYCLE
@@ -846,10 +851,26 @@ EOF
     esac
     exit 0
     ;;
+  /loop-plan-review*)   # must precede /loop-plan* (prefix overlap)
+    iprv=$(next_from_list "${LOOP_FAKE_IMPL_PLAN_REVIEW:-APPROVE}" .loop/fake-implplanrev-i)
+    case "$iprv" in
+      REVISE)
+        emit_json "$cost" "Analysis: milestone 1 does not advance its cited REQ.\n\nIMPL-PLAN-REVIEW: REVISE 1. M1 cites a REQ its work cannot complete" ;;
+      NOVERDICT)
+        emit_json "$cost" "Plan looks fine but I forgot the output protocol entirely." ;;
+      *)
+        emit_json "$cost" "IMPL-PLAN-REVIEW: APPROVE milestones are real and iteration-sized" ;;
+    esac
+    exit 0
+    ;;
   /loop-plan*)
     # Read-only planner: return a schema-valid payload for the harness to
     # validate and publish. Milestones derive from the fixture's actual
     # contract REQ headings so every fixture keeps exact REQ coverage.
+    # Record whether this call could see validator/reviewer feedback from a
+    # prior attempt (the harness must keep the file alive across the retry).
+    [ ! -f .loop/plan-feedback.md ] \
+      || head -1 .loop/plan-feedback.md >> .loop/fake-plan-fb-seen
     fake_planner_tamper plan "${LOOP_FAKE_PLAN_TAMPER:-}"
     pv=$(next_from_list "${LOOP_FAKE_PLAN:-READY}" .loop/fake-plan-i)
     FAKE_IMPLEMENTATION_PLAN=.loop/fake-implementation-plan

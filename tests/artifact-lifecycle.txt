@@ -62,6 +62,8 @@
 .loop/decompose-parse.err contract
 .loop/implementation-plan-parse.err contract
 .loop/plan-candidates contract
+.loop/plan-feedback.md contract
+.loop/plan-review-feedback.md contract
 .loop/decompose-review-feedback.md contract
 .loop/master-contract.md contract
 .loop/parallel-context.md contract

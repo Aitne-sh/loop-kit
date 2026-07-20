@@ -484,6 +484,7 @@ codex_skill_names() {
     loop-evidence \
     loop-iterate \
     loop-plan \
+    loop-plan-review \
     loop-review \
     loop-setup \
     loop-stop-eval \
@@ -493,7 +494,7 @@ codex_skill_names() {
 codex_skill_supported() {
   case "${1:-}" in
     loop-contract|loop-contract-review|loop-decompose|loop-decompose-review|\
-    loop-evidence|loop-iterate|loop-plan|loop-review|loop-setup|loop-stop-eval|loop-supervise)
+    loop-evidence|loop-iterate|loop-plan|loop-plan-review|loop-review|loop-setup|loop-stop-eval|loop-supervise)
       return 0 ;;
     *) return 1 ;;
   esac
@@ -7047,32 +7048,124 @@ validate_implementation_plan() { # $1 plan path — fixed section schema + exact
   return 0
 }
 
-generate_implementation_plan() { # iteration-0: read-only planner + harness publication
-  local res verdict why call_ok=1 errf=.loop/implementation-plan-parse.err
-  prepare_plan_candidates \
-    || die_next "could not prepare a clean ignored implementation-plan staging area" "restore .loop/plan-candidates as an untracked ignored directory, then ./loop.sh run"
+run_plan_once() { # $1 label, $2 optional prompt suffix (retry feedback pointer)
+  # — one generate+stage+validate round for the iteration-0 implementation
+  # plan. Publication happens ONLY in generate_implementation_plan after the
+  # (optional) independent review re-validates. Failure: .loop/plan-feedback.md
+  # written for the retry, rc 1. The file must survive into the NEXT attempt
+  # (the skill reads it to fix the violations) — it is cleared on success here
+  # and at the start of a fresh flow, never between attempts.
+  local label="$1" res verdict call_ok=1 errf=.loop/implementation-plan-parse.err
+  prepare_plan_candidates || {
+    echo "could not prepare a clean ignored implementation-plan staging area (restore .loop/plan-candidates as an untracked ignored directory)" > .loop/plan-feedback.md
+    return 1
+  }
   rm -f "$errf"
   planner_containment_begin
-  run_claude "iter-0-plan" "/loop-plan" "$MODEL_PLAN" planner PLAN || call_ok=0
+  run_claude "$label" "/loop-plan${2:+ $2}" "$MODEL_PLAN" planner PLAN || call_ok=0
+  # run even when the call failed: a partial session may already have written
   planner_containment_end "during iteration-0 planning"
   if [ "$call_ok" = 0 ]; then
+    echo "planning agent call failed${AGENT_FAIL_DIAG:+ — $AGENT_FAIL_DIAG} (evidence: .loop/logs/failed/)" > .loop/plan-feedback.md
     discard_plan_candidates || true
-    die_next "planning agent failed${AGENT_FAIL_DIAG:+ — $AGENT_FAIL_DIAG} (evidence: .loop/logs/failed/)" "fix the cause, then ./loop.sh run"
+    return 1
   fi
-  res=$(agent_result "iter-0-plan")
+  res=$(agent_result "$label")
   verdict=$(extract_verdict "$res" "PLAN: READY")
-  if [ -z "$verdict" ] \
-     || ! materialize_response_envelope "$res" '<!-- IMPLEMENTATION-PLAN-BEGIN v1 -->' \
-          '<!-- IMPLEMENTATION-PLAN-END -->' "$verdict" .loop/plan-candidates/implementation-plan.md 2> "$errf"; then
-    why=$(head -1 "$errf" 2>/dev/null || true)
+  if [ -z "$verdict" ]; then
+    echo "the reply had no exact final 'PLAN: READY' verdict line" > .loop/plan-feedback.md
+    discard_plan_candidates || true
+    return 1
+  fi
+  if ! materialize_response_envelope "$res" '<!-- IMPLEMENTATION-PLAN-BEGIN v1 -->' \
+      '<!-- IMPLEMENTATION-PLAN-END -->' "$verdict" .loop/plan-candidates/implementation-plan.md 2> "$errf"; then
+    cat "$errf" > .loop/plan-feedback.md
     rm -f "$errf"
     discard_plan_candidates || true
-    die_next "invalid implementation-plan reply (one envelope + the exact final 'PLAN: READY' verdict)${why:+ — $why}" "inspect $(agent_log_path iter-0-plan json), then ./loop.sh run"
+    return 1
   fi
   rm -f "$errf"
   if ! validate_implementation_plan .loop/plan-candidates/implementation-plan.md; then
+    echo "the plan violates the fixed schema: exactly one '# Implementation Plan' heading; '## Key decisions' (3-7 bullets), '## Milestones' (checkbox rows), '## Current blockers' and '## Notes / learnings' in that order; the milestone rows must contain exactly every contract REQ id" > .loop/plan-feedback.md
     discard_plan_candidates || true
-    die_next "implementation-plan candidate is invalid (fixed four-section schema, 3-7 key decisions, milestone checkboxes covering exactly every contract REQ)" "inspect $(agent_log_path iter-0-plan json), then ./loop.sh run"
+    return 1
+  fi
+  rm -f .loop/plan-feedback.md
+  return 0
+}
+
+run_plan_review() { # independent read-only check of the implementation-plan
+  # candidate itself. Mirrors run_decompose_review: retry-once on format
+  # failure, fail-closed. 0 = APPROVE; 1 = REVISE
+  # (.loop/plan-review-feedback.md written). The verdict token is
+  # IMPL-PLAN-REVIEW, not PLAN-REVIEW: the fleet phase-boundary review
+  # (/loop-supervise mode=plan-review) already owns PLAN-REVIEW's
+  # KEEP/REPLACE/ESCALATE vocabulary and journal namespace.
+  local res="" verdict="" prompt="/loop-plan-review"
+  note "plan review: independent check of the implementation plan ($MODEL_REVIEW, read-only)"
+  for _ in 1 2; do
+    run_claude "plan-review" "$prompt" "$MODEL_REVIEW" reader REVIEW || continue
+    res=$(agent_result "plan-review")
+    verdict=$(extract_verdict "$res" "IMPL-PLAN-REVIEW: (APPROVE|REVISE)")
+    [ -z "$verdict" ] || break
+    prompt="/loop-plan-review (FORMAT REMINDER: the LAST line of your reply must be exactly 'IMPL-PLAN-REVIEW: APPROVE <summary>' or 'IMPL-PLAN-REVIEW: REVISE <must-fix list>' — plain text, no code fence. Your previous attempt contained no parseable verdict.)"
+  done
+  if [ -z "$res" ]; then
+    journal_append "plan" "IMPL_PLAN_REVIEW_ERROR" "plan reviewer call failed twice"
+    die_next "plan review unavailable (see $(agent_log_path plan-review err)) — review .loop/plan-candidates/implementation-plan.md yourself, or disable it with LOOP_PLAN_REVIEW=0" "fix the cause, then ./loop.sh run"
+  fi
+  if [ -z "$verdict" ]; then
+    verdict="IMPL-PLAN-REVIEW: REVISE (unparseable reviewer output after a format-reminder retry — treated as revise)"
+    res="$verdict
+$res"
+  fi
+  if [ "${verdict#IMPL-PLAN-REVIEW: APPROVE}" != "$verdict" ]; then
+    rm -f .loop/plan-review-feedback.md
+    journal_append "plan" "IMPL_PLAN_REVIEW_APPROVE" "$verdict"
+    note "plan review -> APPROVE"
+    return 0
+  fi
+  {
+    echo "# Plan reviewer feedback — the implementation plan was rejected"
+    echo
+    printf '%s\n' "$res"
+  } > .loop/plan-review-feedback.md
+  journal_append "plan" "IMPL_PLAN_REVIEW_REVISE" "$verdict"
+  note "plan review -> REVISE (feedback: .loop/plan-review-feedback.md)"
+  return 1
+}
+
+generate_implementation_plan() { # iteration-0: read-only planner + validation
+  # retry + independent review (LOOP_PLAN_REVIEW=0 skips) + harness publication
+  # fresh flow: drop feedback left over from a previous (possibly abandoned)
+  # attempt — the contract may have changed since it was written
+  rm -f .loop/plan-feedback.md .loop/plan-review-feedback.md
+  if ! run_plan_once "iter-0-plan"; then
+    journal_append "plan" "PLAN_INVALID" "$(head -3 .loop/plan-feedback.md 2>/dev/null | tr '\n' '; ')"
+    note "iteration-0 plan attempt 1 invalid — retrying once against the validator feedback"
+    if ! run_plan_once "iter-0-plan-2" "(VALIDATOR FEEDBACK: your previous plan was rejected by the deterministic validator — read .loop/plan-feedback.md and fix every listed violation)"; then
+      journal_append "plan" "PLAN_INVALID" "$(head -3 .loop/plan-feedback.md 2>/dev/null | tr '\n' '; ')"
+      discard_plan_candidates || true
+      die_next "implementation planning failed twice (.loop/plan-feedback.md)${AGENT_FAIL_DIAG:+ — last agent error: $AGENT_FAIL_DIAG}" "inspect $(agent_log_path iter-0-plan-2 json), or write .loop/docs/implementation-plan.md yourself (non-template content is reused as-is), then ./loop.sh run"
+    fi
+  fi
+  if [ "${LOOP_PLAN_REVIEW:-1}" != "0" ]; then
+    if ! run_plan_review; then
+      # regeneration passes no prompt suffix: the skill's read order covers
+      # .loop/plan-review-feedback.md (same shape as decompose-3)
+      note "regenerating the implementation plan once against the reviewer feedback"
+      journal_append "plan" "IMPL_PLAN_REVIEW_REGEN" "regenerating after plan-review REVISE"
+      if ! run_plan_once "iter-0-plan-3" || ! run_plan_review; then
+        discard_plan_candidates || true
+        die_next "the implementation plan failed the independent plan review (.loop/plan-review-feedback.md, .loop/plan-feedback.md)" "fix the contract or write .loop/docs/implementation-plan.md yourself (non-template content is reused as-is), then ./loop.sh run"
+      fi
+    fi
+  fi
+  # publication: re-validate the exact staged bytes AFTER the review window,
+  # then the harness alone materializes the authoritative plan.
+  if ! validate_implementation_plan .loop/plan-candidates/implementation-plan.md; then
+    discard_plan_candidates || true
+    die_next "the reviewed implementation-plan candidate failed deterministic re-validation" "regenerate: ./loop.sh run"
   fi
   mv -f .loop/plan-candidates/implementation-plan.md .loop/docs/implementation-plan.md \
     || die_next "could not publish the validated implementation plan" "fix .loop/docs permissions, then ./loop.sh run"
@@ -8754,7 +8847,8 @@ reset_contract_scoped_docs() { # [--keep-contract] — archive + reset the loop 
         .loop/baseline-verify.log \
         .loop/contract-review-feedback.md .loop/last-instruction.md \
         .loop/decompose-approved .loop/decompose-feedback.md \
-        .loop/decompose-review-feedback.md .loop/state .loop/docs-contract
+        .loop/decompose-review-feedback.md .loop/plan-feedback.md \
+        .loop/plan-review-feedback.md .loop/state .loop/docs-contract
   rm -rf .loop/observations
   rm -f .loop/observations-manifest.jsonl .loop/task-id
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then

@@ -2273,7 +2273,7 @@ else
   bad "plan tool restriction missing: $(sort -u .loop/fake-tools 2>/dev/null | tr '\n' ' ')" plan-gen
 fi
 
-echo "== an implementation-plan with wrong REQ coverage is refused (no publication) =="
+echo "== an implementation-plan with wrong REQ coverage is refused twice (no publication) =="
 make_fixture plan-req-mismatch
 printf '<!-- TEMPLATE -->\n# Implementation Plan\n' > .loop/docs/implementation-plan.md
 git add -A && git commit -q -m "template plan"
@@ -2283,12 +2283,145 @@ LOOP_FAKE_PLAN=REQ_MISMATCH LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NO
   LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
   ./loop.sh run >"$WORK/plan-req-mismatch.out" 2>&1 </dev/null || RC=$?
 if [ "$RC" -ne 0 ] \
-   && grep -q 'implementation-plan candidate is invalid' "$WORK/plan-req-mismatch.out" \
+   && grep -q 'retrying once against the validator feedback' "$WORK/plan-req-mismatch.out" \
+   && grep -q 'implementation planning failed twice' "$WORK/plan-req-mismatch.out" \
+   && grep -q '→ next:' "$WORK/plan-req-mismatch.out" \
    && grep -q 'TEMPLATE' .loop/docs/implementation-plan.md \
    && [ ! -e .loop/plan-candidates ]; then
-  ok "invalid candidate refused; the template plan stayed unpublished"
+  ok "invalid candidate refused on both attempts; the template plan stayed unpublished"
 else
   bad "invalid plan candidate escaped (rc=$RC)" plan-req-mismatch
+fi
+
+echo "== plan validator retry: invalid attempt 1, valid attempt 2 publishes =="
+make_fixture plan-retry-ok
+printf '<!-- TEMPLATE -->\n# Implementation Plan\n' > .loop/docs/implementation-plan.md
+git add -A && git commit -q -m "template plan"
+./loop.sh approve >/dev/null
+RC=0
+LOOP_FAKE_PLAN="REQ_MISMATCH,READY" LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/plan-retry-ok.out" 2>&1 </dev/null || RC=$?
+check "exit 0" plan-retry-ok 0 "$RC"
+check "state SUCCESS" plan-retry-ok SUCCESS "$(cat .loop/state 2>/dev/null || echo none)"
+if grep -q 'retrying once against the validator feedback' "$WORK/plan-retry-ok.out" \
+   && [ -s .loop/fake-plan-fb-seen ] \
+   && [ -s .loop/fake-implplanrev-i ] \
+   && ! grep -q 'TEMPLATE' .loop/docs/implementation-plan.md \
+   && [ ! -f .loop/plan-feedback.md ]; then
+  ok "validator feedback survived into the retry; review ran; attempt 2 published"
+else
+  bad "plan validator retry path broken (rc=$RC)" plan-retry-ok
+fi
+
+echo "== plan review REVISE regenerates once, then approves and publishes =="
+make_fixture plan-review-revise
+printf '<!-- TEMPLATE -->\n# Implementation Plan\n' > .loop/docs/implementation-plan.md
+git add -A && git commit -q -m "template plan"
+./loop.sh approve >/dev/null
+RC=0
+LOOP_FAKE_IMPL_PLAN_REVIEW="REVISE,APPROVE" LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/plan-review-revise.out" 2>&1 </dev/null || RC=$?
+check "exit 0" plan-review-revise 0 "$RC"
+check "state SUCCESS" plan-review-revise SUCCESS "$(cat .loop/state 2>/dev/null || echo none)"
+if grep -q 'plan review -> REVISE' "$WORK/plan-review-revise.out" \
+   && grep -q 'plan review -> APPROVE' "$WORK/plan-review-revise.out" \
+   && grep -q '"state": "IMPL_PLAN_REVIEW_REGEN"' .loop/journal.jsonl \
+   && [ "$(cat .loop/fake-plan-i)" = "2" ] \
+   && [ ! -f .loop/plan-review-feedback.md ]; then
+  ok "REVISE fed one regeneration; the re-review approved and the harness published"
+else
+  bad "plan review regen path broken (rc=$RC)" plan-review-revise
+fi
+
+echo "== plan review rejects twice -> stop naming the feedback path =="
+make_fixture plan-review-reject
+printf '<!-- TEMPLATE -->\n# Implementation Plan\n' > .loop/docs/implementation-plan.md
+git add -A && git commit -q -m "template plan"
+./loop.sh approve >/dev/null
+RC=0
+LOOP_FAKE_IMPL_PLAN_REVIEW=REVISE LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/plan-review-reject.out" 2>&1 </dev/null || RC=$?
+if [ "$RC" -ne 0 ] \
+   && grep -q 'failed the independent plan review' "$WORK/plan-review-reject.out" \
+   && grep -q '→ next:' "$WORK/plan-review-reject.out" \
+   && grep -q 'TEMPLATE' .loop/docs/implementation-plan.md \
+   && [ ! -e .loop/plan-candidates ] \
+   && [ -f .loop/plan-review-feedback.md ]; then
+  ok "double REVISE stopped the run; feedback file kept for the human"
+else
+  bad "plan review double-REVISE path broken (rc=$RC)" plan-review-reject
+fi
+
+echo "== LOOP_PLAN_REVIEW=0 skips the plan review entirely =="
+make_fixture plan-review-off
+printf '<!-- TEMPLATE -->\n# Implementation Plan\n' > .loop/docs/implementation-plan.md
+git add -A && git commit -q -m "template plan"
+./loop.sh approve >/dev/null
+RC=0
+LOOP_PLAN_REVIEW=0 LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/plan-review-off.out" 2>&1 </dev/null || RC=$?
+check "exit 0" plan-review-off 0 "$RC"
+check "state SUCCESS" plan-review-off SUCCESS "$(cat .loop/state 2>/dev/null || echo none)"
+if [ ! -e .loop/fake-implplanrev-i ] && ! grep -q 'plan review ->' "$WORK/plan-review-off.out"; then
+  ok "no plan-review call was made"
+else
+  bad "plan review ran despite LOOP_PLAN_REVIEW=0" plan-review-off
+fi
+
+echo "== plan review rides AGENT_REVIEW=codex under the read-only sandbox =="
+make_fixture plan-review-codex
+printf 'AGENT_REVIEW="codex"\nMODEL_REVIEW="gpt-5.5-review"\n' >> loop.models.sh
+printf '<!-- TEMPLATE -->\n# Implementation Plan\n' > .loop/docs/implementation-plan.md
+git add -A && git commit -q -m "template plan"
+./loop.sh approve >/dev/null
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/plan-review-codex.out" 2>&1 </dev/null || RC=$?
+check "exit 0" plan-review-codex 0 "$RC"
+prv_line=$(grep -n 'loop-plan-review' .loop/fake-codex-prompts 2>/dev/null | head -1 | cut -d: -f1)
+if [ -n "$prv_line" ] && sed -n "${prv_line}p" .loop/fake-codex-args | grep -q 'read-only'; then
+  ok "the plan-review call ran on Codex with --sandbox read-only"
+else
+  bad "plan-review Codex posture wrong (prompt line: ${prv_line:-none})" plan-review-codex
+fi
+
+echo "== a non-template implementation plan is reused: no planner call, no plan review =="
+make_fixture plan-reuse
+cat > .loop/docs/implementation-plan.md <<'EOF'
+# Implementation Plan
+
+## Key decisions
+
+- Existing hand-written plan, kept.
+- Deterministic verification stays authoritative.
+- Scope stays inside the approved contract.
+
+## Milestones
+
+- [ ] M1: implement and verify REQ-001
+
+## Current blockers
+
+- None.
+
+## Notes / learnings
+
+- Hand-written plan for the reuse test.
+EOF
+git add -A && git commit -q -m "hand-written plan"
+./loop.sh approve >/dev/null
+run_loop "READY_NOW"
+check "exit 0" plan-reuse 0 "$RC"
+check "state SUCCESS" plan-reuse SUCCESS "$STATE"
+if [ ! -e .loop/fake-plan-i ] && [ ! -e .loop/fake-implplanrev-i ]; then
+  ok "reused plan skipped both the planner and the plan review"
+else
+  bad "reuse path spent planner/review calls" plan-reuse
 fi
 
 echo "== an iteration-0 planner stray write fails closed to RISK =="

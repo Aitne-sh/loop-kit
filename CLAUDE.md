@@ -69,10 +69,11 @@ Two layers, and the split is the point:
   model. This is the maker–checker boundary: deterministic checks gate first, AI review second,
   humans see only an evidence report. No model self-grades.
 - **`kit/.claude/skills/loop-*/SKILL.md`** — the canonical *prompts*. Each phase of the spine
-  is a skill: `loop-contract` (+`-review`), `loop-decompose` (+`-review`), `loop-plan`,
-  `loop-iterate`, `loop-review`, `loop-stop-eval`, `loop-evidence`, `loop-supervise`, plus
-  `loop-setup` (interactive agent/model tuning, dual-projected) and Claude-only `loop-refine`.
-  `init`/`update` project the eleven headless-compatible skills into `.agents/skills` with
+  is a skill: `loop-contract` (+`-review`), `loop-decompose` (+`-review`), `loop-plan`
+  (+`-review`), `loop-iterate`, `loop-review`, `loop-stop-eval`, `loop-evidence`,
+  `loop-supervise`, plus `loop-setup` (interactive agent/model tuning, dual-projected) and
+  Claude-only `loop-refine`.
+  `init`/`update` project the twelve headless-compatible skills into `.agents/skills` with
   Codex-valid frontmatter and invocation metadata; never maintain a second source tree or
   deploy `.codex/skills`.
 - **`kit/loop-docs/*.md`** — pristine templates for the working docs (`product-contract.md`,
@@ -150,8 +151,11 @@ the repository `.codex/**` control plane are copied byte-for-byte into each work
 - **Planner publication is harness-owned.** DECOMPOSE and iteration-0 PLAN stay in the
   read-only `planner` envelope path; never let a model write their authoritative documents
   and never widen those call sites back to `full`. Candidate bytes belong only in the
-  ignored, contract-scoped `.loop/plan-candidates/`; decompose candidates are re-validated
-  after the independent review, and only the harness publishes `.loop/docs/task-plan.md` /
+  ignored, contract-scoped `.loop/plan-candidates/`; decompose and implementation-plan
+  candidates are re-validated after their independent reviews (`loop-decompose-review` /
+  `loop-plan-review`; opt-out `LOOP_DECOMPOSE_REVIEW=0` / `LOOP_PLAN_REVIEW=0` — the
+  plan-review verdict token is `IMPL-PLAN-REVIEW:`, never `PLAN-REVIEW:`, which the fleet
+  phase-boundary review owns), and only the harness publishes `.loop/docs/task-plan.md` /
   `implementation-plan.md`. The containment check is deliberately cheap (git porcelain +
   HEAD ref + `check_harness`) — per-call full-tree hashing, off-tree guard mirrors, and
   plan context-binding were evaluated and rejected as disproportionate (heavier variants

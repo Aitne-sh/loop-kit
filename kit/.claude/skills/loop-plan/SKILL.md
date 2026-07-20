@@ -15,21 +15,25 @@ contents of `.loop/docs/implementation-plan.md`; when this role is invoked by
 Explore before you plan — a plan written blind schedules the wrong work. In order:
 
 1. Read `.loop/docs/product-contract.md` (the fixed contract) and its REQ list.
-2. Locate the files/modules each REQ touches (search the codebase; never guess).
-3. Find the real verification commands (`VERIFY_COMMANDS` in `loop.config.sh`,
+2. Read `.loop/plan-feedback.md` if it exists — the deterministic validator
+   rejected your previous plan; fix EVERY listed violation.
+3. Read `.loop/plan-review-feedback.md` if it exists — the independent reviewer
+   rejected your previous plan; address every must-fix item.
+4. Locate the files/modules each REQ touches (search the codebase; never guess).
+5. Find the real verification commands (`VERIFY_COMMANDS` in `loop.config.sh`,
    manifests/CI config). Identify which checks are cheap from their definitions,
    existing logs, and repository evidence, but do NOT execute them in this
    read-only planning step and do not invent a current PASS/FAIL result.
-4. Note the conventions the work must follow (structure, framework, idioms of
+6. Note the conventions the work must follow (structure, framework, idioms of
    the surrounding code).
-5. Note the risky areas (auth, schema/migrations, secrets, prod config,
+7. Note the risky areas (auth, schema/migrations, secrets, prod config,
    dependency manifests) — feed them into the risk-first ordering below.
-6. If `.loop/docs/run-archive/` exists, skim the "Lessons for future runs"
+8. If `.loop/docs/run-archive/` exists, skim the "Lessons for future runs"
    section of the **most recent 3** archived `evidence-report.md` files (just
    that section — do not re-read whole archives): past runs' design decisions,
    rejected approaches, and repository traps. Fold anything that applies into
    `## Key decisions` or the milestone hints below.
-7. If `.loop/docs/implementation-plan.md` already contains a non-template plan,
+9. If `.loop/docs/implementation-plan.md` already contains a non-template plan,
    use it as mutable historical context, not as authority over the contract —
    a re-plan was requested because that plan is missing, template-only, or
    being deliberately replaced; never preserve a stale milestone merely

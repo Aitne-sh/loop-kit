@@ -312,7 +312,13 @@ Before iteration 1, the iteration-0 PLAN step runs **read-only** (Claude: Read/G
 only; Codex: `--sandbox read-only` with automatic project-doc loading disabled) — the
 same posture as fleet decomposition. The model returns the plan inside one versioned
 envelope; the harness stages it under the ignored `.loop/plan-candidates/`, validates the
-fixed section schema and exact contract-REQ coverage, and publishes
+fixed section schema and exact contract-REQ coverage (an invalid reply gets one retry
+against the validator's written feedback in `.loop/plan-feedback.md`), then has an
+independent read-only reviewer (`MODEL_REVIEW`) judge the candidate semantically — do the
+milestones really advance their REQs, is the riskiest work first, is anything invented
+beyond the contract? A REVISE feeds one regeneration; set `LOOP_PLAN_REVIEW=0` to skip
+this review (the decompose review has the matching `LOOP_DECOMPOSE_REVIEW=0`). After the
+review the harness re-validates the exact staged bytes and publishes
 `.loop/docs/implementation-plan.md` itself. Any planner-side project write or commit
 stops the run as `RISK_REQUIRES_APPROVAL`. This is capability containment, not
 whole-machine isolation: Claude project hooks/plugins/MCP are not structurally isolated
