@@ -217,6 +217,70 @@ emit_json() { # $1 cost, $2 result text (no quotes/backslashes)
   printf '{"type":"result","subtype":"success","is_error":false,"result":"%s","total_cost_usd":%s,"num_turns":%s,"session_id":"fake-s%s"}\n' "$2" "$1" "${LOOP_FAKE_TURNS:-0}" "$sn"
 }
 
+escape_json_text() { # stdin -> JSON string body; mirrors loop.sh's portable awk
+  awk '
+    {
+      line=$0; esc=""; m=length(line)
+      for (k=1; k<=m; k++) {
+        ch=substr(line,k,1)
+        if      (ch=="\\") esc=esc "\\\\"
+        else if (ch=="\"") esc=esc "\\\""
+        else if (ch=="\t") esc=esc "\\t"
+        else if (ch=="\r") esc=esc "\\r"
+        else                esc=esc ch
+      }
+      out=(NR==1 ? esc : out "\\n" esc)
+    }
+    END { printf "%s", out }
+  '
+}
+
+emit_decompose_json() { # $1 cost, $2 verdict/text, $3 optional malformed shape
+  # Real DECOMPOSE is read-only and returns the plan in its final response. The
+  # fake stages fixture text outside .loop/docs, removes it before returning,
+  # and therefore proves the harness (not the agent) materializes task-plan.md.
+  local payload shape="${3:-NORMAL}" envelope
+  payload=$(escape_json_text < "$FAKE_DECOMPOSE_PLAN")
+  rm -f "$FAKE_DECOMPOSE_PLAN"
+  envelope="<!-- DECOMPOSE-PLAN-BEGIN v1 -->\n${payload}\n<!-- DECOMPOSE-PLAN-END -->"
+  case "$shape" in
+    DUP_ENVELOPE)        emit_json "$1" "${envelope}\n\n${envelope}\n\n$2" ;;
+    PRE_ENVELOPE_PROSE)  emit_json "$1" "non-empty prose before the envelope\n${envelope}\n\n$2" ;;
+    POST_ENVELOPE_PROSE) emit_json "$1" "${envelope}\nnon-empty prose between envelope and verdict\n\n$2" ;;
+    DUP_VERDICT)         emit_json "$1" "${envelope}\n\n$2\n$2" ;;
+    *)                   emit_json "$1" "${envelope}\n\n$2" ;;
+  esac
+}
+
+emit_plan_json() { # $1 cost, $2 verdict/text, $3 optional malformed shape
+  local payload shape="${3:-NORMAL}" envelope
+  payload=$(escape_json_text < "$FAKE_IMPLEMENTATION_PLAN")
+  rm -f "$FAKE_IMPLEMENTATION_PLAN"
+  envelope="<!-- IMPLEMENTATION-PLAN-BEGIN v1 -->\n${payload}\n<!-- IMPLEMENTATION-PLAN-END -->"
+  case "$shape" in
+    DUP_ENVELOPE)        emit_json "$1" "${envelope}\n\n${envelope}\n\n$2" ;;
+    POST_ENVELOPE_PROSE) emit_json "$1" "${envelope}\nnon-empty prose between envelope and verdict\n\n$2" ;;
+    *)                   emit_json "$1" "${envelope}\n\n$2" ;;
+  esac
+}
+
+fake_planner_tamper() { # $1 role label, $2 scenario — a misbehaving planner's writes
+  local role="$1" scenario="$2"
+  [ -n "$scenario" ] || return 0
+  case "$scenario" in
+    PROJECT)
+      printf 'stray implementation by %s\n' "$role" > "$role-stray.txt" ;;
+    PROJECT_COMMIT)
+      printf 'committed stray implementation by %s\n' "$role" > "$role-stray.txt"
+      git add "$role-stray.txt"
+      git commit -q -m "fake: $role committed stray" ;;
+    DOCS)
+      printf 'stray docs mutation by %s\n' "$role" >> .loop/docs/assumptions.md ;;
+    MODELS)
+      printf 'MODEL_REVIEW="tampered-by-%s"\n' "$role" >> loop.models.sh ;;
+  esac
+}
+
 next_from_list() { # $1 list, $2 counter-file -> echoes next entry (last repeats)
   local idx last
   idx=$(cat "$2" 2>/dev/null || echo 0)
@@ -280,17 +344,18 @@ case "$PROMPT" in
     # (the harness must keep .loop/decompose-feedback.md alive across the retry)
     [ ! -f .loop/decompose-feedback.md ] \
       || head -1 .loop/decompose-feedback.md >> .loop/fake-decompose-fb-seen
-    if [ "${LOOP_FAKE_DECOMPOSE_TAMPER:-}" = MODELS ]; then
-      # A full DECOMPOSE role can physically reach ignored harness/config files;
-      # the parent must catch this before it parses or publishes the plan.
-      echo 'MODEL_REVIEW="tampered-by-decompose"' >> loop.models.sh
-    fi
+    # The real role is read-only, but the harness must not TRUST that: a
+    # misbehaving planner writing project files, tracked docs, commits, or
+    # ignored harness config must be caught before the plan is published.
+    fake_planner_tamper decompose "${LOOP_FAKE_DECOMPOSE_TAMPER:-}"
     dv=$(next_from_list "${LOOP_FAKE_DECOMPOSE:-ONE}" .loop/fake-decompose-i)
+    dshape=$(next_from_list "${LOOP_FAKE_DECOMPOSE_SHAPE:-NORMAL}" .loop/fake-decompose-shape-i)
+    FAKE_DECOMPOSE_PLAN=.loop/fake-decompose-plan
     dep="-"
     [ "$dv" = "CHAIN" ] && dep="part-a"
     case "$dv" in
       TWO_PAR|CHAIN)
-        cat > .loop/docs/task-plan.md <<EOF
+        cat > "$FAKE_DECOMPOSE_PLAN" <<EOF
 # Task Plan
 Two tasks (fake decomposition).
 <!-- TASK-PLAN-BEGIN v1 -->
@@ -314,9 +379,9 @@ BODY-END
 TASK-END
 <!-- TASK-PLAN-END -->
 EOF
-        emit_json "$cost" "DECOMPOSE: TASKS n=2" ;;
+        emit_decompose_json "$cost" "DECOMPOSE: TASKS n=2" "$dshape" ;;
       CHAIN_SHARED)
-        cat > .loop/docs/task-plan.md <<'EOF'
+        cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
 # Task Plan
 Three sequential phases of one large piece of work (fake decomposition):
 phase-a -> phase-b -> phase-c share REQ-001; the tail also owns REQ-002.
@@ -350,7 +415,7 @@ BODY-END
 TASK-END
 <!-- TASK-PLAN-END -->
 EOF
-        emit_json "$cost" "DECOMPOSE: TASKS n=3" ;;
+        emit_decompose_json "$cost" "DECOMPOSE: TASKS n=3" "$dshape" ;;
       DRIFT_CHAIN)
         # aa-drift (REQ-001, independent, no dependents) alongside a 3-phase chain
         # ch-a -> ch-b -> ch-c sharing REQ-002. aa-drift is a single fast phase, so
@@ -358,7 +423,7 @@ EOF
         # always still queued at that moment, guaranteeing a queued PLANNED task.
         # Because NOTHING depends on aa-drift, any plan-review it gets can only come
         # from the drift trigger (task_has_queued_dependents is false for it).
-        cat > .loop/docs/task-plan.md <<'EOF'
+        cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
 # Task Plan
 An independent drift task beside a 3-phase chain (fake decomposition):
 aa-drift owns REQ-001; ch-a -> ch-b -> ch-c share REQ-002 (ch-c completing owner).
@@ -401,9 +466,9 @@ BODY-END
 TASK-END
 <!-- TASK-PLAN-END -->
 EOF
-        emit_json "$cost" "DECOMPOSE: TASKS n=4" ;;
+        emit_decompose_json "$cost" "DECOMPOSE: TASKS n=4" "$dshape" ;;
       SHARED_PAR)
-        cat > .loop/docs/task-plan.md <<'EOF'
+        cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
 # Task Plan
 INVALID: two parallel tasks share REQ-001 (no chain).
 <!-- TASK-PLAN-BEGIN v1 -->
@@ -427,9 +492,9 @@ BODY-END
 TASK-END
 <!-- TASK-PLAN-END -->
 EOF
-        emit_json "$cost" "DECOMPOSE: TASKS n=2" ;;
+        emit_decompose_json "$cost" "DECOMPOSE: TASKS n=2" "$dshape" ;;
       SHARED_FORK)
-        cat > .loop/docs/task-plan.md <<'EOF'
+        cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
 # Task Plan
 INVALID: part-b and part-c fork off part-a and share REQ-002.
 <!-- TASK-PLAN-BEGIN v1 -->
@@ -462,9 +527,9 @@ BODY-END
 TASK-END
 <!-- TASK-PLAN-END -->
 EOF
-        emit_json "$cost" "DECOMPOSE: TASKS n=3" ;;
+        emit_decompose_json "$cost" "DECOMPOSE: TASKS n=3" "$dshape" ;;
       SHARED_FORKJOIN)
-        cat > .loop/docs/task-plan.md <<'EOF'
+        cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
 # Task Plan
 VALID diamond: part-b ∥ part-c fork off part-a; the join part-d owns the
 shared REQ-002 too and depends on both branches — the completing owner.
@@ -507,9 +572,9 @@ BODY-END
 TASK-END
 <!-- TASK-PLAN-END -->
 EOF
-        emit_json "$cost" "DECOMPOSE: TASKS n=4" ;;
+        emit_decompose_json "$cost" "DECOMPOSE: TASKS n=4" "$dshape" ;;
       SHARED_TWOSINKS)
-        cat > .loop/docs/task-plan.md <<'EOF'
+        cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
 # Task Plan
 INVALID: two parallel "joins" (part-d ∥ part-e) both own the shared REQ-002 —
 no single completing owner.
@@ -561,9 +626,9 @@ BODY-END
 TASK-END
 <!-- TASK-PLAN-END -->
 EOF
-        emit_json "$cost" "DECOMPOSE: TASKS n=5" ;;
+        emit_decompose_json "$cost" "DECOMPOSE: TASKS n=5" "$dshape" ;;
       CYCLE)
-        cat > .loop/docs/task-plan.md <<'EOF'
+        cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
 # Task Plan
 Cyclic (invalid) plan.
 <!-- TASK-PLAN-BEGIN v1 -->
@@ -587,12 +652,12 @@ BODY-END
 TASK-END
 <!-- TASK-PLAN-END -->
 EOF
-        emit_json "$cost" "DECOMPOSE: TASKS n=2" ;;
+        emit_decompose_json "$cost" "DECOMPOSE: TASKS n=2" "$dshape" ;;
       LONGID)
         # first id is 30 chars (mechanical violation reproducing the production
         # failure); part-b depends on it — the harness must normalize BOTH the
         # TASK: line and the DEPENDS: reference deterministically
-        cat > .loop/docs/task-plan.md <<'EOF'
+        cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
 # Task Plan
 Two tasks; the first id exceeds the 24-char limit (fake decomposition).
 <!-- TASK-PLAN-BEGIN v1 -->
@@ -616,9 +681,9 @@ BODY-END
 TASK-END
 <!-- TASK-PLAN-END -->
 EOF
-        emit_json "$cost" "DECOMPOSE: TASKS n=2" ;;
+        emit_decompose_json "$cost" "DECOMPOSE: TASKS n=2" "$dshape" ;;
       *)
-        cat > .loop/docs/task-plan.md <<'EOF'
+        cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
 # Task Plan
 One task (fake decomposition).
 <!-- TASK-PLAN-BEGIN v1 -->
@@ -636,7 +701,7 @@ EOF
         if [ "$dv" = "NOVERDICT" ]; then
           emit_json "$cost" "plan written but the protocol line was forgotten"
         else
-          emit_json "$cost" "DECOMPOSE: TASKS n=1"
+          emit_decompose_json "$cost" "DECOMPOSE: TASKS n=1" "$dshape"
         fi ;;
     esac
     exit 0
@@ -782,12 +847,74 @@ EOF
     exit 0
     ;;
   /loop-plan*)
-    cat > .loop/docs/implementation-plan.md <<'EOF'
+    # Read-only planner: return a schema-valid payload for the harness to
+    # validate and publish. Milestones derive from the fixture's actual
+    # contract REQ headings so every fixture keeps exact REQ coverage.
+    fake_planner_tamper plan "${LOOP_FAKE_PLAN_TAMPER:-}"
+    pv=$(next_from_list "${LOOP_FAKE_PLAN:-READY}" .loop/fake-plan-i)
+    FAKE_IMPLEMENTATION_PLAN=.loop/fake-implementation-plan
+    cat > "$FAKE_IMPLEMENTATION_PLAN" <<'EOF'
 # Implementation Plan
+
+## Key decisions
+
+- Keep the change inside the approved product contract.
+- Run the configured verification gate after implementation.
+- Preserve existing behavior outside the named requirements.
+
 ## Milestones
-- [ ] M1: make the verification gate pass
+
 EOF
-    emit_json "$cost" "plan written"
+    plan_milestone=0
+    while IFS= read -r plan_req; do
+      [ -n "$plan_req" ] || continue
+      plan_milestone=$((plan_milestone + 1))
+      printf -- '- [ ] M%s: implement and verify %s\n' "$plan_milestone" "$plan_req" \
+        >> "$FAKE_IMPLEMENTATION_PLAN"
+    done <<PLAN_REQS
+$(contract_req_ids)
+PLAN_REQS
+    cat >> "$FAKE_IMPLEMENTATION_PLAN" <<'EOF'
+
+## Current blockers
+
+- None.
+
+## Notes / learnings
+
+- This plan was derived from read-only fixture evidence.
+EOF
+    case "$pv" in
+      REQ_MISMATCH)
+        # INVALID: milestones cover an id absent from the contract — the
+        # harness's exact-REQ-set validation must refuse publication
+        cat > "$FAKE_IMPLEMENTATION_PLAN" <<'EOF'
+# Implementation Plan
+
+## Key decisions
+
+- Keep the contract authoritative.
+- Run deterministic verification.
+- Preserve unrelated behavior.
+
+## Milestones
+
+- [ ] M1: implement REQ-999 only
+
+## Current blockers
+
+- None.
+
+## Notes / learnings
+
+- Deliberately wrong REQ coverage for the validator test.
+EOF
+        emit_plan_json "$cost" "PLAN: READY" ;;
+      NOVERDICT)
+        emit_plan_json "$cost" "plan drafted but the protocol line was forgotten" ;;
+      *)
+        emit_plan_json "$cost" "PLAN: READY" ;;
+    esac
     exit 0
     ;;
   /loop-evidence*)

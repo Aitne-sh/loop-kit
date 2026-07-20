@@ -288,6 +288,12 @@ entry to `.loop/docs/decision-requests.md` (why, options, recommendation, the
 exact question for the human — for `NEEDS_DECOMPOSITION`: the done-vs-remaining
 split and the proposed phases).
 
+`RISK_REQUIRES_APPROVAL` is different: it is a deterministic harness/evaluator
+guard verdict, never a state you declare and never a model-authored decision
+request. Do not create or update `.loop/reports/decision.html` for RISK, and do
+not emit an `HTML-DECISION: authored` marker for it; the harness shows its own
+risk inspection and recovery guidance.
+
 If your skill argument contains `html=on` or `html=auto`, the state you are declaring is
 `NEEDS_SPEC_DECISION` or `NEEDS_ARCHITECTURE_DECISION` (the escalations the harness
 opens this page for — a bare `BLOCKED` dead-end needs only its markdown entry), AND

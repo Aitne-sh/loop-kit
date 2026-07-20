@@ -308,6 +308,17 @@ the `.loop/docs/*` files and git history. That "fresh context every time, memory
 disk" design is deliberate: it keeps each iteration focused and prevents context from
 rotting over a long run.
 
+Before iteration 1, the iteration-0 PLAN step runs **read-only** (Claude: Read/Glob/Grep
+only; Codex: `--sandbox read-only` with automatic project-doc loading disabled) — the
+same posture as fleet decomposition. The model returns the plan inside one versioned
+envelope; the harness stages it under the ignored `.loop/plan-candidates/`, validates the
+fixed section schema and exact contract-REQ coverage, and publishes
+`.loop/docs/implementation-plan.md` itself. Any planner-side project write or commit
+stops the run as `RISK_REQUIRES_APPROVAL`. This is capability containment, not
+whole-machine isolation: Claude project hooks/plugins/MCP are not structurally isolated
+at launch, and Codex `read-only` bounds only the local filesystem — external services can
+still have side effects.
+
 ```
 1. IMPLEMENT   The agent reads the contract, the plan, the progress notes, the three
                ledgers (below), and any reviewer feedback; implements ONE milestone;
@@ -552,13 +563,17 @@ the shape:
   worktree and branch, running the same loop engine, with results merged back one at a
   time and the merged whole reviewed against the original contract.
 
-The plan is written to `.loop/docs/task-plan.md` (git-tracked, so you can audit it) and a
-deterministic validator checks it before anything runs: unique task ids, dependencies that
-resolve and don't form a cycle, and every requirement covered — owned by exactly one task,
-or shared by tasks with a single *completing owner*: a strictly sequential dependency
-chain, or a fork-join whose final task depends on every other owner (a *phased
-workflow*, below). You can preview it without running (`./loop.sh decompose`), force
-one in-place loop with `./loop.sh run --single`, or disable decomposition for the
+The decomposer itself runs **read-only** and only returns a plan payload; the harness
+stages it as an untrusted candidate under the ignored `.loop/plan-candidates/`, runs a
+deterministic validator over it — unique task ids, dependencies that resolve and don't
+form a cycle, and every requirement covered: owned by exactly one task, or shared by
+tasks with a single *completing owner*: a strictly sequential dependency chain, or a
+fork-join whose final task depends on every other owner (a *phased workflow*, below) —
+then has an independent read-only session review the candidate, re-validates the exact
+staged bytes, and only then publishes `.loop/docs/task-plan.md` (git-tracked, so you can
+audit it). A decomposer that touches project files or Git state instead stops the run as
+`RISK_REQUIRES_APPROVAL`. You can preview a plan without running (`./loop.sh decompose`),
+force one in-place loop with `./loop.sh run --single`, or disable decomposition for the
 project with `FLEET_DECOMPOSE=0`.
 
 ### Phased workflows — how long-running work is split

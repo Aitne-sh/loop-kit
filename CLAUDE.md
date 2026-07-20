@@ -52,11 +52,19 @@ Two layers, and the split is the point:
   hashing, git/worktree management, journaling, and command dispatch all live here.
   `run_claude` retains its historical name but dispatches each routable role through
   `AGENT_<ROLE>`; its Codex adapter normalizes JSONL into the existing result envelope.
-  Codex checker roles force `read-only` plus `project_doc_max_bytes=0`, preventing
-  repository `AGENTS.md` from becoming checker instructions; authoring roles retain normal
-  project guidance.
+  Codex checker AND planner roles force `read-only` plus `project_doc_max_bytes=0`,
+  preventing repository `AGENTS.md` from becoming role instructions; other authoring
+  roles retain normal project guidance and write posture.
   `AGENT_CONTRACT` governs only the headless definition path — interactive `start`/`refine`
   launch the Claude TUI directly and never consult the resolver.
+  DECOMPOSE and the iteration-0 PLAN are read-only planning roles (`planner` mode =
+  reader's structural posture for both CLIs): the model returns the plan in a versioned
+  response envelope, the harness stages it under the ignored, contract-scoped
+  `.loop/plan-candidates/`, validates it deterministically, and alone publishes the
+  authoritative documents. A cheap before/after Git-state check (porcelain + HEAD ref +
+  `check_harness`) around each planner call turns any planner-side write or commit into
+  `RISK_REQUIRES_APPROVAL`. Mechanical validation does not make semantic plan quality
+  deterministic.
 - **`bin/evaluate.sh`** — the evaluator. Re-runs the user's `VERIFY_COMMANDS` *outside* the
   model. This is the maker–checker boundary: deterministic checks gate first, AI review second,
   humans see only an evidence report. No model self-grades.
@@ -139,6 +147,22 @@ the repository `.codex/**` control plane are copied byte-for-byte into each work
 - **`LOOP_CODEX_NETWORK` controls only Codex shell-sandbox networking.** It does not disable
   MCP servers, connected apps, or hosted search exposed by the Codex client. Treat those as
   separate environment capabilities.
+- **Planner publication is harness-owned.** DECOMPOSE and iteration-0 PLAN stay in the
+  read-only `planner` envelope path; never let a model write their authoritative documents
+  and never widen those call sites back to `full`. Candidate bytes belong only in the
+  ignored, contract-scoped `.loop/plan-candidates/`; decompose candidates are re-validated
+  after the independent review, and only the harness publishes `.loop/docs/task-plan.md` /
+  `implementation-plan.md`. The containment check is deliberately cheap (git porcelain +
+  HEAD ref + `check_harness`) — per-call full-tree hashing, off-tree guard mirrors, and
+  plan context-binding were evaluated and rejected as disproportionate (heavier variants
+  live on the parked `codex-hardening-wip` branch). Claude planner sessions get only
+  Read/Glob/Grep, but project hooks/plugins/MCP are NOT structurally isolated; Codex
+  `read-only` is a local-filesystem boundary only.
+- **`RISK_REQUIRES_APPROVAL` is a guard verdict, not a decision request.** finish() shows
+  the dedicated risk box (`print_next_actions risk`) and never the decision-request file;
+  agents must not author DRs or decision HTML for RISK. `decision_requests_present()`
+  gates every DR display on a real heading (the pristine `## DR-N:` template example is
+  not actionable).
 
 ## Concurrent Claude Code and Codex sessions
 

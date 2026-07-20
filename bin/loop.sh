@@ -246,6 +246,20 @@ print_next_actions() {
       echo " ▸ Answer WITHIN the contract (choose a default / give guidance, no requirement change):"
       echo "     record it in .loop/docs/assumptions.md, then:  ./loop.sh approve && ./loop.sh run"
       ;;
+    risk)
+      echo " A safety boundary changed. This is a GUARD TRIP, not a model-authored"
+      echo " decision request. Do not approve it blindly."
+      echo
+      echo " ▸ Inspect the exact reason/path in RESULT and the full trail:"
+      echo "     ./loop.sh report --text"
+      echo "     git status --short && git diff"
+      echo
+      echo " ▸ If the change was UNINTENDED: restore only the flagged artifact from a"
+      echo "   trusted source (git checkout for tracked files; redeploy for harness files)."
+      echo
+      echo " ▸ After the risk is resolved — whether reverted or intentionally retained:"
+      echo "     ./loop.sh approve && ./loop.sh run"
+      ;;
     refine-exit)
       echo " Interactive refine session ended."
       echo
@@ -1067,9 +1081,10 @@ print_agent_routing() {
   fi
   if [ "$(get_config_scalar LOOP_CODEX_SANDBOX workspace-write)" = read-only ]; then
     # authoring roles must write files; a read-only OS sandbox guarantees the
-    # loop fails at the first Codex-routed full call — say so at approval time
+    # loop fails at the first Codex-routed full call — say so at approval time.
+    # PLAN and DECOMPOSE are planner roles (always read-only) and don't belong here.
     local full_codex=""
-    for role in CONTRACT PLAN IMPLEMENT EVIDENCE DECOMPOSE; do
+    for role in CONTRACT IMPLEMENT EVIDENCE; do
       [ "$(configured_agent "$role")" != codex ] || full_codex="$full_codex $role"
     done
     [ -z "$full_codex" ] || note "  warning: LOOP_CODEX_SANDBOX=read-only — Codex-routed authoring roles (${full_codex# }) cannot write files and will fail"
@@ -1620,6 +1635,40 @@ agent_log_path() { # $1 label, $2 json|err
   printf '%s/%s.%s' "$(active_log_dir)" "$1" "$2"
 }
 
+utf8_clip() { # stdin -> stdout with byte-truncation damage removed: head -c can
+  # cut a trailing multibyte character and tail -c can start inside one. The
+  # resulting invalid bytes would ride AGENT_FAIL_DIAG into every downstream
+  # locale-sensitive tool (journal escaping, the rate-limit classifier's tr) and
+  # crash BSD tools under a UTF-8 locale — trim to whole sequences at BOTH edges.
+  LC_ALL=C awk '
+    BEGIN { for (i = 128; i < 256; i++) v[sprintf("%c", i)] = i }
+    { data = (NR == 1 ? $0 : data "\n" $0) }
+    END {
+      n = length(data)
+      s = 1
+      while (s <= n && s <= 3) {              # leading orphan continuation bytes
+        b = v[substr(data, s, 1)] + 0
+        if (b >= 128 && b < 192) s++
+        else break
+      }
+      e = n; cont = 0
+      while (e >= s) {                        # trailing incomplete sequence
+        b = v[substr(data, e, 1)] + 0
+        if (b >= 128 && b < 192 && cont < 3) { cont++; e--; continue }
+        if (b >= 194 && b < 245) {
+          need = (b < 224 ? 1 : (b < 240 ? 2 : 3))
+          if (cont < need) e--                # incomplete: drop the lead byte too
+          else e += cont                      # complete: keep the walked bytes
+        } else {
+          e += cont                           # ASCII/invalid lead: keep walked bytes
+        }
+        break
+      }
+      if (e < s - 1) e = s - 1
+      printf "%s", substr(data, s, e - s + 1)
+    }'
+}
+
 normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
   local raw="$1" msg="$2" out="$3" status="$4"
   local summary="" thread="" thread_escaped="" turns=0 failed=0 error_nr=0 fatal_type=""
@@ -1735,7 +1784,9 @@ EOF
     "$result_escaped" "$thread_escaped" "$turns" "$is_error" > "$out"
 }
 
-run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
+run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader|planner,
+  # planner = reader's structural read-only posture for planning roles that
+  # return a document envelope instead of writing files (DECOMPOSE, iter-0 PLAN)
   # $5 optional role key (EFFORT_<role> override; omitted = global effort only)
   # — cost accumulated
   local label="$1" prompt="$2" model="$3" mode="$4" role="${5:-}"
@@ -1782,11 +1833,11 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
       # shellcheck disable=SC2086
       set -- "$@" $codex_eff
     fi
-    if [ "$mode" = reader ]; then
+    if [ "$mode" = reader ] || [ "$mode" = planner ]; then
       codex_sandbox=read-only
-      # Checker roles must not auto-load project AGENTS.md as instructions.
-      # A skill may still read repository guidance explicitly as untrusted
-      # project data when it needs conventions to judge the implementation.
+      # Checker AND planner roles must not auto-load project AGENTS.md as
+      # instructions. A skill may still read repository guidance explicitly as
+      # untrusted project data when it needs conventions or landing sites.
       set -- "$@" -c project_doc_max_bytes=0
     else
       codex_sandbox=${LOOP_CODEX_SANDBOX:-workspace-write}
@@ -1822,7 +1873,7 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
       set -- "$@" --resume "$CLAUDE_RESUME_SESSION"
     fi
     CLAUDE_RESUME_SESSION=""
-    if [ "$mode" = "reader" ]; then
+    if [ "$mode" = "reader" ] || [ "$mode" = "planner" ]; then
       # structurally read-only: editors and Bash do not exist in the session
       launch_agent "$CLAUDE_CMD" -p "$prompt" \
         --output-format json \
@@ -1892,10 +1943,11 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader,
     # NOT on stderr — surface both, and preserve the evidence before the next
     # run's identically-labeled call overwrites it
     local result_preview="" errtail=""
-    # LC_ALL=C: head/tail -c may split a UTF-8 char and BSD tr aborts on the
-    # partial sequence in a multibyte locale ("tr: Illegal byte sequence").
-    result_preview=$(json_field "$out" result "" | head -c 200 | LC_ALL=C tr '\n' ' ')
-    [ ! -s "$err" ] || errtail=$(tail -c 200 "$err" | LC_ALL=C tr '\n' ' ')
+    # head/tail -c split UTF-8 characters at the byte cut; utf8_clip restores
+    # whole-sequence boundaries so the diag stays valid text everywhere it
+    # travels, and LC_ALL=C keeps the newline fold byte-safe regardless.
+    result_preview=$(json_field "$out" result "" | head -c 200 | utf8_clip | LC_ALL=C tr '\n' ' ')
+    [ ! -s "$err" ] || errtail=$(tail -c 200 "$err" | utf8_clip | LC_ALL=C tr '\n' ' ')
     AGENT_FAIL_DIAG="exit=$status is_error=$is_err"
     [ -z "${CODEX_FAIL_CAUSE:-}" ] || AGENT_FAIL_DIAG="$AGENT_FAIL_DIAG (cause: $CODEX_FAIL_CAUSE)"
     [ "$timed_out" = 0 ] || AGENT_FAIL_DIAG="$AGENT_FAIL_DIAG (watchdog kill after ${iter_timeout}s)"
@@ -1973,6 +2025,24 @@ journal_append() { # $1 iteration-label, $2 state, $3 reason
     >> .loop/journal.jsonl
 }
 
+decision_requests_present() { # true when the contract-scoped file has a real DR
+  # The pristine template contains the literal example `## DR-N: <one-line
+  # title>`, so a broad '^## DR-' grep leaks the template as if it were a live
+  # request. Accept any other DR heading: numeric agent requests plus the
+  # harness-authored CONTRACT/FLEET namespaces all use this shape.
+  awk '
+    /^## DR-/ && $0 !~ /^## DR-N: <one-line title>/ { found=1; exit }
+    END { exit !found }
+  ' .loop/docs/decision-requests.md 2>/dev/null
+}
+
+print_decision_requests() { # actionable blocks only; never print template prose
+  awk '
+    /^## DR-/ && $0 !~ /^## DR-N: <one-line title>/ { on=1 }
+    on { print }
+  ' .loop/docs/decision-requests.md 2>/dev/null
+}
+
 finish() { # $1 state, $2 reason
   local state="$1" reason="$2"
   echo "$state" > .loop/state
@@ -2018,10 +2088,15 @@ finish() { # $1 state, $2 reason
       # headless/auto, and the file exists only when HTML authoring was on
       open_html .loop/reports/evidence.html
       exit 0 ;;
-    NEEDS_SPEC_DECISION|NEEDS_ARCHITECTURE_DECISION|NEEDS_DECOMPOSITION|RISK_REQUIRES_APPROVAL|PENDING_APPROVAL)
+    NEEDS_SPEC_DECISION|NEEDS_ARCHITECTURE_DECISION|NEEDS_DECOMPOSITION|PENDING_APPROVAL)
       echo
       echo "── Human decision required ──"
-      if [ -f .loop/docs/decision-requests.md ]; then cat .loop/docs/decision-requests.md; fi
+      if decision_requests_present; then
+        print_decision_requests
+      else
+        echo " No structured DR entry was recorded; use the RESULT reason above and"
+        echo " ./loop.sh report. The pristine decision-request template is not actionable."
+      fi
       # if the iteration authored a visual decision brief, show it too (no-op headless)
       open_html .loop/reports/decision.html
       if [ "$state" = "NEEDS_DECOMPOSITION" ]; then
@@ -2033,26 +2108,35 @@ finish() { # $1 state, $2 reason
         echo "then: ./loop.sh approve && ./loop.sh run   (the run restarts and re-plans;"
         echo "progress.md carries the memory forward)"
       else
-        # spec/arch/risk/pending: the exact trap this messaging exists to prevent is
+        # spec/arch/pending: the exact trap this messaging exists to prevent is
         # "approve WITHOUT editing the contract" → the loop keeps the same contract and
         # re-stops. print_next_actions spells out the edit-vs-not fork.
         print_next_actions decision
-        if [ "$state" = "RISK_REQUIRES_APPROVAL" ]; then
-          echo " NOTE: approving without reverting accepts this change permanently — review the diff first."
-        fi
       fi
+      exit 3 ;;
+    RISK_REQUIRES_APPROVAL)
+      # A deterministic guard verdict, never a model-authored decision request:
+      # showing the DR file (usually its pristine template) or a stale decision
+      # brief here sent humans hunting for a question that does not exist. The
+      # guard's reason is the RESULT line; the risk box carries the recovery.
+      echo
+      echo "── Risk review required ──"
+      echo " This stop was raised by a deterministic safety guard. No decision-request"
+      echo " template or possibly stale decision HTML is shown."
+      print_next_actions "${NEXT_ACTION_CTX:-risk}"
+      echo " NOTE: approving without reverting accepts this change permanently — review the diff first."
       exit 3 ;;
     BLOCKED|STALLED)
       # a BLOCKED dead-end may still carry a decision request the human must
       # read (a `human` checklist row awaiting sign-off, 3 failed fix attempts
       # on one error) — show it like the NEEDS_* states do, or the "what should
       # I look at" the loop wrote stays buried in .loop/docs. Gate on a real
-      # numbered entry, not the template marker: agents may append entries
+      # actionable entry, not the template marker: agents may append entries
       # without stripping the pristine marker.
-      if grep -qE '^## DR-[0-9]' .loop/docs/decision-requests.md 2>/dev/null; then
+      if decision_requests_present; then
         echo
         echo "── Decision request(s) from this run ──"
-        cat .loop/docs/decision-requests.md
+        print_decision_requests
       fi
       # BLOCKED → the sign-off / within-contract-steer / contract-change box;
       # STALLED → the futility box (it is not a sign-off gate). A caller may
@@ -6725,52 +6809,292 @@ EOF
   return 0
 }
 
-run_decompose_once() { # $1 label, $2 optional prompt suffix (retry feedback pointer)
-  # — one generate+parse+validate round.
-  # Success: ORCH_TOPO (space-separated topological order) + ORCH_N set, rc 0.
-  # Failure: .loop/decompose-feedback.md written for the retry, rc 1. The file
-  # must survive into the NEXT attempt (the skill reads it to fix the violations)
-  # — it is cleared on success here and at the start of a fresh flow, never
-  # between attempts.
-  local label="$1" res verdict vn ids topo stray errf=.loop/decompose-parse.err
+# ── planner containment + harness-owned plan publication ────────────────────
+# DECOMPOSE and the iteration-0 PLAN are read-only planning roles: the model
+# returns the complete plan inside a versioned response envelope, and only the
+# harness materializes, validates, and publishes the authoritative document.
+# Candidate bytes stay in the ignored, contract-scoped .loop/plan-candidates/
+# tree until validation (and, for decompose, the independent review) passes.
+# This is capability containment plus a cheap Git-state check — deliberately
+# NOT whole-machine isolation or per-call content hashing.
+
+PLANNER_BASE_HEAD=""
+PLANNER_BASE_STATUS=""
+planner_containment_begin() { # cheap pre-call snapshot: HEAD ref + porcelain
+  PLANNER_BASE_HEAD=$(git rev-parse --verify HEAD 2>/dev/null || echo none)
+  PLANNER_BASE_STATUS=$(git status --porcelain 2>/dev/null || true)
+}
+
+planner_containment_end() { # $1 context ("during …") — RISK-stop on any drift.
+  # No ':(exclude).loop': planners may write NOTHING; tracked .loop/docs
+  # changes must trip this, while ignored .loop scratch (logs, counters) is
+  # invisible to `git status` anyway. The HEAD comparison catches an agent
+  # that commits its stray work to leave the porcelain clean.
+  local context="$1" now_head now_status detail
+  check_harness "$context"
+  now_head=$(git rev-parse --verify HEAD 2>/dev/null || echo none)
+  now_status=$(git status --porcelain 2>/dev/null || true)
+  if [ "$now_head" = "$PLANNER_BASE_HEAD" ] && [ "$now_status" = "$PLANNER_BASE_STATUS" ]; then
+    return 0
+  fi
+  if [ "$now_head" != "$PLANNER_BASE_HEAD" ]; then
+    detail="HEAD moved $PLANNER_BASE_HEAD -> $now_head"
+  else
+    detail=$(printf '%s\n' "$now_status" | head -3 | tr '\n' ' ')
+  fi
+  discard_plan_candidates || true
+  finish RISK_REQUIRES_APPROVAL "project files or Git state changed $context (planner sessions are read-only; only the harness publishes plans): $detail"
+}
+
+discard_plan_candidates() { # candidates are ignored, untracked, non-authoritative
+  if [ -e .loop/plan-candidates ] || [ -L .loop/plan-candidates ]; then
+    [ -d .loop/plan-candidates ] && [ ! -L .loop/plan-candidates ] || return 1
+    [ -z "$(git ls-files -- .loop/plan-candidates 2>/dev/null)" ] || return 1
+    rm -rf -- .loop/plan-candidates || return 1
+  fi
+  rm -rf -- .loop/fleet/plan-candidate
+}
+
+prepare_plan_candidates() { # fresh private staging for untrusted model output
+  discard_plan_candidates || return 1
+  (umask 077; mkdir .loop/plan-candidates) || return 1
+  [ -d .loop/plan-candidates ] && [ ! -L .loop/plan-candidates ] || return 1
+  # the deployed gitignore must keep candidates ignored, or a broad snapshot
+  # commit could sweep unvalidated bytes into history
+  git check-ignore -q .loop/plan-candidates/task-plan.md
+}
+
+materialize_response_envelope() { # $1 result $2 begin $3 end $4 verdict $5 dst
+  # Exactly one ordered envelope; after its close only blank lines and the one
+  # exact terminal verdict are allowed. Staging is one same-dir rename.
+  local res="$1" begin="$2" end="$3" verdict="$4" dst="$5" tmp bytes dir
+  dir=${dst%/*}; [ "$dir" != "$dst" ] || dir=.
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+  if [ -L "$dst" ] || { [ -e "$dst" ] && [ ! -f "$dst" ]; }; then return 1; fi
+  tmp=$(mktemp "$dir/.${dst##*/}.tmp.XXXXXX") || return 1
+  if ! printf '%s\n' "$res" | awk -v b="$begin" -v e="$end" -v v="$verdict" '
+    $0 == b { nb++; if (state != 0) bad=1; state=1; next }
+    $0 == e { ne++; if (state != 1) bad=1; state=2; next }
+    $0 == v { nv++ }
+    state == 0 {
+      if ($0 == "") next
+      bad=1; next
+    }
+    state == 2 {
+      if ($0 == "") next
+      if ($0 == v && nv == 1) { state=3; next }
+      bad=1; next
+    }
+    state == 3 && $0 != "" { bad=1 }
+    END { exit !(nb == 1 && ne == 1 && nv == 1 && state == 3 && !bad) }
+  '; then
+    rm -f "$tmp"
+    echo "the reply must contain one ordered $begin / $end envelope, followed only by blanks and the exact final verdict '$verdict'" >&2
+    return 1
+  fi
+  extract_between "$res" "$begin" "$end" > "$tmp" || { rm -f "$tmp"; return 1; }
+  [ -s "$tmp" ] || { rm -f "$tmp"; echo "the response envelope was empty" >&2; return 1; }
+  bytes=$(LC_ALL=C wc -c < "$tmp" | tr -d '[:space:]') || { rm -f "$tmp"; return 1; }
+  [ "$bytes" -le 1048576 ] 2>/dev/null \
+    || { rm -f "$tmp"; echo "the response envelope exceeds the 1 MiB safety limit" >&2; return 1; }
+  chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$dst" || { rm -f "$tmp"; echo "could not stage the response envelope at $dst" >&2; return 1; }
+}
+
+validate_decompose_candidate() { # $1 verdict task count (empty = derive from topo)
+  local vn="${1:-}" ids topo _t errf=.loop/decompose-parse.err
   ORCH_TOPO=""; ORCH_N=0
-  if ! run_claude "$label" "/loop-decompose${2:+ $2}" "$MODEL_DECOMPOSE" full DECOMPOSE; then
-    echo "decompose agent call failed${AGENT_FAIL_DIAG:+ — $AGENT_FAIL_DIAG} (evidence: .loop/logs/failed/)" > .loop/decompose-feedback.md
-    return 1
-  fi
-  # DECOMPOSE is a full authoring role for either CLI, but its authority ends at
-  # the plan. Check ignored/hash-protected surfaces before parsing or enqueueing;
-  # otherwise a modified loop.sh/model/skill could be copied into every worker.
-  check_harness "during decomposition"
-  # containment: this step may only write under .loop/ (the plan file). Any
-  # project-file diff means the decomposer did implementation work — fail
-  # closed to a human (the pre-decompose snapshot protects user work).
-  stray=$(git status --porcelain -- . ':(exclude).loop' 2>/dev/null || true)
-  if [ -n "$stray" ]; then
-    finish RISK_REQUIRES_APPROVAL "decompose step changed project files (it may only write .loop/docs/task-plan.md): $(echo "$stray" | head -3 | tr '\n' ' ')"
-  fi
-  res=$(agent_result "$label")
-  verdict=$(extract_verdict "$res" "DECOMPOSE: TASKS n=[0-9]+")
-  if [ -z "$verdict" ]; then
-    echo "the reply had no parseable 'DECOMPOSE: TASKS n=<N>' last line" > .loop/decompose-feedback.md
-    return 1
-  fi
-  vn=$(printf '%s' "$verdict" | sed -E 's/.*n=([0-9]+).*/\1/')
-  normalize_task_plan .loop/docs/task-plan.md
-  if ! ids=$(parse_task_plan .loop/docs/task-plan.md .loop/fleet/plan 2> "$errf" | tr '\n' ' '); then
+  if ! ids=$(parse_task_plan .loop/plan-candidates/task-plan.md .loop/fleet/plan-candidate 2> "$errf" | tr '\n' ' '); then
     cat "$errf" > .loop/decompose-feedback.md
     rm -f "$errf"
     return 1
   fi
-  if ! topo=$(validate_task_plan .loop/fleet/plan "$ids" "$vn" "$(fcfg FLEET_MAX_TASKS 12)" "" 2> "$errf" | tr '\n' ' '); then
+  if ! topo=$(validate_task_plan .loop/fleet/plan-candidate "$ids" "$vn" "$(fcfg FLEET_MAX_TASKS 12)" "" 2> "$errf" | tr '\n' ' '); then
     cat "$errf" > .loop/decompose-feedback.md
     rm -f "$errf"
     return 1
   fi
   rm -f "$errf"
-  rm -f .loop/decompose-feedback.md
   ORCH_TOPO="${topo% }"
-  ORCH_N="$vn"
+  if [ -n "$vn" ]; then
+    ORCH_N="$vn"
+  else
+    for _t in $ORCH_TOPO; do ORCH_N=$((ORCH_N + 1)); done
+  fi
+  return 0
+}
+
+publish_decompose_candidate() {
+  # Both staged artifacts were just re-parsed/revalidated. Replace the derived
+  # plan directory first with rollback, then atomically publish the candidate
+  # doc; the staging tree disappears only after both moves succeed.
+  local old=".loop/fleet/.plan.previous.$$"
+  [ -f .loop/plan-candidates/task-plan.md ] && [ ! -L .loop/plan-candidates/task-plan.md ] || return 1
+  [ -d .loop/fleet/plan-candidate ] && [ ! -L .loop/fleet/plan-candidate ] || return 1
+  rm -rf "$old"
+  if [ -e .loop/fleet/plan ] || [ -L .loop/fleet/plan ]; then
+    mv .loop/fleet/plan "$old" || return 1
+  fi
+  if ! mv .loop/fleet/plan-candidate .loop/fleet/plan; then
+    [ ! -e "$old" ] || mv "$old" .loop/fleet/plan 2>/dev/null || true
+    return 1
+  fi
+  if ! mv -f .loop/plan-candidates/task-plan.md .loop/docs/task-plan.md; then
+    rm -rf .loop/fleet/plan
+    [ ! -e "$old" ] || mv "$old" .loop/fleet/plan 2>/dev/null || true
+    return 1
+  fi
+  rm -rf "$old" .loop/plan-candidates
+}
+
+validate_implementation_plan() { # $1 plan path — fixed section schema + exact REQ set
+  local plan="$1" ids plan_ids bytes
+  [ -s "$plan" ] && [ -f "$plan" ] && [ ! -L "$plan" ] || return 1
+  ! grep -q '<!-- TEMPLATE -->' "$plan" || return 1
+  bytes=$(LC_ALL=C wc -c < "$plan" | tr -d '[:space:]') || return 1
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le 1048576 ] || return 1
+  ids=$(req_ids_from_contract)
+  [ -n "$ids" ] || return 1
+  plan_ids=$(awk '
+    $0 == "# Implementation Plan" {
+      title++
+      if (title != 1 || section != 0) bad=1
+      next
+    }
+    $0 == "## Key decisions" {
+      key_h++
+      if (title != 1 || section != 0) bad=1
+      section=1; next
+    }
+    $0 == "## Milestones" {
+      milestones_h++
+      if (section != 1) bad=1
+      section=2; next
+    }
+    $0 == "## Current blockers" {
+      blockers_h++
+      if (section != 2) bad=1
+      section=3; next
+    }
+    $0 == "## Notes / learnings" {
+      notes_h++
+      if (section != 3) bad=1
+      section=4; next
+    }
+    /^#/ { bad=1; next }
+    section == 0 { if ($0 != "") bad=1; next }
+    section == 1 {
+      if ($0 == "") next
+      if ($0 ~ /^- \[[ xX]\] / || $0 !~ /^- [^[:space:]].*/) bad=1
+      else decisions++
+      next
+    }
+    section == 2 {
+      if ($0 == "") next
+      if ($0 !~ /^- \[[ xX]\] [^[:space:]].*/) { bad=1; next }
+      milestones++
+      found=0
+      n=split($0, token, /[^[:alnum:]_-]+/)
+      for (i=1; i<=n; i++) {
+        if (token[i] ~ /^REQ-[0-9]+$/) { req[token[i]]=1; found=1 }
+      }
+      if (!found) bad=1
+      next
+    }
+    section == 3 || section == 4 {
+      if ($0 == "") next
+      if ($0 ~ /^- \[[ xX]\] / || $0 !~ /^- [^[:space:]].*/) bad=1
+      else if (section == 3) blockers++
+      else notes++
+      next
+    }
+    { bad=1 }
+    END {
+      if (title != 1 || key_h != 1 || milestones_h != 1 \
+          || blockers_h != 1 || notes_h != 1 || section != 4 \
+          || decisions < 3 || decisions > 7 || milestones < 1 \
+          || blockers < 1 || notes < 1 || bad) exit 1
+      for (id in req) print id
+    }
+  ' "$plan" | sort -u) || return 1
+  [ "$plan_ids" = "$ids" ] || return 1
+  return 0
+}
+
+generate_implementation_plan() { # iteration-0: read-only planner + harness publication
+  local res verdict why call_ok=1 errf=.loop/implementation-plan-parse.err
+  prepare_plan_candidates \
+    || die_next "could not prepare a clean ignored implementation-plan staging area" "restore .loop/plan-candidates as an untracked ignored directory, then ./loop.sh run"
+  rm -f "$errf"
+  planner_containment_begin
+  run_claude "iter-0-plan" "/loop-plan" "$MODEL_PLAN" planner PLAN || call_ok=0
+  planner_containment_end "during iteration-0 planning"
+  if [ "$call_ok" = 0 ]; then
+    discard_plan_candidates || true
+    die_next "planning agent failed${AGENT_FAIL_DIAG:+ — $AGENT_FAIL_DIAG} (evidence: .loop/logs/failed/)" "fix the cause, then ./loop.sh run"
+  fi
+  res=$(agent_result "iter-0-plan")
+  verdict=$(extract_verdict "$res" "PLAN: READY")
+  if [ -z "$verdict" ] \
+     || ! materialize_response_envelope "$res" '<!-- IMPLEMENTATION-PLAN-BEGIN v1 -->' \
+          '<!-- IMPLEMENTATION-PLAN-END -->' "$verdict" .loop/plan-candidates/implementation-plan.md 2> "$errf"; then
+    why=$(head -1 "$errf" 2>/dev/null || true)
+    rm -f "$errf"
+    discard_plan_candidates || true
+    die_next "invalid implementation-plan reply (one envelope + the exact final 'PLAN: READY' verdict)${why:+ — $why}" "inspect $(agent_log_path iter-0-plan json), then ./loop.sh run"
+  fi
+  rm -f "$errf"
+  if ! validate_implementation_plan .loop/plan-candidates/implementation-plan.md; then
+    discard_plan_candidates || true
+    die_next "implementation-plan candidate is invalid (fixed four-section schema, 3-7 key decisions, milestone checkboxes covering exactly every contract REQ)" "inspect $(agent_log_path iter-0-plan json), then ./loop.sh run"
+  fi
+  mv -f .loop/plan-candidates/implementation-plan.md .loop/docs/implementation-plan.md \
+    || die_next "could not publish the validated implementation plan" "fix .loop/docs permissions, then ./loop.sh run"
+  discard_plan_candidates || true
+}
+
+run_decompose_once() { # $1 label, $2 optional prompt suffix (retry feedback pointer)
+  # — one generate+stage+parse+validate round. Publication happens ONLY in
+  # cmd_decompose_flow after the (optional) independent review re-validates.
+  # Success: candidate staged + ORCH_TOPO (topological order) + ORCH_N set, rc 0.
+  # Failure: .loop/decompose-feedback.md written for the retry, rc 1. The file
+  # must survive into the NEXT attempt (the skill reads it to fix the violations)
+  # — it is cleared on success here and at the start of a fresh flow, never
+  # between attempts.
+  local label="$1" res verdict vn call_ok=1 errf=.loop/decompose-parse.err
+  ORCH_TOPO=""; ORCH_N=0
+  prepare_plan_candidates || {
+    echo "could not prepare a clean ignored task-plan staging area" > .loop/decompose-feedback.md
+    return 1
+  }
+  planner_containment_begin
+  run_claude "$label" "/loop-decompose${2:+ $2}" "$MODEL_DECOMPOSE" planner DECOMPOSE || call_ok=0
+  # run even when the call failed: a partial session may already have written
+  planner_containment_end "during decomposition"
+  if [ "$call_ok" = 0 ]; then
+    echo "decompose agent call failed${AGENT_FAIL_DIAG:+ — $AGENT_FAIL_DIAG} (evidence: .loop/logs/failed/)" > .loop/decompose-feedback.md
+    discard_plan_candidates || true
+    return 1
+  fi
+  res=$(agent_result "$label")
+  verdict=$(extract_verdict "$res" "DECOMPOSE: TASKS n=[0-9]+")
+  if [ -z "$verdict" ]; then
+    echo "the reply had no parseable 'DECOMPOSE: TASKS n=<N>' last line" > .loop/decompose-feedback.md
+    discard_plan_candidates || true
+    return 1
+  fi
+  vn=$(printf '%s' "$verdict" | sed -E 's/.*n=([0-9]+).*/\1/')
+  if ! materialize_response_envelope "$res" '<!-- DECOMPOSE-PLAN-BEGIN v1 -->' \
+      '<!-- DECOMPOSE-PLAN-END -->' "$verdict" .loop/plan-candidates/task-plan.md 2> "$errf"; then
+    cat "$errf" > .loop/decompose-feedback.md
+    rm -f "$errf"
+    discard_plan_candidates || true
+    return 1
+  fi
+  normalize_task_plan .loop/plan-candidates/task-plan.md
+  validate_decompose_candidate "$vn" || return 1
+  rm -f .loop/decompose-feedback.md
   return 0
 }
 
@@ -6860,6 +7184,7 @@ cmd_decompose_flow() { # $1 force(0|1), $2 enqueue(0|1) — the routing brain.
       note "decompose attempt 1 invalid — retrying once against the validator feedback"
       if ! run_decompose_once "decompose-2" "(VALIDATOR FEEDBACK: your previous plan was rejected by the deterministic validator — read .loop/decompose-feedback.md and fix every listed violation)"; then
         journal_append "decompose" "DECOMPOSE_INVALID" "$(head -3 .loop/decompose-feedback.md 2>/dev/null | tr '\n' '; ')"
+        discard_plan_candidates || true
         finish NEEDS_SPEC_DECISION "decomposition failed twice (.loop/decompose-feedback.md) — split the work manually (./loop.sh add), or run single: ./loop.sh run --single"
       fi
     fi
@@ -6868,10 +7193,19 @@ cmd_decompose_flow() { # $1 force(0|1), $2 enqueue(0|1) — the routing brain.
         note "regenerating the task plan once against the reviewer feedback"
         journal_append "decompose" "DECOMPOSE_REGEN" "regenerating after decompose-review REVISE"
         if ! run_decompose_once "decompose-3" || ! run_decompose_review; then
+          discard_plan_candidates || true
           finish NEEDS_SPEC_DECISION "task plan failed the independent decompose review (.loop/decompose-review-feedback.md) — fix the plan or contract, or run single: ./loop.sh run --single"
         fi
       fi
     fi
+    # publication: re-validate the exact staged bytes AFTER the review window,
+    # then the harness alone materializes the authoritative plan + parsed queue.
+    if ! validate_decompose_candidate ""; then
+      discard_plan_candidates || true
+      finish NEEDS_SPEC_DECISION "the reviewed task-plan candidate failed deterministic re-validation (.loop/decompose-feedback.md) — regenerate: ./loop.sh decompose --force"
+    fi
+    publish_decompose_candidate \
+      || die_next "could not publish the validated task plan" "inspect .loop/plan-candidates and .loop/fleet, then ./loop.sh decompose --force"
     decompose_plan_hash > .loop/decompose-approved
     commit_if_changes "loop: task plan"
   fi
@@ -9520,8 +9854,8 @@ cmd_run() {
 
     # iteration 0: implementation plan (mutable by design; the contract is not)
     if [ ! -s .loop/docs/implementation-plan.md ] || grep -q '<!-- TEMPLATE -->' .loop/docs/implementation-plan.md; then
-      note "iteration 0: generating implementation plan (/loop-plan, $MODEL_PLAN)"
-      run_claude "iter-0-plan" "/loop-plan" "$MODEL_PLAN" full PLAN || die_next "planning agent failed${AGENT_FAIL_DIAG:+ — $AGENT_FAIL_DIAG} (evidence: .loop/logs/failed/)" "fix the cause, then ./loop.sh run"
+      note "iteration 0: generating implementation plan (/loop-plan, $MODEL_PLAN, read-only)"
+      generate_implementation_plan
       commit_if_changes "loop: iter 0 — implementation plan"
       journal_append "0" "PLAN" "implementation plan generated"
     fi
@@ -9579,8 +9913,9 @@ run_iteration_loop() { # $1 i $2 run_start_ref $3 agent_failures $4 gate_revise 
         # A rate/usage limit is a transient API failure, not a loop problem: steer
         # the human to wait-and-retry (the api-stall box) instead of the sign-off /
         # contract box the generic BLOCKED stop would show. Lowercase via tr (not
-        # ${x,,}) so the classifier works on bash 3.2 (macOS default).
-        local _diaglc; _diaglc=$(printf '%s' "${AGENT_FAIL_DIAG:-}" | tr '[:upper:]' '[:lower:]')
+        # ${x,,}) so the classifier works on bash 3.2 (macOS default); LC_ALL=C
+        # because the keywords are ASCII and the diag may carry multibyte text.
+        local _diaglc; _diaglc=$(printf '%s' "${AGENT_FAIL_DIAG:-}" | LC_ALL=C tr '[:upper:]' '[:lower:]')
         case "$_diaglc" in
           *"rate limit"*|*"rate_limit"*|*overloaded*|*"usage limit"*|*429*|*quota*|*"too many requests"*)
             NEXT_ACTION_CTX=api-stall

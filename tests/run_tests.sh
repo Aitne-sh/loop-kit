@@ -2260,6 +2260,54 @@ run_loop "READY_NOW"
 check "exit code 0" plan-gen 0 "$RC"
 if ! grep -q 'TEMPLATE' .loop/docs/implementation-plan.md; then ok "plan generated"; else bad "plan still template" plan-gen; fi
 if grep -q 'fake-plan' .loop/fake-models; then ok "plan model routed"; else bad "plan model missing" plan-gen; fi
+if grep -q '## Key decisions' .loop/docs/implementation-plan.md \
+   && grep -q 'REQ-001' .loop/docs/implementation-plan.md \
+   && [ ! -e .loop/plan-candidates ]; then
+  ok "harness published a schema-valid plan and cleared the staging area"
+else
+  bad "published plan not schema-shaped or staging residue left" plan-gen
+fi
+if grep -q -- 'fake-plan --tools=Read,Glob,Grep' .loop/fake-tools 2>/dev/null; then
+  ok "iteration-0 plan ran under the read-only planner profile"
+else
+  bad "plan tool restriction missing: $(sort -u .loop/fake-tools 2>/dev/null | tr '\n' ' ')" plan-gen
+fi
+
+echo "== an implementation-plan with wrong REQ coverage is refused (no publication) =="
+make_fixture plan-req-mismatch
+printf '<!-- TEMPLATE -->\n# Implementation Plan\n' > .loop/docs/implementation-plan.md
+git add -A && git commit -q -m "template plan"
+./loop.sh approve >/dev/null
+RC=0
+LOOP_FAKE_PLAN=REQ_MISMATCH LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/plan-req-mismatch.out" 2>&1 </dev/null || RC=$?
+if [ "$RC" -ne 0 ] \
+   && grep -q 'implementation-plan candidate is invalid' "$WORK/plan-req-mismatch.out" \
+   && grep -q 'TEMPLATE' .loop/docs/implementation-plan.md \
+   && [ ! -e .loop/plan-candidates ]; then
+  ok "invalid candidate refused; the template plan stayed unpublished"
+else
+  bad "invalid plan candidate escaped (rc=$RC)" plan-req-mismatch
+fi
+
+echo "== an iteration-0 planner stray write fails closed to RISK =="
+make_fixture plan-stray
+printf '<!-- TEMPLATE -->\n# Implementation Plan\n' > .loop/docs/implementation-plan.md
+git add -A && git commit -q -m "template plan"
+./loop.sh approve >/dev/null
+RC=0
+LOOP_FAKE_PLAN_TAMPER=PROJECT LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="READY_NOW" \
+  LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh run >"$WORK/plan-stray.out" 2>&1 </dev/null || RC=$?
+check "exit 3" plan-stray 3 "$RC"
+check "state RISK_REQUIRES_APPROVAL" plan-stray RISK_REQUIRES_APPROVAL "$(cat .loop/state 2>/dev/null || echo none)"
+if grep -q 'project files or Git state changed during iteration-0 planning' "$WORK/plan-stray.out" \
+   && grep -q 'Risk review required' "$WORK/plan-stray.out"; then
+  ok "planning-step containment names the phase and shows the risk box"
+else
+  bad "plan stray containment message wrong" plan-stray
+fi
 
 echo "== max iterations exhausted =="
 make_fixture max-iter
@@ -2374,6 +2422,13 @@ LOOP_ASK_CRITICAL=1 LOOP_FAKE_CONTRACT=QUESTIONS LOOP_CLAUDE_CMD="$FAKE" LOOP_FA
 check "exit code 3" ask-park 3 "$RC"
 check "state PENDING_APPROVAL" ask-park PENDING_APPROVAL "$(cat .loop/state 2>/dev/null || echo none)"
 if grep -q '^## DR-CONTRACT' .loop/docs/decision-requests.md; then ok "critical question recorded as a DR-CONTRACT block"; else bad "DR-CONTRACT block missing" ask-park; fi
+if grep -q 'Human decision required' "$WORK/ask-park.out" \
+   && grep -q '## DR-CONTRACT' "$WORK/ask-park.out" \
+   && ! grep -q 'DR-N: <one-line title>' "$WORK/ask-park.out"; then
+  ok "PENDING shows the real DR block without the pristine template example"
+else
+  bad "PENDING display lost the DR block or leaked the template" ask-park
+fi
 if grep -q '"state": "CONTRACT_QUESTIONS"' .loop/journal.jsonl; then ok "park journaled as CONTRACT_QUESTIONS"; else bad "CONTRACT_QUESTIONS missing" ask-park; fi
 if [ ! -f .loop/approved ]; then ok "parked definition was never approved"; else bad "parked contract was auto-approved" ask-park; fi
 # the human answers, approves, runs — the loop proceeds normally from there
@@ -5405,6 +5460,11 @@ check "exit 0" orch-single 0 "$RC"
 check "state SUCCESS" orch-single SUCCESS "$(cat .loop/state)"
 if grep -q '"state": "DECOMPOSE_SINGLE"' .loop/journal.jsonl; then ok "single routing journaled"; else bad "DECOMPOSE_SINGLE missing" orch-single; fi
 if grep -q '"state": "DECOMPOSE_REVIEW_APPROVE"' .loop/journal.jsonl; then ok "plan passed independent review"; else bad "DECOMPOSE_REVIEW_APPROVE missing" orch-single; fi
+if grep -q -- 'fake-dec --tools=Read,Glob,Grep' .loop/fake-tools 2>/dev/null; then
+  ok "decompose ran under the read-only planner profile (no Write/Edit/Bash)"
+else
+  bad "decompose tool restriction missing: $(sort -u .loop/fake-tools 2>/dev/null | tr '\n' ' ')" orch-single
+fi
 check "no worktrees created" orch-single 1 "$(git worktree list | wc -l | tr -d ' ')"
 if [ -f .loop/docs/task-plan.md ] && grep -q '^TASK: solo$' .loop/docs/task-plan.md; then ok "task plan written"; else bad "task-plan.md missing/wrong" orch-single; fi
 if grep -q 'fake-dec' .loop/fake-models; then ok "decompose model routed (MODEL_DECOMPOSE)"; else bad "MODEL_DECOMPOSE not routed: $(sort -u .loop/fake-models | tr '\n' ' ')" orch-single; fi
@@ -5449,6 +5509,62 @@ if awk -v t="$(cat .loop/cost-total)" 'BEGIN{exit !(t >= 3.21)}'; then
   ok "manual decompose did not rewind the cost-total mirror"
 else
   bad "manual decompose rewound .loop/cost-total to $(cat .loop/cost-total)" orch-codex-decompose-cost
+fi
+if grep -q 'sandbox=read-only' .loop/fake-codex-args \
+   && grep -q 'project_doc_max_bytes=0' .loop/fake-codex-args; then
+  ok "Codex decompose ran read-only with project instructions suppressed"
+else
+  bad "Codex decompose posture wrong: $(cat .loop/fake-codex-args 2>/dev/null | tr '\n' ' ')" orch-codex-decompose-cost
+fi
+
+echo "== a stray planner write fails closed to RISK with the risk box (not a DR) =="
+make_orch_fixture orch-decompose-stray
+RC=0
+LOOP_FAKE_DECOMPOSE_TAMPER=PROJECT LOOP_FAKE_DECOMPOSE=ONE LOOP_CLAUDE_CMD="$FAKE" \
+  ./loop.sh decompose --force >"$WORK/orch-decompose-stray.out" 2>&1 </dev/null || RC=$?
+check "stray project write exits 3" orch-decompose-stray 3 "$RC"
+check "state RISK_REQUIRES_APPROVAL" orch-decompose-stray RISK_REQUIRES_APPROVAL "$(cat .loop/state)"
+if grep -q 'project files or Git state changed during decomposition' "$WORK/orch-decompose-stray.out" \
+   && [ ! -f .loop/decompose-approved ] && [ ! -e .loop/plan-candidates ]; then
+  ok "stray write stopped before publication and the staging area was discarded"
+else
+  bad "stray planner write was not contained" orch-decompose-stray
+fi
+if grep -q 'Risk review required' "$WORK/orch-decompose-stray.out" \
+   && ! grep -q 'Human decision required' "$WORK/orch-decompose-stray.out" \
+   && ! grep -q 'DR-N: <one-line title>' "$WORK/orch-decompose-stray.out" \
+   && grep -q 'GUARD TRIP' "$WORK/orch-decompose-stray.out"; then
+  ok "RISK stop shows the risk box, never an empty decision request"
+else
+  bad "RISK display leaked decision-request UI" orch-decompose-stray
+fi
+
+echo "== a planner that COMMITS its stray work is still caught (HEAD comparison) =="
+make_orch_fixture orch-decompose-stray-commit
+RC=0
+LOOP_FAKE_DECOMPOSE_TAMPER=PROJECT_COMMIT LOOP_FAKE_DECOMPOSE=ONE LOOP_CLAUDE_CMD="$FAKE" \
+  ./loop.sh decompose --force >"$WORK/orch-decompose-stray-commit.out" 2>&1 </dev/null || RC=$?
+check "committed stray exits 3" orch-decompose-stray-commit 3 "$RC"
+check "state RISK_REQUIRES_APPROVAL" orch-decompose-stray-commit RISK_REQUIRES_APPROVAL "$(cat .loop/state)"
+if grep -q 'HEAD moved' "$WORK/orch-decompose-stray-commit.out"; then
+  ok "clean-porcelain commit trick detected via HEAD comparison"
+else
+  bad "committed stray escaped detection" orch-decompose-stray-commit
+fi
+
+echo "== a malformed decompose envelope is rejected deterministically, then retried =="
+make_orch_fixture orch-decompose-envelope
+RC=0
+LOOP_FAKE_DECOMPOSE_SHAPE=DUP_ENVELOPE,NORMAL LOOP_FAKE_DECOMPOSE=ONE,ONE LOOP_CLAUDE_CMD="$FAKE" \
+  ./loop.sh decompose --force >"$WORK/orch-decompose-envelope.out" 2>&1 </dev/null || RC=$?
+check "second attempt publishes (exit 0)" orch-decompose-envelope 0 "$RC"
+check "decompose called twice" orch-decompose-envelope 2 "$(cat .loop/fake-decompose-i 2>/dev/null)"
+if grep '"state": "DECOMPOSE_INVALID"' .loop/journal.jsonl | grep -q 'one ordered' \
+   && grep -q '^TASK: solo$' .loop/docs/task-plan.md \
+   && [ ! -e .loop/plan-candidates ]; then
+  ok "envelope violation reached the feedback loop; the harness published the retry"
+else
+  bad "envelope rejection/retry broken: $(grep DECOMPOSE_INVALID .loop/journal.jsonl | head -1)" orch-decompose-envelope
 fi
 
 echo "== orch: decompose review REVISE regenerates once, then approves =="

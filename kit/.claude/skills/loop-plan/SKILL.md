@@ -1,16 +1,25 @@
 ---
 name: loop-plan
-description: Create or refresh .loop/docs/implementation-plan.md from the approved product contract — milestone breakdown for the iteration loop. Invoked by loop.sh at iteration 0; can also be run manually to re-plan.
+description: Read-only implementation planning from the approved product contract — return a complete implementation-plan payload for the harness to publish. Invoked by loop.sh at iteration 0; manual invocation drafts a replacement but does not publish it.
 ---
 
 # Create the Implementation Plan
+
+**STOP — you are a planner, not an implementer. This session is read-only.**
+Do not create, edit, delete, or rename any repository or `.loop/` file. Do not
+run tests, checks, builds, formatters, generators, or other side-effecting
+commands. Explore with read-only evidence and return the complete future
+contents of `.loop/docs/implementation-plan.md`; when this role is invoked by
+`loop.sh`, the harness alone validates and publishes it.
 
 Explore before you plan — a plan written blind schedules the wrong work. In order:
 
 1. Read `.loop/docs/product-contract.md` (the fixed contract) and its REQ list.
 2. Locate the files/modules each REQ touches (search the codebase; never guess).
 3. Find the real verification commands (`VERIFY_COMMANDS` in `loop.config.sh`,
-   manifests/CI config) and run the cheap ones once to see their current status.
+   manifests/CI config). Identify which checks are cheap from their definitions,
+   existing logs, and repository evidence, but do NOT execute them in this
+   read-only planning step and do not invent a current PASS/FAIL result.
 4. Note the conventions the work must follow (structure, framework, idioms of
    the surrounding code).
 5. Note the risky areas (auth, schema/migrations, secrets, prod config,
@@ -20,11 +29,15 @@ Explore before you plan — a plan written blind schedules the wrong work. In or
    that section — do not re-read whole archives): past runs' design decisions,
    rejected approaches, and repository traps. Fold anything that applies into
    `## Key decisions` or the milestone hints below.
-7. Only then write `.loop/docs/implementation-plan.md` (replace the template
-   content, remove the `<!-- TEMPLATE -->` marker).
+7. If `.loop/docs/implementation-plan.md` already contains a non-template plan,
+   use it as mutable historical context, not as authority over the contract —
+   a re-plan was requested because that plan is missing, template-only, or
+   being deliberately replaced; never preserve a stale milestone merely
+   because its REQ id still exists. Only then return a complete replacement
+   payload with no `<!-- TEMPLATE -->` marker.
 
 Rules:
-- **Write the plan's prose in the same language as `.loop/docs/product-contract.md`**
+- **Write the plan payload's prose in the same language as `.loop/docs/product-contract.md`**
   (it mirrors the user's original instruction). Keep the checkbox syntax, file
   paths, commands, and identifiers in ASCII.
 - If `.loop/parallel-context.md` exists, read it first: other loops are running
@@ -64,10 +77,59 @@ Rules:
   mandates). Every contract REQ must be covered by at least one milestone —
   requirement satisfaction is tracked per REQ in
   `.loop/docs/requirements-ledger.md`, and a REQ no milestone advances will
-  simply never be met. (Later revisions may reshape milestones freely but must
-  keep every not-yet-met REQ covered.)
+  simply never be met. Keep completed milestones as checked history. Later
+  revisions may reshape pending work, but the checkbox rows under `## Milestones`
+  must contain the exact set of contract REQ ids: every contract id at least once
+  and no unknown id. A REQ may appear in several milestones; ids mentioned in
+  another section do not count. Every milestone checkbox row must name at least
+  one exact REQ token. Never delete a completed REQ's last row.
 - Include a testing milestone if the contract's acceptance criteria require new
   tests (VERIFY_COMMANDS in loop.config.sh must be able to prove the new behavior).
 - Keep it short — a working checklist, not a design document.
 
-Do not implement anything in this step. Write the plan file and stop.
+## Output — implementation-plan payload
+
+Return exactly one ordered envelope containing the complete future file, in
+this shape:
+
+```
+<!-- IMPLEMENTATION-PLAN-BEGIN v1 -->
+# Implementation Plan
+
+## Key decisions
+
+- <3-7 contract/unknowns-backed decisions>
+
+## Milestones
+
+- [ ] M1: <small milestone> — advances <REQ ids>; done when <observable check>; likely areas: <paths/areas>
+
+## Current blockers
+
+- <current blocker, or None>
+
+## Notes / learnings
+
+- <read-only planning evidence that later iterations need>
+<!-- IMPLEMENTATION-PLAN-END -->
+```
+
+The file schema is fixed: exactly one `# Implementation Plan` heading, followed
+by exactly one each of `## Key decisions`, `## Milestones`,
+`## Current blockers`, and `## Notes / learnings` in that order. Do not add,
+rename, duplicate, or omit a level-two section, and do not add any other
+heading. `## Key decisions` contains 3–7 plain bullet rows; `## Milestones`
+contains at least one checkbox row; `## Current blockers` and
+`## Notes / learnings` each contain at least one plain bullet row (use `None`
+when there is no current blocker).
+
+The payload must cover every contract REQ, contain no envelope marker inside
+the plan body, and contain no `<!-- TEMPLATE -->` marker. Before the opening
+marker, emit nothing (empty lines only); do not wrap the actual envelope in a
+code fence and do not claim that you wrote the file. After the closing marker,
+the final non-empty line of your reply must be exactly:
+
+`PLAN: READY`
+
+Emit exactly one envelope and one verdict line. Write nothing after the verdict
+and invoke no further tool. Do not implement anything in this step.
