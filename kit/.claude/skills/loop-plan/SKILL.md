@@ -16,9 +16,14 @@ Explore before you plan — a plan written blind schedules the wrong work. In or
 
 1. Read `.loop/docs/product-contract.md` (the fixed contract) and its REQ list.
 2. Read `.loop/plan-feedback.md` if it exists — the deterministic validator
-   rejected your previous plan; fix EVERY listed violation.
+   rejected your previous plan; fix EVERY listed violation. When the file ends
+   with a `--- PREVIOUS REJECTED ATTEMPT (verbatim) ---` block, that is your
+   own prior plan: resubmit it with ONLY the listed violations corrected and
+   every other line unchanged — do NOT re-derive the plan from scratch.
 3. Read `.loop/plan-review-feedback.md` if it exists — the independent reviewer
-   rejected your previous plan; address every must-fix item.
+   rejected your previous plan; address every must-fix item. It also ends with
+   the rejected plan verbatim: revise that plan against the feedback, keeping
+   the parts the reviewer did not challenge.
 4. Locate the files/modules each REQ touches (search the codebase; never guess).
 5. Find the real verification commands (`VERIFY_COMMANDS` in `loop.config.sh`,
    manifests/CI config). Identify which checks are cheap from their definitions,

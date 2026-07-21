@@ -353,6 +353,11 @@ case "$PROMPT" in
     # (the harness must keep .loop/decompose-feedback.md alive across the retry)
     [ ! -f .loop/decompose-feedback.md ] \
       || head -1 .loop/decompose-feedback.md >> .loop/fake-decompose-fb-seen
+    # and snapshot it whenever it carries the rejected previous attempt — the
+    # suite asserts the retry saw the full plan bytes, not just the error line
+    if grep -q -- '--- PREVIOUS REJECTED ATTEMPT' .loop/decompose-feedback.md 2>/dev/null; then
+      cp .loop/decompose-feedback.md .loop/fake-decompose-fb-full
+    fi
     # The real role is read-only, but the harness must not TRUST that: a
     # misbehaving planner writing project files, tracked docs, commits, or
     # ignored harness config must be caught before the plan is published.
@@ -692,7 +697,25 @@ TASK-END
 EOF
         emit_decompose_json "$cost" "DECOMPOSE: TASKS n=2" "$dshape" ;;
       *)
-        cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
+        if [ "$dv" = "NODEPENDS" ]; then
+          # replays a real incident: an otherwise-valid single task whose
+          # DEPENDS line was dropped on a from-scratch regeneration
+          cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
+# Task Plan
+One task, DEPENDS key forgotten (fake decomposition).
+<!-- TASK-PLAN-BEGIN v1 -->
+TASK: nodeps
+SUMMARY: fix value.txt so the check passes
+SCOPE: value.txt - owns everything the contract allows
+REQS: REQ-001
+BODY-BEGIN
+Fix value.txt so ./check.sh passes (REQ-001).
+BODY-END
+TASK-END
+<!-- TASK-PLAN-END -->
+EOF
+        else
+          cat > "$FAKE_DECOMPOSE_PLAN" <<'EOF'
 # Task Plan
 One task (fake decomposition).
 <!-- TASK-PLAN-BEGIN v1 -->
@@ -707,6 +730,7 @@ BODY-END
 TASK-END
 <!-- TASK-PLAN-END -->
 EOF
+        fi
         if [ "$dv" = "NOVERDICT" ]; then
           emit_json "$cost" "plan written but the protocol line was forgotten"
         else

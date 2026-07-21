@@ -122,6 +122,56 @@ else
   bad "envelope rejection/retry broken: $(grep DECOMPOSE_INVALID .loop/journal.jsonl | head -1)" orch-decompose-envelope
 fi
 
+section "decompose: harmless preamble prose before the envelope is tolerated (no retry burned)"
+# a real $4.59 attempt was once rejected for one line of narration before the
+# opening marker; the extraction is marker-bounded, so tolerance is lossless
+make_orch_fixture orch-preamble
+RC=0
+LOOP_FAKE_DECOMPOSE_SHAPE=PRE_ENVELOPE_PROSE LOOP_FAKE_DECOMPOSE=ONE LOOP_CLAUDE_CMD="$FAKE" \
+  ./loop.sh decompose --force >"$WORK/orch-preamble.out" 2>&1 </dev/null || RC=$?
+check "first attempt publishes (exit 0)" orch-preamble 0 "$RC"
+check "decompose called once" orch-preamble 1 "$(cat .loop/fake-decompose-i 2>/dev/null)"
+if ! grep -q '"state": "DECOMPOSE_INVALID"' .loop/journal.jsonl \
+   && grep -q '^TASK: solo$' .loop/docs/task-plan.md; then
+  ok "preamble prose neither burned the attempt nor leaked into the published plan"
+else
+  bad "preamble tolerance broken: $(grep DECOMPOSE_INVALID .loop/journal.jsonl | head -1)" orch-preamble
+fi
+
+section "decompose: a stray envelope marker in the preamble still rejects (ambiguity is not prose)"
+make_orch_fixture orch-preamble-dup
+RC=0
+LOOP_FAKE_DECOMPOSE_SHAPE=DUP_ENVELOPE,NORMAL LOOP_FAKE_DECOMPOSE=ONE,ONE LOOP_CLAUDE_CMD="$FAKE" \
+  ./loop.sh decompose --force >"$WORK/orch-preamble-dup.out" 2>&1 </dev/null || RC=$?
+check "duplicate envelope still rejected, retry publishes" orch-preamble-dup 0 "$RC"
+check "decompose called twice" orch-preamble-dup 2 "$(cat .loop/fake-decompose-i 2>/dev/null)"
+
+section "decompose: missing key is named precisely and the retry sees the rejected attempt"
+# replays the auto_agent incident: DEPENDS dropped on attempt 1 — the feedback
+# must name exactly DEPENDS, and attempt 2 must receive attempt 1's full bytes
+make_orch_fixture orch-nodep
+RC=0
+LOOP_FAKE_DECOMPOSE=NODEPENDS,ONE LOOP_CLAUDE_CMD="$FAKE" \
+  ./loop.sh decompose --force >"$WORK/orch-nodep.out" 2>&1 </dev/null || RC=$?
+check "second attempt publishes (exit 0)" orch-nodep 0 "$RC"
+if grep '"state": "DECOMPOSE_INVALID"' .loop/journal.jsonl | grep -q 'missing DEPENDS before BODY-BEGIN' \
+   && ! grep '"state": "DECOMPOSE_INVALID"' .loop/journal.jsonl | grep -q 'missing SUMMARY'; then
+  ok "validator named exactly the absent key"
+else
+  bad "missing key not named precisely: $(grep DECOMPOSE_INVALID .loop/journal.jsonl | head -1)" orch-nodep
+fi
+if grep -q -- '--- PREVIOUS REJECTED ATTEMPT (verbatim) ---' .loop/fake-decompose-fb-full 2>/dev/null \
+   && grep -q '^TASK: nodeps$' .loop/fake-decompose-fb-full; then
+  ok "retry saw the full rejected attempt below the error line"
+else
+  bad "rejected attempt not carried into the retry: $(head -4 .loop/fake-decompose-fb-full 2>/dev/null | tr '\n' ' ')" orch-nodep
+fi
+if [ ! -f .loop/decompose-feedback.md ]; then
+  ok "enriched feedback still cleared after the successful attempt"
+else
+  bad "stale enriched feedback survived success" orch-nodep
+fi
+
 section "orch: decompose review REVISE regenerates once, then approves"
 make_orch_fixture orch-drev
 RC=0
@@ -143,6 +193,12 @@ LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_DECOMPOSE=ONE LOOP_FAKE_DECOMPOSE_REVIEW=REVIS
 check "exit 3" orch-drev2 3 "$RC"
 check "state NEEDS_SPEC_DECISION" orch-drev2 NEEDS_SPEC_DECISION "$(cat .loop/state)"
 if [ -f .loop/decompose-review-feedback.md ]; then ok "review feedback kept for the human"; else bad "feedback missing" orch-drev2; fi
+if grep -q -- '--- PREVIOUS REJECTED ATTEMPT (verbatim) ---' .loop/decompose-review-feedback.md 2>/dev/null \
+   && grep -q '^TASK: solo$' .loop/decompose-review-feedback.md; then
+  ok "review feedback carries the rejected plan verbatim for the human"
+else
+  bad "rejected plan missing from review feedback" orch-drev2
+fi
 
 section "orch: invalid plan (cycle) burns no review call; valid retry succeeds"
 make_orch_fixture orch-dinv

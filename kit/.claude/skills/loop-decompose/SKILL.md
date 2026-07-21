@@ -26,9 +26,15 @@ Read, in this order:
    Non-goals, Constraints, Acceptance Criteria)
 2. `loop.config.sh` — VERIFY_COMMANDS / DENIED_PATHS / ESCALATE_PATHS
 3. `.loop/decompose-feedback.md` if it exists — the deterministic validator
-   rejected your previous plan; fix EVERY listed error
+   rejected your previous plan; fix EVERY listed error. When the file ends
+   with a `--- PREVIOUS REJECTED ATTEMPT (verbatim) ---` block, that is your
+   own prior plan: resubmit it with ONLY the listed violations corrected and
+   every other line unchanged — do NOT re-derive the decomposition from
+   scratch (a fresh regeneration risks re-breaking what was already right)
 4. `.loop/decompose-review-feedback.md` if it exists — the independent reviewer
-   rejected your previous plan; address every must-fix item
+   rejected your previous plan; address every must-fix item. It also ends with
+   the rejected plan verbatim: revise that plan against the feedback, keeping
+   the parts the reviewer did not challenge
 5. The repository — enough to know where each requirement actually lands in the
    code. Scope boundaries you cannot verify in the code are guesses; do not
    emit them.

@@ -277,6 +277,23 @@ print_next_actions() {
       echo
       echo " ▸ Not done yet: run ./loop.sh refine again, or ./loop.sh status to see where things stand."
       ;;
+    blocked-stuck)
+      echo " This run stopped and cannot continue on its own. It is NOT waiting for"
+      echo " your sign-off — there is no pending 'human' acceptance row to sign."
+      echo
+      echo " ▸ Read the cause: the RESULT line above, plus whichever applies:"
+      echo "     .loop/last-verify.log      the failing verification command"
+      echo "     .loop/review-feedback.md   what the reviewer rejected"
+      echo "     .loop/logs/failed/         the raw error from a failed agent call"
+      echo
+      echo " ▸ Give it a different steer, then continue where it left off:"
+      echo "     ./loop.sh resume --note '<what to try differently>'   (counters + cost preserved)"
+      echo
+      echo " ▸ The goal may be wrong or unreachable — CHANGE the contract:"
+      echo "     revise it with /loop-contract, then:  ./loop.sh approve"
+      echo
+      echo " ▸ Start over from a clean slate: ./loop.sh run --fresh"
+      ;;
     stalled)
       echo " This run STALLED — it kept iterating without making progress. It is NOT"
       echo " waiting on your sign-off; it could not get unstuck on its own."
@@ -8712,7 +8729,7 @@ parse_task_plan() { # $1 plan-file, $2 out-dir — stdout: task ids in file orde
   # TASK-PLAN markers, keys at column 0, body between BODY-BEGIN/BODY-END.
   # Writes <out>/<id>.body and <out>/<id>.meta. Nonzero + stderr on violation.
   local plan="$1" out="$2"
-  local in_plan=0 in_task=0 in_body=0 id="" summary="" depends="" scope="" reqs="" line n=0 seen=""
+  local in_plan=0 in_task=0 in_body=0 id="" summary="" depends="" scope="" reqs="" line n=0 seen="" missing=""
   [ -f "$plan" ] || { plan_perr "missing file: $plan"; return 1; }
   rm -rf "${out:?}"
   mkdir -p "$out"
@@ -8758,8 +8775,15 @@ parse_task_plan() { # $1 plan-file, $2 out-dir — stdout: task ids in file orde
         reqs="${line#REQS: }" ;;
       BODY-BEGIN)
         [ "$in_task" = 1 ] || { plan_perr "line $n: BODY-BEGIN outside a task"; return 1; }
-        { [ -n "$summary" ] && [ -n "$depends" ] && [ -n "$scope" ] && [ -n "$reqs" ]; } \
-          || { plan_perr "line $n: task '$id' is missing SUMMARY/DEPENDS/SCOPE/REQS before BODY-BEGIN"; return 1; }
+        # name exactly the absent keys — a generic four-key list once sent a
+        # retry hunting the wrong field while it dropped one it had before
+        missing=""
+        [ -n "$summary" ] || missing="$missing SUMMARY"
+        [ -n "$depends" ] || missing="$missing DEPENDS"
+        [ -n "$scope" ] || missing="$missing SCOPE"
+        [ -n "$reqs" ] || missing="$missing REQS"
+        [ -z "$missing" ] \
+          || { plan_perr "line $n: task '$id' is missing$missing before BODY-BEGIN (each is one 'KEY: value' line at column 0; 'DEPENDS: -' = no dependencies)"; return 1; }
         in_body=1 ;;
       TASK-END)
         { [ "$in_task" = 1 ] && [ "$in_body" = 2 ]; } || { plan_perr "line $n: TASK-END without a completed body"; return 1; }
@@ -9159,9 +9183,33 @@ prepare_plan_candidates() { # fresh private staging for untrusted model output
   git check-ignore -q .loop/plan-candidates/task-plan.md
 }
 
+append_rejected_attempt() { # $1 feedback-file — stdin: the attempt just rejected.
+  # A retry that regenerates from scratch is regression roulette: attempt 2
+  # once fixed the named violation and silently dropped a DEPENDS line attempt
+  # 1 had. Carry the exact rejected bytes below the error so the retry (and
+  # the human, after a terminal stop) fixes ONLY what the feedback names.
+  # These are unvalidated model bytes: append only while the feedback channel
+  # stays git-ignored (same posture as .loop/plan-candidates — never sweepable
+  # into a snapshot commit), and cap at the envelope's 1 MiB limit. Journals
+  # read head -3 of the feedback file, so the error lines stay on top.
+  local fb="$1"
+  git check-ignore -q "$fb" 2>/dev/null || return 0
+  {
+    printf '\n\n--- PREVIOUS REJECTED ATTEMPT (verbatim) ---\n'
+    head -c 1048576
+    printf '\n--- PREVIOUS REJECTED ATTEMPT END ---\n'
+  } >> "$fb" 2>/dev/null || true
+}
+
 materialize_response_envelope() { # $1 result $2 begin $3 end $4 verdict $5 dst
   # Exactly one ordered envelope; after its close only blank lines and the one
-  # exact terminal verdict are allowed. Staging is one same-dir rename.
+  # exact terminal verdict are allowed. Prose BEFORE the opening marker is
+  # tolerated: models narrate ("I have what I need: …") and the extraction is
+  # marker-bounded, so a preamble can never reach the staged bytes — rejecting
+  # an otherwise-valid plan for it burned a $4.59 attempt in production (same
+  # philosophy as normalize_task_plan: mechanical tolerance, no semantics
+  # invented). A stray envelope marker or duplicate verdict in the preamble
+  # still rejects. Staging is one same-dir rename.
   local res="$1" begin="$2" end="$3" verdict="$4" dst="$5" tmp bytes dir
   dir=${dst%/*}; [ "$dir" != "$dst" ] || dir=.
   [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
@@ -9171,10 +9219,7 @@ materialize_response_envelope() { # $1 result $2 begin $3 end $4 verdict $5 dst
     $0 == b { nb++; if (state != 0) bad=1; state=1; next }
     $0 == e { ne++; if (state != 1) bad=1; state=2; next }
     $0 == v { nv++ }
-    state == 0 {
-      if ($0 == "") next
-      bad=1; next
-    }
+    state == 0 { next }
     state == 2 {
       if ($0 == "") next
       if ($0 == v && nv == 1) { state=3; next }
@@ -9184,7 +9229,7 @@ materialize_response_envelope() { # $1 result $2 begin $3 end $4 verdict $5 dst
     END { exit !(nb == 1 && ne == 1 && nv == 1 && state == 3 && !bad) }
   '; then
     rm -f "$tmp"
-    echo "the reply must contain one ordered $begin / $end envelope, followed only by blanks and the exact final verdict '$verdict'" >&2
+    echo "the reply must contain exactly one ordered $begin / $end envelope, with only blank lines and the exact final verdict '$verdict' after it" >&2
     return 1
   fi
   extract_between "$res" "$begin" "$end" > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -9343,6 +9388,7 @@ run_plan_once() { # $1 label, $2 optional prompt suffix (retry feedback pointer)
   verdict=$(extract_verdict "$res" "PLAN: READY")
   if [ -z "$verdict" ]; then
     echo "the reply had no exact final 'PLAN: READY' verdict line" > .loop/plan-feedback.md
+    printf '%s\n' "$res" | append_rejected_attempt .loop/plan-feedback.md
     discard_plan_candidates || true
     return 1
   fi
@@ -9350,12 +9396,14 @@ run_plan_once() { # $1 label, $2 optional prompt suffix (retry feedback pointer)
       '<!-- IMPLEMENTATION-PLAN-END -->' "$verdict" .loop/plan-candidates/implementation-plan.md 2> "$errf"; then
     cat "$errf" > .loop/plan-feedback.md
     rm -f "$errf"
+    printf '%s\n' "$res" | append_rejected_attempt .loop/plan-feedback.md
     discard_plan_candidates || true
     return 1
   fi
   rm -f "$errf"
   if ! validate_implementation_plan .loop/plan-candidates/implementation-plan.md; then
     echo "the plan violates the fixed schema: exactly one '# Implementation Plan' heading; '## Key decisions' (3-7 bullets), '## Milestones' (checkbox rows), '## Current blockers' and '## Notes / learnings' in that order; the milestone rows must contain exactly every contract REQ id" > .loop/plan-feedback.md
+    append_rejected_attempt .loop/plan-feedback.md < .loop/plan-candidates/implementation-plan.md
     discard_plan_candidates || true
     return 1
   fi
@@ -9399,6 +9447,10 @@ $res"
     echo
     printf '%s\n' "$res"
   } > .loop/plan-review-feedback.md
+  # the regeneration (and the human, if this becomes terminal) revises the
+  # exact rejected plan instead of re-deriving one from scratch
+  [ ! -f .loop/plan-candidates/implementation-plan.md ] \
+    || append_rejected_attempt .loop/plan-review-feedback.md < .loop/plan-candidates/implementation-plan.md
   journal_append "plan" "IMPL_PLAN_REVIEW_REVISE" "$verdict"
   note "plan review -> REVISE (feedback: .loop/plan-review-feedback.md)"
   return 1
@@ -9412,7 +9464,7 @@ generate_implementation_plan() { # iteration-0: read-only planner + validation
   if ! run_plan_once "iter-0-plan"; then
     journal_append "plan" "PLAN_INVALID" "$(head -3 .loop/plan-feedback.md 2>/dev/null | tr '\n' '; ')"
     note "iteration-0 plan attempt 1 invalid — retrying once against the validator feedback"
-    if ! run_plan_once "iter-0-plan-2" "(VALIDATOR FEEDBACK: your previous plan was rejected by the deterministic validator — read .loop/plan-feedback.md and fix every listed violation)"; then
+    if ! run_plan_once "iter-0-plan-2" "(VALIDATOR FEEDBACK: your previous plan was rejected by the deterministic validator — read .loop/plan-feedback.md: it names each violation and ends with your rejected attempt verbatim; resubmit that attempt with ONLY the named violations fixed, do not re-derive the plan)"; then
       journal_append "plan" "PLAN_INVALID" "$(head -3 .loop/plan-feedback.md 2>/dev/null | tr '\n' '; ')"
       discard_plan_candidates || true
       die_next "implementation planning failed twice (.loop/plan-feedback.md)${AGENT_FAIL_DIAG:+ — last agent error: $AGENT_FAIL_DIAG}" "inspect $(agent_log_path iter-0-plan-2 json), or write .loop/docs/implementation-plan.md yourself (non-template content is reused as-is), then ./loop.sh run"
@@ -9468,6 +9520,7 @@ run_decompose_once() { # $1 label, $2 optional prompt suffix (retry feedback poi
   verdict=$(extract_verdict "$res" "DECOMPOSE: TASKS n=[0-9]+")
   if [ -z "$verdict" ]; then
     echo "the reply had no parseable 'DECOMPOSE: TASKS n=<N>' last line" > .loop/decompose-feedback.md
+    printf '%s\n' "$res" | append_rejected_attempt .loop/decompose-feedback.md
     discard_plan_candidates || true
     return 1
   fi
@@ -9476,11 +9529,15 @@ run_decompose_once() { # $1 label, $2 optional prompt suffix (retry feedback poi
       '<!-- DECOMPOSE-PLAN-END -->' "$verdict" .loop/plan-candidates/task-plan.md 2> "$errf"; then
     cat "$errf" > .loop/decompose-feedback.md
     rm -f "$errf"
+    printf '%s\n' "$res" | append_rejected_attempt .loop/decompose-feedback.md
     discard_plan_candidates || true
     return 1
   fi
   normalize_task_plan .loop/plan-candidates/task-plan.md
-  validate_decompose_candidate "$vn" || return 1
+  validate_decompose_candidate "$vn" || {
+    append_rejected_attempt .loop/decompose-feedback.md < .loop/plan-candidates/task-plan.md
+    return 1
+  }
   rm -f .loop/decompose-feedback.md
   return 0
 }
@@ -9517,6 +9574,10 @@ $res"
     echo
     printf '%s\n' "$res"
   } > .loop/decompose-review-feedback.md
+  # the regeneration (and the human, if this becomes terminal) revises the
+  # exact rejected plan instead of re-deriving one from scratch
+  [ ! -f .loop/plan-candidates/task-plan.md ] \
+    || append_rejected_attempt .loop/decompose-review-feedback.md < .loop/plan-candidates/task-plan.md
   journal_append "decompose" "DECOMPOSE_REVIEW_REVISE" "$verdict"
   note "decompose review -> REVISE (feedback: .loop/decompose-review-feedback.md)"
   return 1
@@ -9569,7 +9630,7 @@ cmd_decompose_flow() { # $1 force(0|1), $2 enqueue(0|1) — the routing brain.
     if ! run_decompose_once "decompose-1"; then
       journal_append "decompose" "DECOMPOSE_INVALID" "$(head -3 .loop/decompose-feedback.md 2>/dev/null | tr '\n' '; ')"
       note "decompose attempt 1 invalid — retrying once against the validator feedback"
-      if ! run_decompose_once "decompose-2" "(VALIDATOR FEEDBACK: your previous plan was rejected by the deterministic validator — read .loop/decompose-feedback.md and fix every listed violation)"; then
+      if ! run_decompose_once "decompose-2" "(VALIDATOR FEEDBACK: your previous plan was rejected by the deterministic validator — read .loop/decompose-feedback.md: it names each violation and ends with your rejected attempt verbatim; resubmit that attempt with ONLY the named violations fixed, do not re-derive the plan)"; then
         journal_append "decompose" "DECOMPOSE_INVALID" "$(head -3 .loop/decompose-feedback.md 2>/dev/null | tr '\n' '; ')"
         discard_plan_candidates || true
         finish NEEDS_SPEC_DECISION "decomposition failed twice (.loop/decompose-feedback.md) — split the work manually (./loop.sh add), or run single: ./loop.sh run --single"

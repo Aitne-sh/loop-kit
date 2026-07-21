@@ -238,6 +238,12 @@ if [ "$RC" -ne 0 ] \
 else
   bad "invalid plan candidate escaped (rc=$RC)" plan-req-mismatch
 fi
+if grep -q -- '--- PREVIOUS REJECTED ATTEMPT (verbatim) ---' .loop/plan-feedback.md 2>/dev/null \
+   && grep -q '# Implementation Plan' .loop/plan-feedback.md; then
+  ok "plan feedback carries the rejected attempt for the retry and the human"
+else
+  bad "rejected plan attempt missing from .loop/plan-feedback.md: $(head -4 .loop/plan-feedback.md 2>/dev/null | tr '\n' ' ')" plan-req-mismatch
+fi
 
 section "plan validator retry: invalid attempt 1, valid attempt 2 publishes"
 make_fixture plan-retry-ok
