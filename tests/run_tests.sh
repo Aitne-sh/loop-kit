@@ -238,8 +238,17 @@ done
 if [ -n "${LOOP_TEST_TIMING:-}" ] && [ -s "$LOOP_TEST_TIMING_FILE" ]; then
   echo
   echo "slowest sections:"
-  sort -rn "$LOOP_TEST_TIMING_FILE" | head -30 \
-    | awk -F'\t' '{ printf "  %5ds  %-24s %s\n", $1, $2, $3 }'
+  # awk does the limiting, NOT `head -30`. Under `set -euo pipefail`, a `head`
+  # that exits after N lines closes the pipe on `sort`, which then dies of
+  # SIGPIPE (BSD: 141) or reports a write error (GNU: exit 2) — and pipefail
+  # promotes that to the pipeline's status, so `set -e` killed the driver right
+  # here, AFTER the aggregate was computed but BEFORE `passed:`/`wall:` were
+  # printed. Whether it fires is a race between sort finishing its write and head
+  # exiting, so it was intermittent: CI aborted with exit 2 and no counts at all,
+  # which reads as a mystery infra failure rather than a suite result. awk reads
+  # the whole stream, so nothing ever closes the pipe early.
+  sort -rn "$LOOP_TEST_TIMING_FILE" \
+    | awk -F'\t' 'NR <= 30 { printf "  %5ds  %-24s %s\n", $1, $2, $3 }'
 fi
 
 echo

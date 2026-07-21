@@ -44,9 +44,16 @@ jobs:
     env:
       # The gate SKIPS itself when shellcheck is absent, which is right for a dev
       # machine and wrong here: a runner image that drops shellcheck would silently
-      # turn the lint gate into a no-op and nothing would say so. Job-scoped rather
-      # than workflow-scoped — windows-latest genuinely has no shellcheck.
-      LOOP_TEST_REQUIRE_SHELLCHECK: "1"
+      # turn the lint gate into a no-op and nothing would say so.
+      #
+      # Linux only, and not for tidiness. Turning this on proved that macos-latest
+      # ships NO shellcheck — that leg has never linted anything, and its gate has
+      # been a silent no-op for as long as it has existed. The fix is not to brew
+      # install one: shellcheck's analysis is OS-independent, both Linux legs
+      # already run it against the pinned .shellcheckrc, and a third image would
+      # add a third version to skew against, on the slowest runner. So macOS
+      # deliberately does not lint, and now says so instead of pretending.
+      LOOP_TEST_REQUIRE_SHELLCHECK: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
     steps:
       - uses: actions/checkout@v6
       - name: Configure git identity
@@ -75,7 +82,14 @@ jobs:
         run: |
           bash --version | head -1
           sed --version 2>/dev/null | head -1 || echo "BSD sed (no --version)"
-          shellcheck --version 2>/dev/null | awk '/version:/{print "shellcheck " $2}' || echo "no shellcheck on runner"
+          # `shellcheck --version | awk ...` exits 0 even when shellcheck is absent
+          # (awk succeeds on empty input), so the `|| echo` fallback was unreachable
+          # and a runner with no shellcheck printed NOTHING here. Probe first.
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck --version | awk '/version:/{print "shellcheck " $2}'
+          else
+            echo "no shellcheck on this runner (lint is enforced on the Linux legs)"
+          fi
           command -v claude >/dev/null && echo "claude shim on PATH" || echo "no claude on PATH"
       - name: Run full suite (includes shellcheck gate)
         env:
