@@ -1469,6 +1469,14 @@ EOF
     esac
     echo "NEEDS_SPEC_DECISION requirement REQ-002 contradicts REQ-001" > .loop/agent-state
     ;;
+  FIX_THEN_SPEC)
+    # the real-incident shape (Codex seatbelt vs browser probe): the work IS
+    # done and the gate goes green, but the agent still stops claiming its own
+    # environment cannot run a command — finish() must name whose environment
+    # the claim belongs to (the sandbox-vs-gate note)
+    echo fixed > value.txt
+    echo "NEEDS_SPEC_DECISION AC-001 observation channel unusable in this sandbox" > .loop/agent-state
+    ;;
   DECLARE_DECOMP)
     # the worker judges the remaining work too large for its iteration budget:
     # commit-clean boundary + a done-vs-remaining decision request, then the

@@ -107,3 +107,30 @@ else
   bad "repo mode did not resume (legacy behavior changed?)" forge-rebind-repo
 fi
 
+section "decision stop vs green gate: the display names the agent sandbox, not the gate"
+# The incident shape: the agent finishes the work (evaluator gate all green)
+# but still declares NEEDS_SPEC_DECISION claiming a command cannot run in its
+# environment (e.g. a browser launch denied by the Codex seatbelt). The
+# evaluator just re-ran every VERIFY_COMMAND outside that sandbox, so the stop
+# display must say which environment the claim holds in.
+make_fixture decision-green-note
+run_loop "FIX_THEN_SPEC"
+check "stopped for the decision (exit 3)" decision-green-note 3 "$RC"
+check "state NEEDS_SPEC_DECISION" decision-green-note NEEDS_SPEC_DECISION "$STATE"
+if grep -q 'not the verify gate' "$WORK/last-run.out"; then
+  ok "green gate + decision stop prints the sandbox-vs-gate note"
+else
+  bad "sandbox-vs-gate note missing despite an all-green evaluator pass" decision-green-note
+fi
+# and the note NEVER prints while the gate itself is red — a red gate means
+# the environment claim is untested there, so pointing the human away from
+# the agent's report would mislead
+make_fixture decision-red-note
+run_loop "DECLARE_SPEC"
+check "stopped for the decision (exit 3)" decision-red-note 3 "$RC"
+if grep -q 'not the verify gate' "$WORK/last-run.out"; then
+  bad "sandbox-vs-gate note printed although the evaluator gate is red" decision-red-note
+else
+  ok "no note while the evaluator gate is red"
+fi
+

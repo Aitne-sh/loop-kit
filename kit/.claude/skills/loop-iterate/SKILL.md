@@ -167,7 +167,22 @@ outside the verified checklist. Mention such captures prefix-less.
 a `run` row** — "the wiring looks correct" is exactly how a migration that
 renders nothing gets certified. If observation is impossible this iteration
 (channel broken, environment missing), leave the row `pending` and record
-why in progress.md — never fake it. But if the observation CHANNEL itself is
+why in progress.md — never fake it. First check WHOSE environment failed:
+when the probe backing a `run` row is also one of the VERIFY_COMMANDS, the
+executor of record is the deterministic evaluator, which re-runs every
+VERIFY_COMMAND OUTSIDE your session after each iteration — your session's
+sandbox may be unable to launch what the evaluator launches fine (a browser
+denied by an OS sandbox, e.g. Chromium's Mach port registration under a
+Codex seatbelt; a GUI or network policy block). Such an in-session launch
+failure is NEVER by itself evidence that the channel is unusable: record
+the failure once in progress.md, leave the row `pending` if the artifact
+does not exist yet (the evaluator's next pass runs the probe and
+regenerates it), and flip the row to `verified` citing the generated
+artifact once `.loop/last-verify.log` shows that command `[PASS]` — do not
+re-launch the probe from your own shell. For a VERIFY-backed row,
+channel-unusable is judged from the EVALUATOR's log alone: declare it only
+when `.loop/last-verify.log` shows the probe itself failing to launch
+there too. But if the observation CHANNEL itself is
 confirmed unusable in this execution mode — the feasibility premise recorded
 in unknowns.md no longer holds (e.g. the headless probe can no longer launch
 at all), not a transient failure — do not leave the row `pending` forever:

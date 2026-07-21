@@ -2304,6 +2304,26 @@ finish() { # $1 state, $2 reason
         echo " No structured DR entry was recorded; use the RESULT reason above and"
         echo " ./loop.sh report. The pristine decision-request template is not actionable."
       fi
+      # Deterministic cross-check (SPEC/ARCH stops only): the step-2 evaluator
+      # re-ran every VERIFY_COMMAND OUTSIDE the agent session, so "command X
+      # cannot run in this environment" can be true inside the agent sandbox
+      # (Codex's seatbelt denies Chromium's Mach port registration) yet false
+      # for the gate. When THIS process ran an evaluator pass and its log is
+      # non-empty all-green, tell the human whose environment the claim
+      # describes. ITER_EVAL_RAN gates freshness: decompose/fleet finishes
+      # never set it, so a prior run's green log cannot print a stale note.
+      case "$state" in
+        NEEDS_SPEC_DECISION|NEEDS_ARCHITECTURE_DECISION)
+          if [ "${ITER_EVAL_RAN:-0}" = 1 ] && [ -s .loop/last-verify.log ] \
+             && grep -q '^\[PASS\]' .loop/last-verify.log \
+             && ! grep -q '^\[FAIL\]' .loop/last-verify.log; then
+            echo
+            echo " note: the deterministic evaluator re-ran every VERIFY_COMMAND outside the"
+            echo " agent session this iteration — ALL PASSED (.loop/last-verify.log)."
+            echo " A decision request claiming a command cannot run in this environment"
+            echo " describes the agent session's sandbox, not the verify gate."
+          fi ;;
+      esac
       # if the iteration authored a visual decision brief, show it too (no-op headless)
       open_html .loop/reports/decision.html
       if [ "$state" = "NEEDS_DECOMPOSITION" ]; then
@@ -12507,6 +12527,11 @@ run_iteration_loop() { # $1 i $2 run_start_ref $3 agent_failures $4 gate_revise 
     if ! state_line=$("$evaluator" --pre-ref "$pre_ref" --approved-hash "$RUN_CONTRACT_HASH"); then
       state_line="BLOCKED external evaluator crashed"
     fi
+    # an evaluator pass exists IN THIS PROCESS: finish() may cross-check a
+    # decision stop against .loop/last-verify.log knowing it is this run's
+    # fresh output, not a previous run's leftover (decompose/fleet finishes
+    # never set this, so they never print the sandbox-vs-gate note)
+    ITER_EVAL_RAN=1
     # The normal evaluator validates but never writes the observations
     # manifest; its VERIFY_COMMANDS are arbitrary project shell, so any
     # manifest change across this call is tampering, not a stamp. Catch it
