@@ -66,6 +66,17 @@ done
 
 emit() { echo "$1 $2"; exit 0; }
 
+# brief_list — stdin: one item per line -> a BOUNDED single-line summary. An emit
+# reason becomes the run's RESULT line, so a wide violation must not print every
+# path and bury the reason. The count stays exact even when names are truncated.
+# (loop.sh carries the same helper — the two scripts share no library.)
+brief_list() {
+  awk -v max=5 '
+    { n++; if (n <= max) out = (out == "" ? $0 : out " " $0) }
+    END { if (n > max) printf "%s (+%d more)\n", out, n - max; else print out }
+  '
+}
+
 # strictly per-evaluation evidence: clear BEFORE any early emit (sections 1-4,
 # config errors), or a previous evaluation's flake log would survive an early
 # exit and be journaled by loop.sh against an iteration that never re-verified
@@ -411,19 +422,19 @@ EOF
 # ---------- 2. harness paths ----------
 viol=$(match_globs "$changed" "$HARNESS_PATHS")
 if [ -n "$viol" ]; then
-  emit RISK_REQUIRES_APPROVAL "harness file(s) modified by the loop: $(echo "$viol" | tr '\n' ' ')"
+  emit RISK_REQUIRES_APPROVAL "harness file(s) modified by the loop: $(printf '%s\n' "$viol" | brief_list)"
 fi
 
 # ---------- 3. denied paths ----------
 viol=$(match_globs "$changed" "$DENIED_PATHS")
 if [ -n "$viol" ]; then
-  emit RISK_REQUIRES_APPROVAL "denied path(s) modified: $(echo "$viol" | tr '\n' ' ')"
+  emit RISK_REQUIRES_APPROVAL "denied path(s) modified: $(printf '%s\n' "$viol" | brief_list)"
 fi
 
 # ---------- 4. escalate paths ----------
 esc=$(match_globs "$changed" "$ESCALATE_PATHS")
 if [ -n "$esc" ]; then
-  emit NEEDS_ARCHITECTURE_DECISION "architecture-sensitive path(s) modified: $(echo "$esc" | tr '\n' ' ')"
+  emit NEEDS_ARCHITECTURE_DECISION "architecture-sensitive path(s) modified: $(printf '%s\n' "$esc" | brief_list)"
 fi
 
 # ---------- 5. verification (the deterministic gate — run by the evaluator itself) ----------
@@ -832,7 +843,12 @@ if [ "$verify_ok" -eq 1 ] && [ "$gate_state" = "READY_FOR_REVIEW" ]; then
   emit SUCCESS_CANDIDATE "verify green + agent ready — pending review + evidence"
 fi
 if [ "$FINAL" -eq 1 ]; then
-  emit BLOCKED "final re-check failed (verify_ok=$verify_ok, agent_state=$agent_state)"
+  # this reason is printed verbatim as the run's RESULT line — name the cause in
+  # words and point at the artifact, not at raw internal variables
+  if [ "$verify_ok" -eq 1 ]; then
+    emit BLOCKED "final re-check failed: verification passes but the agent never declared readiness (agent state: ${agent_state:-none})"
+  fi
+  emit BLOCKED "final re-check failed: a verification command is still failing — see .loop/last-verify.log"
 fi
 
 # ---------- 8. stagnation & repeated identical failure ----------
@@ -861,7 +877,7 @@ if [ "$verify_ok" -eq 0 ]; then
   count=$(echo "$recent" | grep -c . || true)
   uniqc=$(echo "$recent" | sort -u | grep -c . || true)
   if [ "$count" -ge "$REPEAT_FAIL_N" ] && [ "$uniqc" -eq 1 ]; then
-    emit BLOCKED "identical verification failure repeated $REPEAT_FAIL_N times — needs a different approach or human help"
+    emit BLOCKED "identical verification failure repeated $REPEAT_FAIL_N times — needs a different approach or human help; the failing command is in .loop/last-verify.log"
   fi
   # A/B oscillation: the identical-repeat rule above only catches N-in-a-row
   # of ONE fingerprint; a loop ping-ponging between two failure states (the
@@ -876,7 +892,7 @@ if [ "$verify_ok" -eq 0 ]; then
     count=$(echo "$recent" | grep -c . || true)
     uniqc=$(echo "$recent" | sort -u | grep -c . || true)
     if [ "$count" -ge "$cyc_n" ] && [ "$uniqc" -le 2 ]; then
-      emit BLOCKED "verification failures cycling between $uniqc states over the last $cyc_n failing iterations — needs a different approach or human help"
+      emit BLOCKED "verification failures cycling between $uniqc states over the last $cyc_n failing iterations — needs a different approach or human help; the latest failure is in .loop/last-verify.log"
     fi
   fi
 fi

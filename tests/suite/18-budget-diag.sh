@@ -202,3 +202,45 @@ else
   bad "die_next recovery line missing on a gap error site" nextcmd
 fi
 
+
+section "watch: escalations stop; only a rate/usage limit is waited out"
+# `watch` used to print "rc=4 — retrying in <interval>s" for EVERY non-zero exit.
+# For a BLOCKED/STALLED/BUDGET_EXCEEDED run that retry is a bare `run`, which
+# decide_run_mode maps to FRESH — so the message hid a full restart from
+# iteration 1 that re-spends the whole budget, up to --max-runs times, on a run
+# that already needs a human. README documents watch as "until success or
+# escalation"; these pin that.
+make_fixture watch-stop
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="DECLARE_BLOCKED" LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh watch --max-runs 3 --interval 1 >"$WORK/watch-stop.out" 2>&1 </dev/null || RC=$?
+check "watch stops on a BLOCKED escalation (exit 4)" watch-stop 4 "$RC"
+n=$(grep -c '^loop: watch: run ' "$WORK/watch-stop.out" || true)
+if [ "$n" = 1 ]; then ok "watch made exactly one attempt (no silent fresh restart)"; else bad "watch retried an escalation ($n attempts)" watchstop; fi
+if grep -q 'needs a human' "$WORK/watch-stop.out" && grep -q 'restart from iteration 1' "$WORK/watch-stop.out"; then
+  ok "watch names the state and why it is not retrying"
+else
+  bad "watch stop message missing the state / no-retry reason" watchstop
+fi
+if grep -q 'NEXT ACTION' "$WORK/watch-stop.out"; then ok "watch prints the run's NEXT ACTION box"; else bad "watch stop printed no NEXT ACTION box" watchstop; fi
+
+# the ONE stop worth waiting out: a rate/usage limit. It must keep going AND
+# continue with `resume`, so the checkpoint and counters survive the wait.
+make_fixture watch-stall
+RC=0
+LOOP_CLAUDE_CMD="$FAKE" LOOP_FAKE_SCENARIO="ERRJSON,ERRJSON" LOOP_FAKE_REVIEW=APPROVE LOOP_FAKE_STOPEVAL=CONTINUE \
+  ./loop.sh watch --max-runs 2 --interval 1 >"$WORK/watch-stall.out" 2>&1 </dev/null || RC=$?
+check "watch exhausts --max-runs on a rate limit (exit 5)" watch-stall 5 "$RC"
+n=$(grep -c '^loop: watch: run ' "$WORK/watch-stall.out" || true)
+if [ "$n" = 2 ]; then ok "watch waited out the rate limit and retried"; else bad "watch did not retry a rate-limit stall ($n attempts)" watchstall; fi
+if grep -q 'rate/usage limit' "$WORK/watch-stall.out"; then ok "watch names the rate/usage limit as the reason it waits"; else bad "watch wait reason missing" watchstall; fi
+if grep -q '^loop: watch: run 2/2 (resume)' "$WORK/watch-stall.out"; then
+  ok "watch continues with resume (counters + cost preserved), not a fresh run"
+else
+  bad "watch retried with a fresh run instead of resume" watchstall
+fi
+if grep -q 'reached --max-runs' "$WORK/watch-stall.out" && grep -q 'last state:' "$WORK/watch-stall.out"; then
+  ok "watch's max-runs exit names the last state instead of just 'max runs reached'"
+else
+  bad "watch max-runs message missing the state" watchstall
+fi

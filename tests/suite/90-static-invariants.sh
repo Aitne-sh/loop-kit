@@ -51,3 +51,41 @@ else
   bad "boundary-strip sed drifted between loop.sh and evaluate.sh" parser-sync
 fi
 
+section "every stop state resolves to a NEXT ACTION context that actually exists"
+# The "what do I run next?" surface is only uniform if the two halves stay in
+# sync: next_action_ctx_for_state() decides WHICH box a stop shows, and
+# print_next_actions() implements the boxes. A context named by one and missing
+# from the other is a stop that prints an empty box (or silently prints none) —
+# the dead-end this whole surface exists to prevent. Both directions are checked,
+# because an orphaned box is just as much a bug as a missing one.
+ctx_impl=$(awk '/^print_next_actions\(\)/,/^}/' "$ROOT/bin/loop.sh" \
+  | grep -oE '^    [a-z-]+\)' | tr -d ' )' | sort -u)
+# comment lines are dropped first: the prose around these call sites names them
+# ("print_next_actions spells out ...") and would otherwise be read as contexts
+code_only() { grep -vE '^[[:space:]]*#'; }
+ctx_used=$({ awk '/^next_action_ctx_for_state\(\)/,/^}/' "$ROOT/bin/loop.sh" | code_only \
+              | grep -oE 'echo [a-z-]+' | awk '{print $2}'
+            # a caller may pin a box directly (e.g. the api-stall classifier)
+            code_only < "$ROOT/bin/loop.sh" | grep -oE 'NEXT_ACTION_CTX=[a-z-]+' | cut -d= -f2
+            # ...and finish()/refine call a few by literal name
+            code_only < "$ROOT/bin/loop.sh" | grep -oE 'print_next_actions [a-z-]+' | awk '{print $2}'
+          } | grep -v '^$' | sort -u)
+missing=$(comm -23 <(printf '%s\n' "$ctx_used") <(printf '%s\n' "$ctx_impl"))
+orphan=$(comm -13 <(printf '%s\n' "$ctx_used") <(printf '%s\n' "$ctx_impl"))
+if [ -z "$missing" ]; then
+  ok "every NEXT ACTION context a stop can select is implemented in print_next_actions"
+else
+  bad "stop states select context(s) print_next_actions does not implement: $(echo "$missing" | tr '\n' ' ')" nextaction-sync
+fi
+if [ -z "$orphan" ]; then
+  ok "print_next_actions has no unreachable context"
+else
+  bad "print_next_actions implements context(s) nothing selects: $(echo "$orphan" | tr '\n' ' ')" nextaction-sync
+fi
+# and the two BLOCKED branches must both remain selectable — collapsing them is
+# what put `./loop.sh signoff` in front of every failing loop in the first place
+if printf '%s\n' "$ctx_used" | grep -qx blocked && printf '%s\n' "$ctx_used" | grep -qx blocked-stuck; then
+  ok "BLOCKED still splits into the sign-off box and the stuck box"
+else
+  bad "BLOCKED lost one of its two boxes (blocked / blocked-stuck)" nextaction-sync
+fi

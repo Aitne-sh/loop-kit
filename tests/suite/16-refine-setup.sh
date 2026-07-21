@@ -6,6 +6,17 @@ set -euo pipefail
 # ---------- design-gate refine + unchanged-re-approval guard + NEXT ACTION logs ----------
 section "NEXT ACTION box on BLOCKED, and refine declines without a TTY (Parts B+C)"
 make_fixture blocked-refine
+# a REAL sign-off gate: one pending 'human' acceptance row, which is the only
+# condition under which ./loop.sh signoff has anything to sign. finish() picks the
+# box from exactly this (pending_human_acs), so the fixture has to carry the row
+# the guidance is about — see the blocked-stuck section below for the other branch.
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | the swirl looks right to a human | human | pending | - |
+EOF
 run_loop "DECLARE_BLOCKED"
 check "state BLOCKED" blocked-refine BLOCKED "$STATE"
 # finish() must always print the scannable NEXT ACTION box that keeps the two human
@@ -35,6 +46,59 @@ if grep -q '/loop-refine' "$ROOT/bin/loop.sh" && grep -q 'sign off + ./loop.sh r
   ok "refine interactive session + [y] sign-off-and-resume present in source"
 else
   bad "refine interactive/confirm path missing from source" nextaction
+fi
+# `status` and `report` must reach the SAME guidance the stop printed — those two
+# advertise each other as "full guidance", and report used to dead-end without it
+./loop.sh status >"$WORK/blocked-status.out" 2>&1 </dev/null || true
+if grep -q './loop.sh signoff' "$WORK/blocked-status.out"; then
+  ok "status on a real sign-off gate names signoff"
+else
+  bad "status hint missing signoff on a sign-off gate" nextaction
+fi
+./loop.sh report --text >"$WORK/blocked-report.out" 2>&1 </dev/null || true
+if grep -q 'NEXT ACTION' "$WORK/blocked-report.out" && grep -q './loop.sh signoff' "$WORK/blocked-report.out"; then
+  ok "report --text carries the NEXT ACTION box it is advertised as ('full guidance')"
+else
+  bad "report --text printed no NEXT ACTION box" nextaction
+fi
+
+section "BLOCKED with NO pending human row gets the stuck box, never a signoff referral"
+# The dead-end that this split exists to kill: a BLOCKED caused by a failing loop
+# (repeated verification failure, review churn, a failed agent call, a certification
+# or fleet failure) is not a sign-off gate. Leading with `./loop.sh signoff` sent the
+# human to a command that answers "nothing to sign off" and forwards them to
+# `report` — which, before this, printed no guidance at all.
+make_fixture blocked-stuck
+run_loop "DECLARE_BLOCKED"
+check "state BLOCKED" blocked-stuck BLOCKED "$STATE"
+if grep -q 'NEXT ACTION' "$WORK/last-run.out"; then ok "stuck BLOCKED still prints the NEXT ACTION box"; else bad "NEXT ACTION box missing on stuck BLOCKED" stuckbox; fi
+if grep -q './loop.sh signoff' "$WORK/last-run.out"; then
+  bad "stuck BLOCKED still offers signoff (nothing to sign — dead-end referral)" stuckbox
+else
+  ok "stuck BLOCKED does NOT offer signoff"
+fi
+if grep -q 'NOT waiting for' "$WORK/last-run.out" && grep -q 'last-verify.log' "$WORK/last-run.out"; then
+  ok "stuck box says it is not a sign-off gate and names where the cause is"
+else
+  bad "stuck box missing the not-a-sign-off-gate wording / cause pointers" stuckbox
+fi
+if grep -q "resume --note" "$WORK/last-run.out" && grep -q 'run --fresh' "$WORK/last-run.out"; then
+  ok "stuck box offers the steer and the clean restart"
+else
+  bad "stuck box missing resume --note / run --fresh" stuckbox
+fi
+# and the inspect surfaces agree with the stop instead of contradicting it
+./loop.sh status >"$WORK/stuck-status.out" 2>&1 </dev/null || true
+if grep -q 'next:' "$WORK/stuck-status.out" && ! grep -q './loop.sh signoff' "$WORK/stuck-status.out"; then
+  ok "status hint on a stuck BLOCKED names a recovery without referring to signoff"
+else
+  bad "status hint still refers a stuck BLOCKED to signoff" stuckbox
+fi
+./loop.sh report --text >"$WORK/stuck-report.out" 2>&1 </dev/null || true
+if grep -q 'NOT waiting for' "$WORK/stuck-report.out"; then
+  ok "report --text shows the same stuck box the stop showed"
+else
+  bad "report --text did not carry the stuck box" stuckbox
 fi
 
 section "refine declines a non-BLOCKED state with guidance (Part B)"

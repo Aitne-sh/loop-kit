@@ -330,6 +330,71 @@ print_next_actions() {
   echo "────────────────────────────────────────────────────────────"
 }
 
+# next_action_ctx_for_state <state> — the print_next_actions context a stop state
+# maps to, or empty for the states that show no box (SUCCESS/NO_OP/RUNNING, and
+# NEEDS_DECOMPOSITION, which finish() answers with its own tailored lines).
+# BLOCKED is the one state whose box depends on WHY it stopped. The sign-off box
+# is correct ONLY when the acceptance checklist actually holds pending `human`
+# row(s) for `./loop.sh signoff` to sign; every other BLOCKED (a repeated
+# verification failure, review churn, a failed agent call, a certification or
+# fleet failure) is a dead end, and leading with `signoff` there sent the human
+# to a command that answers "nothing to sign off" and bounces them onward.
+# pending_human_acs() is the SAME row match cmd_signoff signs, so this choice can
+# never disagree with what signoff would actually do.
+next_action_ctx_for_state() {
+  case "$1" in
+    BLOCKED)
+      if [ -n "$(pending_human_acs 2>/dev/null || true)" ]; then
+        echo blocked
+      else
+        echo blocked-stuck
+      fi ;;
+    STALLED)                echo stalled ;;
+    BUDGET_EXCEEDED)        echo budget ;;
+    RISK_REQUIRES_APPROVAL) echo risk ;;
+    NEEDS_SPEC_DECISION|NEEDS_ARCHITECTURE_DECISION|PENDING_APPROVAL) echo decision ;;
+    *)                      echo "" ;;
+  esac
+}
+
+# stop_ctx_for_display — the context for the CURRENT .loop/state, for the inspect
+# surfaces (status / report / watch). finish() records the context it chose,
+# including an api-stall override the state alone cannot re-derive; that record is
+# honored only while it still names THIS state, so a stale context from an earlier
+# stop can never label a later one.
+stop_ctx_for_display() {
+  local st rec
+  st=$(cat .loop/state 2>/dev/null || echo "")
+  [ -n "$st" ] || return 0
+  rec=$(cat .loop/last-stop-ctx 2>/dev/null || echo "")
+  case "$rec" in
+    "$st "*) printf '%s\n' "${rec#"$st" }" ;;
+    *)       next_action_ctx_for_state "$st" ;;
+  esac
+}
+
+# print_stop_guidance — the same boxed NEXT ACTION the stop itself printed. Both
+# `status` and `signoff` advertise `./loop.sh report` as "full guidance", so the
+# inspect surfaces have to actually carry it instead of pointing at each other.
+print_stop_guidance() {
+  local ctx
+  ctx=$(stop_ctx_for_display)
+  [ -n "$ctx" ] || return 0
+  print_next_actions "$ctx"
+}
+
+# brief_list — stdin: one item per line -> a BOUNDED single-line summary. Path
+# lists were folded whole into a stop's RESULT reason with `tr '\n' ' '`, so a
+# wide change could print hundreds of paths on one line and bury the reason
+# itself. The count is always exact even when the names are truncated.
+# (evaluate.sh carries the same helper — the two scripts share no library.)
+brief_list() {
+  awk -v max=5 '
+    { n++; if (n <= max) out = (out == "" ? $0 : out " " $0) }
+    END { if (n > max) printf "%s (+%d more)\n", out, n - max; else print out }
+  '
+}
+
 # ---------- HTML report/mockup viewing (interactive only; never headless) ----------
 # The harness never RENDERS html (the model authors self-contained pages into
 # .loop/reports/ while it already has a session open). loop.sh only OPENS them,
@@ -2181,6 +2246,17 @@ finish() { # $1 state, $2 reason
   echo 0 > .loop/last-turns   # the terminal event is not an agent call
   rm -f .loop/run.pid .loop/run.heartbeat   # the liveness signals die with the run
   journal_append "final" "$state" "$reason"
+  # Resolve the NEXT ACTION context ONCE (a caller's NEXT_ACTION_CTX still wins)
+  # and record it beside the state, so `status` / `report` / `watch` can show the
+  # very box this stop showed — including an api-stall classification the state
+  # alone cannot re-derive. Display only: it carries no authority whatsoever.
+  local nactx
+  nactx="${NEXT_ACTION_CTX:-$(next_action_ctx_for_state "$state")}"
+  if [ -n "$nactx" ]; then
+    printf '%s %s\n' "$state" "$nactx" > .loop/last-stop-ctx 2>/dev/null || true
+  else
+    rm -f .loop/last-stop-ctx 2>/dev/null || true
+  fi
   echo
   echo "══════════════════════════════════════════════════"
   echo " RESULT: $state"
@@ -2254,7 +2330,7 @@ finish() { # $1 state, $2 reason
       echo "── Risk review required ──"
       echo " This stop was raised by a deterministic safety guard. No decision-request"
       echo " template or possibly stale decision HTML is shown."
-      print_next_actions "${NEXT_ACTION_CTX:-risk}"
+      print_next_actions "$nactx"
       echo " NOTE: approving without reverting accepts this change permanently — review the diff first."
       exit 3 ;;
     BLOCKED|STALLED)
@@ -2270,19 +2346,15 @@ finish() { # $1 state, $2 reason
         echo "── Decision request(s) from this run ──"
         print_decision_requests
       fi
-      # BLOCKED → the sign-off / within-contract-steer / contract-change box;
-      # STALLED → the futility box (it is not a sign-off gate). A caller may
-      # override (e.g. NEXT_ACTION_CTX=api-stall for a rate/usage-limit stall).
-      if [ -n "${NEXT_ACTION_CTX:-}" ]; then
-        print_next_actions "$NEXT_ACTION_CTX"
-      elif [ "$state" = STALLED ]; then
-        print_next_actions stalled
-      else
-        print_next_actions blocked
-      fi
+      # STALLED → the futility box (it is not a sign-off gate). BLOCKED splits on
+      # whether a pending `human` acceptance row actually exists: only then is the
+      # sign-off box right, otherwise this is a dead end and `signoff` would be a
+      # dead-end referral (next_action_ctx_for_state). A caller may override the
+      # whole choice (e.g. NEXT_ACTION_CTX=api-stall for a rate/usage-limit stall).
+      print_next_actions "$nactx"
       exit 4 ;;
     BUDGET_EXCEEDED)
-      print_next_actions "${NEXT_ACTION_CTX:-budget}"
+      print_next_actions "$nactx"
       exit 5 ;;
     *)
       exit 4 ;;
@@ -2290,8 +2362,19 @@ finish() { # $1 state, $2 reason
 }
 
 on_contract_int() { # contract definition interrupted (no run exists yet: no
-  # checkpoint/state semantics) — the only job is to never orphan the agent subtree
+  # checkpoint/state semantics) — never orphan the agent subtree, then say what
+  # survived and what to type. A bare exit 130 here left the human with a killed
+  # session, no output at all, and no way to tell whether a contract was written.
   kill_agent_group "$CHILD_PID"
+  echo
+  if [ -f .loop/docs/product-contract.md ] \
+     && ! grep -q '<!-- TEMPLATE -->' .loop/docs/product-contract.md 2>/dev/null; then
+    note "interrupted while defining the loop — .loop/docs/product-contract.md was written but NOT approved; no run was started."
+    note "  → next: review it, then ./loop.sh approve && ./loop.sh run   |   redo it: ./loop.sh start \"<instruction>\""
+  else
+    note "interrupted while defining the loop — no contract was written; nothing was approved or changed."
+    note "  → next: ./loop.sh start \"<instruction>\""
+  fi
   exit 130
 }
 
@@ -3113,9 +3196,9 @@ run_evidence_step() { # $1 single|fleet, $2 journal label, $3 call-label prefix,
     evidence_diff=$(post_review_product_changes "$reviewed_ref")
     if [ -n "$evidence_diff" ]; then
       if [ "$gate" = fleet ]; then
-        finish BLOCKED "evidence step changed code after the integration review (unreviewed): $(echo "$evidence_diff" | tr '\n' ' ')"
+        finish BLOCKED "evidence step changed code after the integration review (unreviewed): $(printf '%s\n' "$evidence_diff" | brief_list)"
       fi
-      finish BLOCKED "evidence step changed code after review (unreviewed): $(echo "$evidence_diff" | tr '\n' ' ')"
+      finish BLOCKED "evidence step changed code after review (unreviewed): $(printf '%s\n' "$evidence_diff" | brief_list)"
     fi
     if validate_current_evidence_report; then
       EVIDENCE_REPORT_REASON=""
@@ -3348,7 +3431,7 @@ run_success_gate() { # $1 iter, $2 run-start-ref, $3 pre-ref, $4 forced (0|1)
       || finish BLOCKED "certification inputs changed after the evidence snapshot"
     evidence_diff=$(post_review_product_changes "$reviewed_ref")
     [ -z "$evidence_diff" ] \
-      || finish BLOCKED "product tree changed after review: $(echo "$evidence_diff" | tr '\n' ' ')"
+      || finish BLOCKED "product tree changed after review: $(printf '%s\n' "$evidence_diff" | brief_list)"
     if [ "$task_base_valid" -eq 1 ] \
        && [ -z "$(git diff --name-only "$task_base" -- . \
                     ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' \
@@ -10429,7 +10512,7 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
                     2>/dev/null)" ]; then
         evidence_diff=$(post_review_product_changes "$reviewed_ref")
         [ -z "$evidence_diff" ] \
-          || finish BLOCKED "product tree changed after the integration review: $(echo "$evidence_diff" | tr '\n' ' ')"
+          || finish BLOCKED "product tree changed after the integration review: $(printf '%s\n' "$evidence_diff" | brief_list)"
         write_certification NO_OP "$base" "$base" "$reviewed_ref" NOT_APPLICABLE \
           || finish BLOCKED "failed to write or commit integration certification.json"
         check_harness "after integration certification"
@@ -10437,7 +10520,7 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
       fi
       evidence_diff=$(post_review_product_changes "$reviewed_ref")
       [ -z "$evidence_diff" ] \
-        || finish BLOCKED "product tree changed after the integration review: $(echo "$evidence_diff" | tr '\n' ' ')"
+        || finish BLOCKED "product tree changed after the integration review: $(printf '%s\n' "$evidence_diff" | brief_list)"
       write_certification SUCCESS "$base" "$base" "$reviewed_ref" NOT_APPLICABLE \
         || finish BLOCKED "failed to write or commit integration certification.json"
       check_harness "after integration certification"
@@ -12307,7 +12390,7 @@ cmd_run() {
     rm -f .loop/agent-state .loop/stagnation-count .loop/fail-fingerprints .loop/last-cost \
           .loop/futile-count .loop/review-feedback.md .loop/review-diff.patch \
           .loop/met-count .loop/stop-nudge.md .loop/split-nudge.md .loop/last-turns \
-          .loop/context-nudge.md .loop/ac-seen
+          .loop/context-nudge.md .loop/ac-seen .loop/last-stop-ctx
     # seed the run-scoped AC-id ledger from the checklist as it stands at run
     # start: rows present NOW are recorded before iteration 1 can touch them,
     # so a row deleted in the very first iteration is still caught by the
@@ -13079,7 +13162,7 @@ cmd_resume_list() { # every session in this repo and whether/how it resumes
 
 cmd_watch() {
   need_kit
-  local interval=900 max_runs=10 runs=0 rc
+  local interval=900 max_runs=10 runs=0 rc next_cmd=run
   while [ $# -gt 0 ]; do
     case "$1" in
       --interval) interval="${2:?}"; shift 2 ;;
@@ -13089,17 +13172,36 @@ cmd_watch() {
   done
   while [ "$runs" -lt "$max_runs" ]; do
     runs=$((runs + 1))
-    note "watch: run $runs/$max_runs"
+    note "watch: run $runs/$max_runs ($next_cmd)"
     rc=0
-    "$SELF" run || rc=$?
+    "$SELF" "$next_cmd" || rc=$?
     case "$rc" in
       0) note "watch: success — done"; exit 0 ;;
       3) note "watch: human decision required — stopping (retrying would burn budget)"; exit 3 ;;
       2) exit 2 ;;
+      4|5)
+        # A rate/usage-limit stall is the ONE stop worth waiting out — that is what
+        # --interval is for — and it continues with `resume`, so the checkpoint and
+        # counters survive. Every OTHER rc 4/5 is a real escalation ("until success
+        # or escalation"): a bare `run` maps BLOCKED/STALLED/BUDGET_EXCEEDED to
+        # `fresh` (decide_run_mode, no --require-resume), so retrying would silently
+        # restart from iteration 1 and re-spend a whole budget per round on a run
+        # that already needs a human. Saying only "retrying" hid exactly that.
+        if [ "$(stop_ctx_for_display)" = api-stall ]; then
+          next_cmd=resume
+          note "watch: rate/usage limit — waiting ${interval}s, then continuing with resume (counters + cost preserved)"
+          sleep "$interval"
+        else
+          note "watch: stopped — the last run ended $(cat .loop/state 2>/dev/null || echo "rc=$rc") and needs a human"
+          note "watch: not retrying — a bare 'run' would restart from iteration 1 and re-spend the budget"
+          print_stop_guidance
+          exit "$rc"
+        fi ;;
       *) note "watch: rc=$rc — retrying in ${interval}s"; sleep "$interval" ;;
     esac
   done
-  note "watch: max runs reached"
+  note "watch: reached --max-runs $max_runs without success — last state: $(cat .loop/state 2>/dev/null || echo unknown)"
+  print_stop_guidance
   exit 5
 }
 
@@ -13152,7 +13254,14 @@ cmd_status() {
   # `status` alone never leaves the user wondering what to run next.
   local hint=""
   case "$st" in
-    BLOCKED)          hint="./loop.sh signoff (sign off + re-certify), ./loop.sh refine '<change>', or ./loop.sh resume --note '<change>'  — full guidance: ./loop.sh report" ;;
+    BLOCKED)
+      # same split finish() made: sign-off is only a real option when a pending
+      # 'human' acceptance row exists, so a stuck run is never sent to `signoff`
+      case "$(stop_ctx_for_display)" in
+        blocked)   hint="./loop.sh signoff (sign off + re-certify), ./loop.sh refine '<change>', or ./loop.sh resume --note '<change>'  — full guidance: ./loop.sh report" ;;
+        api-stall) hint="wait for the rate/usage limit to reset, then ./loop.sh resume  — full guidance: ./loop.sh report" ;;
+        *)         hint="read the cause (RESULT / .loop/last-verify.log / .loop/review-feedback.md), then ./loop.sh resume --note '<what to try differently>'  — full guidance: ./loop.sh report" ;;
+      esac ;;
     STALLED)          hint="./loop.sh resume --note '<what to try differently>', or ./loop.sh run --fresh" ;;
     BUDGET_EXCEEDED)  hint="raise MAX_ITERATIONS/MAX_COST_USD in loop.config.sh, then ./loop.sh approve && ./loop.sh resume" ;;
     NEEDS_*|RISK_REQUIRES_APPROVAL|PENDING_APPROVAL) hint="decide (.loop/docs/decision-requests.md), then ./loop.sh approve && ./loop.sh run  — full guidance: ./loop.sh report" ;;
@@ -13212,6 +13321,9 @@ cmd_report() {
   if [ -n "$html" ] && [ -t 0 ] && [ "$AUTO_MODE" != "1" ]; then
     note "opening HTML report (plain-text view: ./loop.sh report --text)"
     open_html "$html"
+    # the page shows the evidence, not what to type next — `status` and `signoff`
+    # both send the user here for "full guidance", so carry it on this path too
+    print_stop_guidance
     return 0
   fi
   for f in evidence-report spec-drift-report assumptions decision-requests unknowns; do
@@ -13331,6 +13443,10 @@ cmd_report() {
   else
     echo "(no journal yet — run ./loop.sh)"
   fi
+  # `status` and `signoff` advertise this command as "full guidance", so the run's
+  # own NEXT ACTION box belongs here — without it those referrals dead-ended on a
+  # report that showed the evidence but never said what to run next.
+  print_stop_guidance
   # report must exit 0 — this trailing hint is cosmetic, and a bare `[ -n ] &&`
   # as the last command would leak exit 1 to scripted callers when no HTML exists
   [ -z "$html" ] || note "HTML view available: ./loop.sh report --open   ($html)"

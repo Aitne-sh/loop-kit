@@ -24,6 +24,20 @@ if [ ! -f .loop/fake-contract-completed ]; then
 else
   bad "orphaned contract child completed after TERM" contract-int
 fi
+# ...and the human must not be left staring at a killed session with NO output at
+# all: on_contract_int used to kill and exit 130 silently, so there was no way to
+# tell whether a contract had been written or what to type next.
+if grep -q 'interrupted while defining the loop' "$WORK/contract-int.out"; then
+  ok "contract interrupt says what it was doing"
+else
+  bad "contract interrupt printed nothing about its state" contract-int
+fi
+if grep -q 'no contract was written' "$WORK/contract-int.out" \
+   && grep -q '→ next:' "$WORK/contract-int.out" && grep -q './loop.sh start' "$WORK/contract-int.out"; then
+  ok "contract interrupt reports nothing was written and names the next command"
+else
+  bad "contract interrupt missing the 'nothing written' status / '→ next:' recovery" contract-int
+fi
 
 section "run interrupt: the WHOLE agent subtree is reaped (no orphaned grandchild)"
 # The agent (claude) spawns its own subprocesses (MCP servers, tool children,

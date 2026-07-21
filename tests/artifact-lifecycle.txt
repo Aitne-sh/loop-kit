@@ -42,6 +42,7 @@
 .loop/docs/evidence-report.md run
 .loop/docs/certification.json run
 .loop/state run
+.loop/last-stop-ctx run
 .loop/loop.sh.new run
 .loop/.parallel-context.md.tmp run
 
