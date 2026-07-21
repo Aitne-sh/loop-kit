@@ -30,7 +30,12 @@ LOOP_TEST_TIMING=1 tests/run_tests.sh    # + a slowest-sections table
 # `sh -n` will report false errors on its process-substitution/arrays; use bash).
 bash -n bin/loop.sh
 
-# Lint (also run as the suite's final assertion, over the suite files too)
+# Lint (also run as the suite's final assertion, over the suite files too).
+# Config lives in /.shellcheckrc and is the ONLY place to disable a check globally —
+# it exists because CI's runner image ships shellcheck 0.9.0 while a current dev box
+# has 0.11.0, and three checks upstream retired between them were red in CI and
+# invisible locally. A clean local lint is therefore NOT proof CI is clean unless
+# .shellcheckrc covers the delta; suppress anything else at the site, with a reason.
 shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh tests/fake_codex.sh \
            tests/run_tests.sh tests/lib.sh tests/suite/*.sh
 

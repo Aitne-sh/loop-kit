@@ -39,6 +39,14 @@ if command -v shellcheck >/dev/null 2>&1; then
   else
     bad "shellcheck findings" shellcheck
   fi
+elif [ -n "${LOOP_TEST_REQUIRE_SHELLCHECK:-}" ]; then
+  # CI sets this. Skipping is the right default on a dev machine that has no
+  # linter installed, and exactly wrong in CI: the first runner image to drop the
+  # binary would silently downgrade this gate to a no-op, and the suite would keep
+  # reporting green with nothing linted. Fail closed instead.
+  # (Do not begin a comment line here with the linter's own name — it would be
+  # parsed as a directive, not prose.)
+  bad "shellcheck required (LOOP_TEST_REQUIRE_SHELLCHECK set) but not installed" shellcheck
 else
   echo "  skip: shellcheck not installed"
 fi

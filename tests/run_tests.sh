@@ -152,9 +152,18 @@ if [ -n "${LOOP_TEST_TIMING:-}" ]; then
 fi
 # Lanes share the CPU: raise the hang backstops so contention reads as a slower
 # suite, never as a spurious timeout FAIL. Assertion thresholds are untouched.
+#
+# The backstops scale WITH -j instead of sitting at one fixed pair, because how
+# much a bounded wait gets stretched is set by how wide the lane is. A run widened
+# past the auto cap — CI pins -j4, including on a 3-core macOS runner — stretches
+# every poll, and a ceiling frozen at the -j2 value would convert that into a
+# spurious FAIL, which is the one thing these numbers must never do. -j2 still
+# resolves to exactly 2 / 240s, so the default lane is byte-compatible. The cap
+# keeps a genuine hang detectable in bounded time on a wide idle box (-j8 -> 720s).
 if [ "$JOBS" -gt 1 ]; then
-  export LOOP_TEST_SUP_WAIT_MAX="${LOOP_TEST_SUP_WAIT_MAX:-240}"
-  export LOOP_TEST_POLL_SCALE="${LOOP_TEST_POLL_SCALE:-2}"
+  scale=$JOBS; [ "$scale" -le 6 ] || scale=6
+  export LOOP_TEST_SUP_WAIT_MAX="${LOOP_TEST_SUP_WAIT_MAX:-$(( 120 * scale ))}"
+  export LOOP_TEST_POLL_SCALE="${LOOP_TEST_POLL_SCALE:-$scale}"
 fi
 
 reap() { # drop finished pids from PIDS; echo how many are still running

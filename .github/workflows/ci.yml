@@ -11,6 +11,16 @@ permissions:
 # loop-kit is shell + prompt files — no build. CI proves the harness stays portable
 # across the BSD/GNU/Windows userland split (see README "Platform support").
 
+env:
+  # tests/run_tests.sh auto-picks `cores - 1, capped at 4` because it normally
+  # runs on a workstation that is ALSO hosting agent sessions. A hosted runner is
+  # dedicated, and the parallel lane is exec-latency bound rather than CPU bound,
+  # so it pays to oversubscribe: macos-latest has 3 cores (auto -> -j2) and could
+  # not finish inside 40 minutes at that width. Set the width explicitly here so
+  # every job is measured at the same concurrency. The driver scales its hang
+  # backstops with -j, so a wider lane cannot turn contention into a timeout FAIL.
+  SUITE_JOBS: "4"
+
 jobs:
   # BSD (macOS) + GNU (Linux) full behavioral suite — the primary regression net.
   # macOS is the leg that catches BSD-only bugs (e.g. GNU-only sed \b); Linux the
@@ -19,14 +29,24 @@ jobs:
     name: suite (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # The suite is exec-latency bound, not CPU bound, so it runs its parallel lane
-    # concurrently (tests/run_tests.sh -j). Keep the watchdog well above the
-    # expected wall time — hosted-runner variance is large and a timeout here
-    # reports as a mystery failure rather than a slow suite.
-    timeout-minutes: 40
+    # concurrently (tests/run_tests.sh -j, width pinned by SUITE_JOBS above).
+    # This is a WATCHDOG, not a performance budget: keep it well above the
+    # expected wall time, because a timeout here reports as a mystery cancellation
+    # with no assertion output, which is strictly worse than a slow suite. The
+    # actual wall time is recorded in the step summary on every run — that, not
+    # this number, is the perf signal. macOS at the previous 40 was tight enough
+    # that ordinary runner variance cancelled the job mid-lane.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ ubuntu-latest, macos-latest ]
+    env:
+      # The gate SKIPS itself when shellcheck is absent, which is right for a dev
+      # machine and wrong here: a runner image that drops shellcheck would silently
+      # turn the lint gate into a no-op and nothing would say so. Job-scoped rather
+      # than workflow-scoped — windows-latest genuinely has no shellcheck.
+      LOOP_TEST_REQUIRE_SHELLCHECK: "1"
     steps:
       - uses: actions/checkout@v6
       - name: Configure git identity
@@ -63,14 +83,18 @@ jobs:
         run: |
           log="$RUNNER_TEMP/loop-suite.log"
           set +e
-          ./tests/run_tests.sh 2>&1 | tee "$log"
+          ./tests/run_tests.sh -j"$SUITE_JOBS" 2>&1 | tee "$log"
           status=${PIPESTATUS[0]}
           set -e
           # Wall time + the slowest sections, on every run: suite duration is a
           # thing that regresses silently, and this is the only place it is recorded.
+          # The shellcheck version rides along because the lint gate's strictness
+          # is a property of the RUNNER IMAGE, not of this repo — when the image
+          # bumps it, this line is the evidence.
           {
             echo "## suite (${{ matrix.os }})"
             echo '```text'
+            shellcheck --version 2>/dev/null | awk '/version:/{print "shellcheck " $2}' || true
             grep -E '^(passed:|wall:)' "$log" || true
             sed -n '/^slowest sections:/,/^$/p' "$log" | head -20
             echo '```'
@@ -91,7 +115,9 @@ jobs:
   suite-coreutils-only:
     name: suite (linux, coreutils sha256sum only)
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
+    env:
+      LOOP_TEST_REQUIRE_SHELLCHECK: "1"
     steps:
       - uses: actions/checkout@v6
       - name: Configure git identity
@@ -114,11 +140,15 @@ jobs:
           SHIM
           chmod +x "$HOME/.local/bin/claude"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Tool versions
+        run: |
+          bash --version | head -1
+          shellcheck --version 2>/dev/null | awk '/version:/{print "shellcheck " $2}' || echo "no shellcheck on runner"
       - name: Run full suite
         run: |
           log="$RUNNER_TEMP/loop-suite.log"
           set +e
-          ./tests/run_tests.sh 2>&1 | tee "$log"
+          ./tests/run_tests.sh -j"$SUITE_JOBS" 2>&1 | tee "$log"
           status=${PIPESTATUS[0]}
           set -e
           if [ "$status" -ne 0 ]; then
@@ -131,12 +161,18 @@ jobs:
           fi
           exit "$status"
 
-  # Native Windows via Git Bash. ENFORCED: the checkout/lint dimension Windows most
-  # needs — LF (not CRLF) shebangs, syntax, shellcheck. The full behavioral suite is
-  # INFORMATIONAL only: the fleet/timing legs are expected-flaky on MSYS, and the
-  # parallel fleet is WSL/Linux-only on Windows by design (see README).
+  # Native Windows via Git Bash. ENFORCED: the checkout dimension Windows most needs
+  # — LF (not CRLF) shebangs, and bash syntax under MSYS. Deployment + the static
+  # assertions run INFORMATIONAL: the fleet/timing legs are expected-flaky on MSYS,
+  # and the parallel fleet is WSL/Linux-only on Windows by design (see README).
+  #
+  # No shellcheck step here on purpose. windows-latest ships no shellcheck, so the
+  # step it used to run silently skipped on every build — a lint gate that lints
+  # nothing. ShellCheck's analysis is OS-independent and is already gated on both
+  # Linux legs against the repo's pinned .shellcheckrc; adding a third runner image
+  # would only re-introduce the version skew that .shellcheckrc exists to close.
   windows-lint:
-    name: windows (Git Bash lint + syntax)
+    name: windows (Git Bash checkout + syntax)
     runs-on: windows-latest
     timeout-minutes: 25
     defaults:
@@ -159,22 +195,29 @@ jobs:
         run: |
           bash -n bin/loop.sh bin/evaluate.sh tests/run_tests.sh tests/lib.sh \
                  tests/fake_claude.sh tests/suite/*.sh
-      - name: shellcheck
-        run: |
-          if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh \
-                       tests/run_tests.sh tests/lib.sh tests/suite/*.sh
-          else
-            echo "shellcheck not on the runner; skipping"
-          fi
-      # Informational only, and MSYS fleet/timing is slow — cap it BELOW the job
-      # timeout so a slow run is swallowed by continue-on-error instead of
-      # cancelling the whole job (a job-level timeout is NOT covered by
-      # continue-on-error; a step-level one is). Fake claude mirrors a dev machine
-      # so bare guard-refusal invocations don't misreport "claude CLI not found".
-      - name: Full suite (informational — MSYS fleet/timing is best-effort)
+      # SCOPED on purpose. This used to run the FULL suite, capped at 15 minutes.
+      # It never once finished: MSYS exec latency is high enough that a single
+      # behavioural file can take 12 minutes, so every build — green ones included —
+      # ended in "the action has timed out", producing an error annotation and no
+      # result. A step that always times out proves nothing and costs 15 minutes.
+      #
+      # What runs now is bounded and always completes. The MSYS-relevant claim is
+      # the deployment path — `bin/loop.sh init` must work from Git Bash — and the
+      # driver performs exactly that to build its golden fixture before any suite
+      # file runs, so selecting the one file that is known to finish in under a
+      # second on MSYS (05-static, pure file-content assertions) buys the init
+      # round-trip for ~no wall clock. The fleet is a documented non-goal on MSYS
+      # and is deliberately not attempted. Widen this subset once real MSYS
+      # per-file timings exist — today the only measured ones are 12+ minutes.
+      #
+      # Still continue-on-error while this proves itself over a few builds; promote
+      # it to enforced once it has been green. The step cap stays BELOW the job
+      # timeout because a job-level timeout is NOT covered by continue-on-error
+      # (a step-level one is). Fake claude mirrors a dev machine so bare
+      # guard-refusal invocations don't misreport "claude CLI not found".
+      - name: Deploy + static assertions (informational — MSYS is best-effort)
         continue-on-error: true
-        timeout-minutes: 15
+        timeout-minutes: 10
         run: |
           git config --global user.email "ci@example.com"
           git config --global user.name "loop ci"
@@ -186,4 +229,16 @@ jobs:
           SHIM
           chmod +x "$HOME/.local/bin/claude"
           export PATH="$HOME/.local/bin:$PATH"
-          ./tests/run_tests.sh
+          log="$RUNNER_TEMP/loop-msys.log"
+          set +e
+          ./tests/run_tests.sh --only 05-static 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo '## windows (MSYS, informational)'
+            echo '```text'
+            grep -E '^(passed:|wall:)' "$log" || true
+            [ "$status" -eq 0 ] || tail -n 40 "$log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

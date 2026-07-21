@@ -1,0 +1,35 @@
+# ─────────────────────────────────────────────────────────────────────────
+# shellcheck configuration — the SINGLE source of truth for this repo's lint
+# gate. Honored by every entry point: the suite gate (tests/suite/95-shellcheck.sh),
+# the CI lint steps, and a developer running `shellcheck bin/loop.sh` by hand.
+# ShellCheck walks up from each checked file to find this file, so it applies
+# to bin/**, tests/** and kit/** no matter which directory the run starts in.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# The gate is only useful if it says the same thing everywhere. It did not:
+# GitHub's ubuntu runner image ships shellcheck 0.9.0, while a current dev
+# machine has 0.11.0. Between those releases upstream retired or defaulted-off
+# three checks, so 46 findings were invisible locally and red on every push —
+# lint drift, not a code defect.
+#
+# Each `disable` below pins the OLD binary to what a CURRENT shellcheck already
+# does by default. This backports upstream's own judgement to the old CI
+# binary; it does not weaken the gate relative to a modern shellcheck. Every
+# other check — including everything at warning/error severity — stays on.
+#
+# Do NOT add codes here to silence a real finding. Suppress those at the site
+# with a scoped `# shellcheck disable=SCxxxx` and a reason.
+# ─────────────────────────────────────────────────────────────────────────
+
+# SC2002 "useless cat" — moved to an opt-in optional check in 0.10.0.
+#   The flagged sites are diagnostic strings like
+#   `bad "... $(cat some.md 2>/dev/null | tr '\n' ' ')"`, where the file may
+#   legitimately not exist. The cat is load-bearing: `tr ... < missing` fails
+#   at the redirection, which `2>/dev/null` on tr does not suppress.
+# SC2015 "A && B || C is not if-then-else" — no longer emitted by 0.11.0.
+#   `cond && act || fallback` is a deliberate idiom throughout the harness.
+# SC2317 "command appears to be unreachable" — a false-positive machine in
+#   0.9.0; heavily restricted in 0.10.0. It fires on functions this codebase
+#   invokes indirectly (traps, dispatch tables, subshell callbacks).
+disable=SC2002,SC2015,SC2317
