@@ -27,6 +27,7 @@ its stop conditions live in `loop.config.sh`, which setup does **not** touch.)
 | Evidence | `EVIDENCE` | Evidence-report authoring | Once near the end |
 | Decompose | `DECOMPOSE` | Fleet supervisor: master contract → task plan | Fleet only |
 | Supervise | `SUPERVISE` | Fleet supervisor: mid-run decisions on escalated tasks. Codex here disables supervisor session reuse (fresh calls). | Fleet only |
+| Rollback | `ROLLBACK` | Independent read-only veto review after deterministic discard rollback checks. It can reject an eligible inverse commit, never widen eligibility. | Only `discard --rollback` |
 
 ## The knobs
 
@@ -35,7 +36,7 @@ its stop conditions live in `loop.config.sh`, which setup does **not** touch.)
 - A typo or unknown value **degrades to claude** — it can never kill a running loop.
 - Roles: `AGENT_IMPLEMENT`, `AGENT_PLAN`, `AGENT_REVIEW`, `AGENT_REVIEW_INTERIM`
   (empty = inherit `AGENT_REVIEW`), `AGENT_STOP_EVAL`, `AGENT_EVIDENCE`,
-  `AGENT_DECOMPOSE`, `AGENT_SUPERVISE`, `AGENT_CONTRACT`.
+  `AGENT_DECOMPOSE`, `AGENT_SUPERVISE`, `AGENT_ROLLBACK`, `AGENT_CONTRACT`.
 - Note: `AGENT_CONTRACT` governs the **headless** definition path only; interactive
   `./loop.sh start` and `./loop.sh refine` always launch Claude Code.
 
@@ -47,7 +48,7 @@ its stop conditions live in `loop.config.sh`, which setup does **not** touch.)
 - **Agent/model consistency is enforced.** If `AGENT_<ROLE>="codex"`, its
   `MODEL_<ROLE>` must be a Codex slug — a Claude alias is rejected at setup/preflight.
   Conversely a Claude role must use a Claude alias, not a `gpt-*` slug.
-- Defaults: `CONTRACT`/`PLAN`/`IMPLEMENT`/`REVIEW`/`DECOMPOSE`/`SUPERVISE` → `opus`;
+- Defaults: `CONTRACT`/`PLAN`/`IMPLEMENT`/`REVIEW`/`DECOMPOSE`/`SUPERVISE`/`ROLLBACK` → `opus`;
   `EVIDENCE`/`REVIEW_INTERIM` → `sonnet`; `STOP_EVAL` → `haiku`.
 - Maker-checker note: implement and gate-review default to the same model. The
   separation is procedural (fresh context, read-only), not statistical. For diversity

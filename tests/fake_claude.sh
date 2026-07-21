@@ -23,6 +23,9 @@
 #                      renders 'VERDICT: ESCALATE <question>'; APPROVE_DECORATED
 #                      wraps the trailing verdict in blockquote+bullet+backtick
 #                      decoration the harness must strip)
+# LOOP_FAKE_ROLLBACK_REVIEW: verdict for /loop-rollback-review
+#                     (SAFE | UNSAFE | NOVERDICT | CRASH). SAFE/UNSAFE emit the
+#                     strict final marker consumed by the discard transaction.
 # LOOP_FAKE_STOPEVAL: comma-separated verdicts consumed one per /loop-stop-eval call
 #                     (CONTINUE | MET | FUTILE | MET_FENCED | FUTILE_FENCED;
 #                      *_FENCED wraps the line in a markdown code fence)
@@ -182,6 +185,7 @@ cost="${LOOP_FAKE_COST:-0.01}"
 # adding a task while the integration-gate review is provably in flight, or
 # interrupting an orchestration while supervision is provably in flight).
 case "$PROMPT" in
+  /loop-rollback-review*) printf '%s\n' "$PROMPT" >> .loop/fake-rollback-prompts ;;
   /loop-review*) printf '%s\n' "$PROMPT" >> .loop/fake-review-prompts ;;
   /loop-contract-review*) printf '%s\n' "$PROMPT" >> .loop/fake-conrev-prompts ;;
   /loop-evidence*) printf '%s\n' "$PROMPT" >> .loop/fake-evidence-prompts ;;
@@ -1024,6 +1028,23 @@ EOF
         fi ;;
     esac
     emit_json "$cost" "evidence written${html_note}"
+    exit 0
+    ;;
+  /loop-rollback-review*)
+    case "${LOOP_FAKE_ROLLBACK_REVIEW:-SAFE}" in
+      CRASH)
+        echo "FATAL: fake rollback reviewer outage" >&2
+        echo "this is not json"
+        exit 1 ;;
+      NOVERDICT)
+        emit_json "$cost" "rollback analysis complete but deliberately missing a verdict" ;;
+      UNSAFE)
+        emit_json "$cost" "Rollback evidence is ambiguous.
+ROLLBACK-REVIEW: UNSAFE parallel or external effects cannot be excluded" ;;
+      *)
+        emit_json "$cost" "Rollback provenance and inverse patch are bounded.
+ROLLBACK-REVIEW: SAFE exact plan-owned Git changes only" ;;
+    esac
     exit 0
     ;;
   /loop-review*)

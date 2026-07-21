@@ -72,6 +72,14 @@
 .loop/fleet/supervisor-session contract
 .loop/fleet/supervisor.lock.d liveness
 .loop/fleet-worker persistent
+.loop/fleet/plan-authority.env contract
+.loop/fleet/plan-dispatched.env contract
+.loop/fleet/discard-request.env contract
+.loop/fleet/discard-quarantine/ persistent
+.loop/fleet/rollback-review contract
+.loop/fleet/discard-merge-abort.patch contract
+.loop/fleet/merge-owner.env liveness
+.loop/fleet/plan-mutation.lock liveness
 .loop/fleet contract
 
 # --- persistent ---

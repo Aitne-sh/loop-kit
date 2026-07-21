@@ -141,6 +141,11 @@ RUN
                         Continue a stopped run (BLOCKED / STALLED, or BUDGET_EXCEEDED
                         after raising MAX_ITERATIONS). --note guides the next
                         iteration; <id> resumes one fleet task; --list shows sessions
+  discard [--rollback|--keep-changes]
+                        Cancel the active planned Fleet run as one unit. Stops its
+                        workers, removes the queued plan, and optionally creates a
+                        guarded inverse commit for already-merged product changes.
+                        Non-interactive use must choose one of the two flags.
   refine ['<note>']     At a human sign-off gate (BLOCKED): open an interactive session
                         to adjust reversible within-contract knobs and preview live.
                         End it (Ctrl-C / /exit), then confirm to sign off + re-certify.
@@ -486,6 +491,7 @@ codex_skill_names() {
     loop-plan \
     loop-plan-review \
     loop-review \
+    loop-rollback-review \
     loop-setup \
     loop-stop-eval \
     loop-supervise
@@ -494,7 +500,7 @@ codex_skill_names() {
 codex_skill_supported() {
   case "${1:-}" in
     loop-contract|loop-contract-review|loop-decompose|loop-decompose-review|\
-    loop-evidence|loop-iterate|loop-plan|loop-plan-review|loop-review|loop-setup|loop-stop-eval|loop-supervise)
+    loop-evidence|loop-iterate|loop-plan|loop-plan-review|loop-review|loop-rollback-review|loop-setup|loop-stop-eval|loop-supervise)
       return 0 ;;
     *) return 1 ;;
   esac
@@ -743,6 +749,85 @@ discard_worktree_slot() { # $1 worktree — remove its off-tree approval slot.
   [ -z "$live" ] || [ ! -e "$live" ] || return 1
   [ -z "$derived" ] || [ ! -e "$derived" ] || return 1
   return 0
+}
+
+write_worktree_untracked_zlist() { # $1 worktree, $2 NUL output; includes ignored
+  local wt="$1" output="$2"
+  git -C "$wt" ls-files -z --others --exclude-standard > "$output" 2>/dev/null \
+    && git -C "$wt" ls-files -z --others --ignored --exclude-standard >> "$output" 2>/dev/null
+}
+
+worker_copied_path_matches_parent() { # $1 worker, $2 relative path
+  local wt="$1" path="$2" worker="$1/$2" parent="./$2"
+  if [ -L "$worker" ] || [ -L "$parent" ]; then
+    [ -L "$worker" ] && [ -L "$parent" ] \
+      && [ "$(readlink "$worker" 2>/dev/null || echo mismatch)" = \
+           "$(readlink "$parent" 2>/dev/null || echo parent-mismatch)" ]
+  else
+    [ -f "$worker" ] && [ -f "$parent" ] && cmp -s "$worker" "$parent"
+  fi
+}
+
+worker_managed_ignored_path() { # $1 worker, $2 ignored path — true only for owned copies
+  local wt="$1" path="$2" rest name
+  case "$path" in
+    .loop|.loop/*|loop.config.sh|loop-instruction.md)
+      return 0 ;;
+    loop.sh|loop.models.sh|fleet.sh|fleet.config.sh)
+      worker_copied_path_matches_parent "$wt" "$path" ; return $? ;;
+    .claude/settings.json|.claude/settings.local.json|.mcp.json|.codex|.codex/*)
+      worker_copied_path_matches_parent "$wt" "$path" ; return $? ;;
+    .claude/skills/loop-*/*)
+      rest=${path#.claude/skills/}
+      name=${rest%%/*}
+      { codex_skill_supported "$name" || [ "$name" = loop-refine ]; } \
+        && worker_copied_path_matches_parent "$wt" "$path"
+      return $? ;;
+    .agents/skills/loop-*/*)
+      rest=${path#.agents/skills/}
+      name=${rest%%/*}
+      codex_skill_supported "$name" \
+        && [ -f "$wt/.agents/skills/$name/$CODEX_SKILL_MARKER" ] \
+        && [ -f ".agents/skills/$name/$CODEX_SKILL_MARKER" ] \
+        && worker_copied_path_matches_parent "$wt" "$path"
+      return $? ;;
+  esac
+  return 1
+}
+
+write_worker_private_zlist() { # $1 worker, $2 NUL output; filters only byte-identical managed ignored files
+  local wt="$1" output="$2" ignored="$2.ignored.$$" path rc=0
+  git -C "$wt" ls-files -z --others --exclude-standard > "$output" 2>/dev/null \
+    || return 1
+  if ! git -C "$wt" ls-files -z --others --ignored --exclude-standard > "$ignored" 2>/dev/null; then
+    rm -f "$ignored"
+    return 1
+  fi
+  while IFS= read -r -d '' path; do
+    worker_managed_ignored_path "$wt" "$path" && continue
+    printf '%s\0' "$path" >> "$output" || { rc=1; break; }
+  done < "$ignored"
+  rm -f "$ignored"
+  return "$rc"
+}
+
+worktree_has_untracked_or_ignored() { # $1 worker — true also on unreadable Git state
+  local zlist="${TMPDIR:-/tmp}/loop-worker-private.$$.zlist" rc
+  write_worker_private_zlist "$1" "$zlist" || { rm -f "$zlist"; return 0; }
+  [ -s "$zlist" ]; rc=$?
+  rm -f "$zlist"
+  return "$rc"
+}
+
+write_worktree_untracked_manifest() { # $1 worker, $2 text audit output
+  local wt="$1" output="$2" zlist="$2.zlist.$$" path rc=0
+  write_worker_private_zlist "$wt" "$zlist" || { rm -f "$zlist"; return 1; }
+  : > "$output" || { rm -f "$zlist"; return 1; }
+  while IFS= read -r -d '' path; do
+    printf '%s\n' "$path" >> "$output" || { rc=1; break; }
+  done < "$zlist"
+  rm -f "$zlist"
+  return "$rc"
 }
 
 verify_approval() { # dies unless both hashes match the approved ones
@@ -1035,6 +1120,7 @@ configured_role_model() { # $1 role -> effective model including interim inherit
     EVIDENCE)       get_model MODEL_EVIDENCE sonnet ;;
     DECOMPOSE)      get_model MODEL_DECOMPOSE opus ;;
     SUPERVISE)      get_model MODEL_SUPERVISE opus ;;
+    ROLLBACK)       get_model MODEL_ROLLBACK opus ;;
     CONTRACT)       get_model MODEL_CONTRACT opus ;;
     *)              printf '%s' "" ;;
   esac
@@ -1055,7 +1141,7 @@ warn_unknown_agent_values() { # the degrade posture is pinned (unknown -> claude
   [ "$AGENT_ROUTE_WARNING_EMITTED" = 0 ] || return 0
   AGENT_ROUTE_WARNING_EMITTED=1
   local role raw
-  for role in CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
+  for role in CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE ROLLBACK; do
     raw=$(get_model "AGENT_$role" "")
     case "$raw" in
       ''|claude|codex) ;;
@@ -1069,7 +1155,7 @@ print_agent_routing() {
   warn_unknown_agent_values
   note "agent routing (role -> agent/model):"
   note "  CONTRACT -> $(configured_agent CONTRACT)/$(configured_role_model CONTRACT) (headless definition; interactive start/refine always Claude)"
-  for role in PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
+  for role in PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE ROLLBACK; do
     agent=$(configured_agent "$role")
     model=$(configured_role_model "$role")
     note "  $role -> $agent/$model"
@@ -1094,6 +1180,8 @@ print_agent_routing() {
 
 codex_routing_enabled() {
   local role
+  # ROLLBACK is an on-demand discard-only reviewer; it has its own readiness
+  # check and must not make an ordinary run require Codex or emit budget noise.
   for role in IMPLEMENT PLAN REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
     [ "$(configured_agent "$role")" != codex ] || return 0
   done
@@ -1352,6 +1440,7 @@ load_models() {
   MODEL_DECOMPOSE=$(configured_role_model DECOMPOSE)
   # shellcheck disable=SC2034  # consumed by the supervise step (fleet dispatcher)
   MODEL_SUPERVISE=$(configured_role_model SUPERVISE)
+  MODEL_ROLLBACK=$(configured_role_model ROLLBACK)
 }
 
 ensure_loop_dir() {
@@ -3324,6 +3413,12 @@ FLEET_DIR=".loop/fleet"
 QUEUE_DIR="$FLEET_DIR/queue"
 RUNS_DIR="$FLEET_DIR/runs"
 LOCK_DIR="$FLEET_DIR/supervisor.lock.d"
+PLAN_AUTHORITY_FILE="$FLEET_DIR/plan-authority.env"
+PLAN_DISPATCHED_FILE="$FLEET_DIR/plan-dispatched.env"
+DISCARD_REQUEST_FILE="$FLEET_DIR/discard-request.env"
+MERGE_OWNER_FILE="$FLEET_DIR/merge-owner.env"
+PLAN_MUTATION_LOCK="$FLEET_DIR/plan-mutation.lock"
+PLAN_MUTATION_LOCK_DEPTH=0
 TICK_SECONDS="${LOOP_FLEET_TICK:-2}"   # dispatch tick; tests shrink it (zero-token suite)
 SETUP_CMD=""                    # resolved from fleet.config.sh in cmd_fleet_run
 MAX_PARALLEL=2
@@ -3372,6 +3467,11 @@ INSPECT
   logs <id>             Show a task's contract-generation and run logs
 
 CONTROL
+  discard [--rollback|--keep-changes]
+                        Cancel the active PLANNED orchestration as one unit. Manual
+                        side-tasks are kept/parked. With --rollback, merged product
+                        changes are inverted only when deterministic provenance and
+                        an independent read-only review both say SAFE.
   stop <id>             TERM a running task loop (state saved; resumable)
   resume <id>           Flip an interrupted/failed task runnable (the supervisor
                         relaunches it; `./loop.sh resume <id>` also dispatches)
@@ -3380,8 +3480,11 @@ CONTROL
   merge <id>            Manually retry a merge (the supervisor does this itself)
   clean <id ...|--done|--orphans> [--force]
                         Remove worktree + branch + queue entry
-                        (--orphans: gc leftovers that lost their queue entry)
-  unlock                Remove a stale supervisor lock
+                        (--orphans: gc leftovers that lost their queue entry;
+                         with --force it also deletes an orphan's kept untracked/
+                         ignored content, e.g. after a quarantining discard)
+  unlock                Remove stale supervisor / plan-mutation locks (refuses
+                        while any loop or task process is still live)
 
 Tasks queue as files in .loop/fleet/queue/. On merge, project code goes back via
 git, .loop/docs is kept from the parent, and the run's contract + evidence are
@@ -3416,6 +3519,134 @@ fcfg() { # $1 key, $2 default — safe key=value parse of fleet.config.sh, no co
         | sed -E "s/^[[:space:]]*$1=//; s/[[:space:]]+#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//; s/^\"//; s/\"$//") || v=""
   fi
   echo "${v:-$2}"
+}
+
+fleet_kv_get() { # $1 file, $2 key, [$3 default] — plain key=value, never sourced
+  local v=""
+  if [ -f "$1" ]; then
+    v=$(grep -E "^$2=" "$1" | tail -1 | cut -d= -f2-) || v=""
+  fi
+  printf '%s' "${v:-${3:-}}"
+}
+
+current_plan_authority() { fleet_kv_get "$PLAN_AUTHORITY_FILE" AUTHORITY ""; }
+current_plan_source_ref() { fleet_kv_get "$PLAN_AUTHORITY_FILE" SOURCE_REF ""; }
+current_plan_refname() { fleet_kv_get "$PLAN_AUTHORITY_FILE" SOURCE_REFNAME ""; }
+
+plan_ref_matches() { # same symbolic branch (or still detached) as publication
+  local expected current
+  expected=$(current_plan_refname)
+  [ -n "$expected" ] || return 1
+  current=$(git symbolic-ref -q HEAD 2>/dev/null || printf '%s' DETACHED)
+  [ "$current" = "$expected" ]
+}
+
+discard_request_authority() { fleet_kv_get "$DISCARD_REQUEST_FILE" AUTHORITY ""; }
+discard_request_present() { [ -e "$DISCARD_REQUEST_FILE" ] || [ -L "$DISCARD_REQUEST_FILE" ]; }
+
+discard_requested() { # even malformed/crash-orphaned WAL freezes every mutation
+  discard_request_present
+}
+
+task_in_current_plan() { # $1 id — manual tasks and other plan generations are false
+  local task_authority current
+  [ "$(renv_get "$1" PLANNED 0)" = "1" ] || return 1
+  task_authority=$(renv_get "$1" PLAN_AUTHORITY "")
+  current=$(current_plan_authority)
+  [ -n "$task_authority" ] && [ "$task_authority" = "$current" ]
+}
+
+task_discard_requested() { # $1 id
+  discard_requested \
+    && [ "$(renv_get "$1" PLANNED 0)" = "1" ] \
+    && [ -n "$(discard_request_authority)" ] \
+    && [ "$(renv_get "$1" PLAN_AUTHORITY "")" = "$(discard_request_authority)" ]
+}
+
+discard_choice_flag() { # persisted enum -> public CLI flag
+  case "${1:-}" in
+    rollback) printf '%s' --rollback ;;
+    keep)     printf '%s' --keep-changes ;;
+    *)        printf '%s' --keep-changes ;;
+  esac
+}
+
+guard_no_discard_pending() { # all mutations except cmd_discard fail closed
+  ! discard_request_present || die_next \
+    "a whole-plan discard transaction is pending; no other queue/run mutation is allowed" \
+    "complete it: ./loop.sh discard --keep-changes   # or: ./loop.sh discard --rollback"
+}
+
+plan_mutation_lock_owned() {
+  [ -f "$PLAN_MUTATION_LOCK" ] \
+    && [ "$(cat "$PLAN_MUTATION_LOCK" 2>/dev/null || echo "")" = "$$" ]
+}
+
+acquire_plan_mutation_lock() { # linearizes request publication vs claim/fork/commit
+  local owner n=0 tmp="$PLAN_MUTATION_LOCK.$$"
+  # Classic single-loop projects may never have created Fleet state. The
+  # cross-mode barrier still applies to them, so create only its parent here.
+  mkdir -p "$FLEET_DIR" || return 1
+  if plan_mutation_lock_owned; then
+    PLAN_MUTATION_LOCK_DEPTH=$((PLAN_MUTATION_LOCK_DEPTH + 1))
+    return 0
+  fi
+  printf '%s\n' "$$" > "$tmp" || return 1
+  while ! ln "$tmp" "$PLAN_MUTATION_LOCK" 2>/dev/null; do
+    owner=$(cat "$PLAN_MUTATION_LOCK" 2>/dev/null || echo "")
+    case "$owner" in
+      ''|*[!0-9]*)
+        rm -f "$tmp"
+        return 1 ;; # malformed/foreign lock: never guess ownership
+      *)
+        if ! kill -0 "$owner" 2>/dev/null; then
+          # Never auto-steal: two recovery racers can otherwise delete each
+          # other's newly-published lock (ABA) and enter the critical section
+          # together. Explicit `fleet unlock`, after global liveness checks, is
+          # the only stale-lock recovery boundary.
+          rm -f "$tmp"
+          return 1
+        else
+          n=$((n + 1))
+          [ "$n" -lt 600 ] || { rm -f "$tmp"; return 1; }
+          sleep 0.1
+        fi ;;
+    esac
+  done
+  rm -f "$tmp"
+  PLAN_MUTATION_LOCK_DEPTH=1
+}
+
+release_plan_mutation_lock() {
+  plan_mutation_lock_owned || return 0
+  if [ "$PLAN_MUTATION_LOCK_DEPTH" -gt 1 ] 2>/dev/null; then
+    PLAN_MUTATION_LOCK_DEPTH=$((PLAN_MUTATION_LOCK_DEPTH - 1))
+    return 0
+  fi
+  rm -f "$PLAN_MUTATION_LOCK"
+  PLAN_MUTATION_LOCK_DEPTH=0
+}
+
+mark_plan_dispatched() { # $1 id — first claim is the durable started boundary
+  local id="$1" authority tmp
+  task_in_current_plan "$id" || return 0
+  authority=$(current_plan_authority)
+  renv_set "$id" DISPATCHED_AT "$(utcnow)"
+  [ -s "$PLAN_DISPATCHED_FILE" ] && return 0
+  tmp="$PLAN_DISPATCHED_FILE.tmp.$$"
+  {
+    echo "AUTHORITY=$authority"
+    echo "FIRST_TASK=$id"
+    echo "DISPATCHED_AT=$(utcnow)"
+  } > "$tmp" || return 1
+  # Only the supervisor writes this record, but use a no-clobber publication so
+  # an operator racing a recovery can never replace the original boundary.
+  if ! ln "$tmp" "$PLAN_DISPATCHED_FILE" 2>/dev/null; then
+    rm -f "$tmp"
+    [ "$(fleet_kv_get "$PLAN_DISPATCHED_FILE" AUTHORITY "")" = "$authority" ]
+    return $?
+  fi
+  rm -f "$tmp"
 }
 
 journal() { # $1 task-id, $2 event, $3 detail
@@ -3966,11 +4197,30 @@ task_fail() { # $1 id, $2 result-state, $3 detail
   fnote "[$1] $2 — $3"
 }
 
-claim_task() { # $1 id — new/ -> claimed/ (atomic), then bootstrap + contract gen
+claim_task() { # mutation-barrier wrapper: discard waits through PID publication
+  local rc=0
+  acquire_plan_mutation_lock \
+    || fdie_next "could not acquire the plan mutation barrier before claiming a task" "if no loop is live, ./loop.sh fleet unlock; then ./loop.sh run"
+  claim_task_locked "$@" || rc=$?
+  release_plan_mutation_lock
+  return "$rc"
+}
+
+claim_task_locked() { # $1 id — new/ -> claimed/ (atomic), then bootstrap + contract gen
   local id="$1"
   [ -f "$RUNS_DIR/$id.env" ] || return 0   # `add` is still writing metadata — claim next tick
+  task_discard_requested "$id" && return 0
   mv "$QUEUE_DIR/new/$id.md" "$QUEUE_DIR/claimed/$id.md" 2>/dev/null || return 0
+  # Linearize against a request published between the pre-check and the mv:
+  # return the task to new/ before bootstrap creates any implementation state.
+  if task_discard_requested "$id"; then
+    mv -f "$QUEUE_DIR/claimed/$id.md" "$QUEUE_DIR/new/$id.md" 2>/dev/null || true
+    journal "$id" DISCARD_CLAIM_BLOCKED "discard request won the claim race"
+    return 0
+  fi
   renv_set "$id" CLAIMED_AT "$(utcnow)"
+  mark_plan_dispatched "$id" \
+    || { mv -f "$QUEUE_DIR/claimed/$id.md" "$QUEUE_DIR/new/$id.md" 2>/dev/null || true; fdie_next "could not record the plan's first dispatch boundary" "inspect $PLAN_DISPATCHED_FILE, then ./loop.sh run"; }
   renv_set "$id" FLEET_INDEX "$(next_fleet_index)"
   mkdir -p "$RUNS_DIR/$id"
   journal "$id" CLAIMED ""
@@ -3989,6 +4239,13 @@ claim_task() { # $1 id — new/ -> claimed/ (atomic), then bootstrap + contract 
 
 start_contract_gen() { # $1 id — headless contract via loop.sh's non-TTY start path
   local id="$1" wt
+  acquire_plan_mutation_lock \
+    || fdie_next "could not acquire the plan mutation barrier before contract launch" "if no loop is live, ./loop.sh fleet unlock; then ./loop.sh run"
+  if task_discard_requested "$id"; then
+    renv_set "$id" PHASE DISCARD_PENDING
+    release_plan_mutation_lock
+    return 0
+  fi
   wt=$(renv_get "$id" WT)
   # LOOP_AUTO is forced to 0: a leaked LOOP_AUTO=1 would auto-approve AND run
   # here — approval must stay a separate, human (or explicitly --auto) step.
@@ -4004,6 +4261,7 @@ start_contract_gen() { # $1 id — headless contract via loop.sh's non-TTY start
   renv_set "$id" PHASE CONTRACT_GEN
   journal "$id" CONTRACT_GEN ""
   fnote "[$id] generating contract headlessly"
+  release_plan_mutation_lock
 }
 
 start_run() { # $1 id — the actual loop; `exec` makes PID be loop.sh itself so
@@ -4013,6 +4271,13 @@ start_run() { # $1 id — the actual loop; `exec` makes PID be loop.sh itself so
   # falls back to a fresh run otherwise (first launch, or a changed contract). So a
   # crash-retry / `./loop.sh fleet resume` resumes instead of restarting from iteration 1.
   local id="$1" wt idx
+  acquire_plan_mutation_lock \
+    || fdie_next "could not acquire the plan mutation barrier before worker launch" "if no loop is live, ./loop.sh fleet unlock; then ./loop.sh run"
+  if task_discard_requested "$id"; then
+    renv_set "$id" PHASE DISCARD_PENDING
+    release_plan_mutation_lock
+    return 0
+  fi
   wt=$(renv_get "$id" WT)
   idx=$(renv_get "$id" FLEET_INDEX 0)
   ( cd "$wt" && LOOP_FLEET_INDEX="$idx" exec ./loop.sh run --prefer-resume </dev/null ) \
@@ -4025,6 +4290,7 @@ start_run() { # $1 id — the actual loop; `exec` makes PID be loop.sh itself so
   renv_set "$id" LAUNCHED_AT "$(utcnow)"
   journal "$id" LAUNCHED ""
   fnote "[$id] running (watch: ./loop.sh fleet logs $id)"
+  release_plan_mutation_lock
 }
 
 park_human_stopped() { # $1 id — STOPPED_BY=human (set by cmd_fleet_stop before the
@@ -5096,7 +5362,7 @@ archive_worker_docs() { # $1 id, $2 worktree — build, verify, atomically publi
   # never a hybrid — retired copies stay browsable for lesson carryover.
   ARCHIVE_PROBLEM=""
   ARCHIVE_SUPERSEDED=""
-  local id="$1" wt="$2" dst tmp f ts
+  local id="$1" wt="$2" dst tmp f ts authority
   dst=".loop/docs/run-archive/$id"
   tmp=".loop/docs/run-archive/.tmp-$id.$$"
   # staging must start EMPTY and VERIFIED so (fail closed, not mkdir -p onto
@@ -5137,6 +5403,23 @@ archive_worker_docs() { # $1 id, $2 worktree — build, verify, atomically publi
     verify_archived_manifest "$tmp" \
       || { ARCHIVE_PROBLEM="$ARCHIVE_MANIFEST_PROBLEM"; rm -rf "$tmp"; return 1; }
   fi
+  # Merge provenance is harness-authored and copied into the tracked archive
+  # before the merge commit. Rollback never has to infer plan ownership from a
+  # human-readable subject alone, and the record survives queue cleanup.
+  authority=$(renv_get "$id" PLAN_AUTHORITY "")
+  if [ -n "$authority" ]; then
+    {
+      echo "VERSION=1"
+      echo "PLAN_AUTHORITY=$authority"
+      echo "PLAN_SOURCE_REF=$(renv_get "$id" PLAN_SOURCE_REF "")"
+      echo "PLAN_SOURCE_REFNAME=$(renv_get "$id" PLAN_SOURCE_REFNAME "")"
+      echo "TASK_ID=$id"
+      echo "PRE_MERGE_HEAD=$(renv_get "$id" MERGE_PRE_HEAD "")"
+      echo "BRANCH_TIP=$(renv_get "$id" MERGE_BRANCH_TIP "")"
+      echo "BASE_REF=$(renv_get "$id" BASE_REF "")"
+    } > "$tmp/integration.env" \
+      || { ARCHIVE_PROBLEM="cannot write integration provenance"; rm -rf "$tmp"; return 1; }
+  fi
   if [ -e "$dst" ]; then
     ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || echo archive)
     ARCHIVE_SUPERSEDED=$(unique_archive_dir "$dst-superseded-$ts")
@@ -5156,6 +5439,43 @@ archive_worker_docs() { # $1 id, $2 worktree — build, verify, atomically publi
   return 0
 }
 
+commit_fleet_task() { # $1 id, $2 subject, $3 log — add strict plan trailers
+  local id="$1" subject="$2" mlog="$3" authority source pre tip
+  authority=$(renv_get "$id" PLAN_AUTHORITY "")
+  source=$(renv_get "$id" PLAN_SOURCE_REF "")
+  pre=$(renv_get "$id" MERGE_PRE_HEAD "")
+  tip=$(renv_get "$id" MERGE_BRANCH_TIP "")
+  if [ -n "$authority" ] && [ -n "$source" ] && [ -n "$pre" ] && [ -n "$tip" ]; then
+    git commit -q -m "$subject" -m "Loop-Plan-Authority: $authority
+Loop-Task: $id
+Loop-Plan-Source: $source
+Loop-Plan-Refname: $(renv_get "$id" PLAN_SOURCE_REFNAME "")
+Loop-Pre-Merge-Head: $pre
+Loop-Branch-Tip: $tip" >> "$mlog" 2>&1
+  else
+    git commit -q -m "$subject" >> "$mlog" 2>&1
+  fi
+}
+
+publish_merge_owner() { # $1 id, $2 pre-head, $3 branch-tip — before git merge
+  local id="$1" pre="$2" tip="$3" authority tmp
+  authority=$(renv_get "$id" PLAN_AUTHORITY "")
+  [ -n "$authority" ] || return 0
+  tmp="$MERGE_OWNER_FILE.tmp.$$"
+  {
+    echo "VERSION=1"
+    echo "AUTHORITY=$authority"
+    echo "TASK_ID=$id"
+    echo "PRE_MERGE_HEAD=$pre"
+    echo "BRANCH_TIP=$tip"
+    echo "OWNER_PID=$$"
+    echo "STARTED_AT=$(utcnow)"
+  } > "$tmp" || return 1
+  mv -f "$tmp" "$MERGE_OWNER_FILE"
+}
+
+clear_merge_owner() { rm -f "$MERGE_OWNER_FILE"; }
+
 merge_noop_task() { # $1 id — a worker that finished NO_OP has no product merge,
   # but its determination ("verification passes with no changes needed") is
   # still evidence the integration gate certifies against: publish its archive
@@ -5164,7 +5484,11 @@ merge_noop_task() { # $1 id — a worker that finished NO_OP has no product merg
   # Same defer/fail discipline as merge_task (parent tracked tree must be
   # clean; rc 1 defers to the next tick; runs in a `||` list, so every step is
   # explicitly checked).
-  local id="$1" wt summary mlog
+  local id="$1" wt summary mlog pre tip
+  if task_discard_requested "$id"; then
+    renv_set "$id" PHASE DISCARD_PENDING
+    return 0
+  fi
   wt=$(renv_get "$id" WT)
   summary=$(renv_get "$id" SUMMARY "$id")
   mlog="$RUNS_DIR/$id/merge.log"
@@ -5176,6 +5500,10 @@ merge_noop_task() { # $1 id — a worker that finished NO_OP has no product merg
     return 1
   fi
   LAST_DEFER_NOTE=""
+  pre=$(git rev-parse HEAD 2>/dev/null || echo "")
+  tip=$(git rev-parse "$(renv_get "$id" BRANCH "")" 2>/dev/null || echo "")
+  renv_set "$id" MERGE_PRE_HEAD "$pre"
+  renv_set "$id" MERGE_BRANCH_TIP "$tip"
   # phase-boundary plan-review marker: a NO_OP completion is still a phase
   # boundary its queued dependents build on — same arming rule as merge_task
   if [ "$(fcfg FLEET_PLAN_REVIEW 1)" != "0" ] && [ "$(fcfg FLEET_SUPERVISE 1)" != "0" ] \
@@ -5190,17 +5518,36 @@ merge_noop_task() { # $1 id — a worker that finished NO_OP has no product merg
   fi
   # shellcheck disable=SC2086  # ARCHIVE_SUPERSEDED is a single path or empty
   if ! git add -- ".loop/docs/run-archive/$id" ${ARCHIVE_SUPERSEDED:+"$ARCHIVE_SUPERSEDED"} 2>>"$mlog" \
-     || ! git commit -q -m "fleet: no-op $id — $summary" >> "$mlog" 2>&1; then
+     || task_discard_requested "$id" \
+     || ! commit_fleet_task "$id" "fleet: no-op $id — $summary" "$mlog"; then
     git reset -q HEAD -- .loop/docs/run-archive >/dev/null 2>&1 || true
+    if task_discard_requested "$id"; then
+      renv_set "$id" PHASE DISCARD_PENDING
+      return 0
+    fi
     task_fail "$id" MERGE_FAILED "could not commit the worker evidence archive: $(tail -2 "$mlog" | tr '\n' ' ')(worktree kept)"
     return 0
   fi
+  renv_set "$id" MERGE_COMMIT "$(git rev-parse HEAD)"
   journal "$id" NOOP_ARCHIVED "evidence archive published (no product changes)"
   task_done "$id" "NO_OP: verification passes with no changes needed (evidence archived)"
 }
 
-merge_task() { # $1 id — parent tracked tree must be clean; defers (rc 1) if not
-  local id="$1" branch wt summary added conflicts f merge_rc=0 mlog
+merge_task() { # mutation-barrier wrapper: request publication cannot race commit
+  local rc=0
+  acquire_plan_mutation_lock \
+    || fdie_next "could not acquire the plan mutation barrier before merge" "if no loop is live, ./loop.sh fleet unlock; then ./loop.sh run"
+  merge_task_locked "$@" || rc=$?
+  release_plan_mutation_lock
+  return "$rc"
+}
+
+merge_task_locked() { # $1 id — parent tracked tree must be clean; defers (rc 1) if not
+  local id="$1" branch wt summary added conflicts f merge_rc=0 mlog pre tip
+  if task_discard_requested "$id"; then
+    renv_set "$id" PHASE DISCARD_PENDING
+    return 0
+  fi
   if [ "$(renv_get "$id" RESULT "")" = "NO_OP" ]; then
     # every MERGE_PENDING dispatcher (tick, drain, fleet merge, recovery
     # adoption) inherits the routing by branching HERE, not at the call sites
@@ -5221,6 +5568,10 @@ merge_task() { # $1 id — parent tracked tree must be clean; defers (rc 1) if n
     return 1
   fi
   LAST_DEFER_NOTE=""
+  pre=$(git rev-parse HEAD 2>/dev/null || echo "")
+  tip=$(git rev-parse "$branch" 2>/dev/null || echo "")
+  renv_set "$id" MERGE_PRE_HEAD "$pre"
+  renv_set "$id" MERGE_BRANCH_TIP "$tip"
   # phase-boundary plan-review marker: written BEFORE the merge commit, so a
   # crash between the commit and the marker can never skip the review. The
   # marker is only consulted for done/ tasks — on any non-merge outcome
@@ -5238,11 +5589,20 @@ merge_task() { # $1 id — parent tracked tree must be clean; defers (rc 1) if n
   fi
   journal "$id" MERGE_START "$branch"
   mkdir -p "$RUNS_DIR/$id"
+  if task_discard_requested "$id"; then
+    renv_set "$id" PHASE DISCARD_PENDING
+    return 0
+  fi
+  if ! publish_merge_owner "$id" "$pre" "$tip"; then
+    task_fail "$id" MERGE_FAILED "could not publish the durable merge-ownership receipt — inspect $MERGE_OWNER_FILE, then ./loop.sh fleet merge $id"
+    return 0
+  fi
   git merge --no-ff --no-commit "$branch" > "$mlog" 2>&1 || merge_rc=$?
   if [ "$merge_rc" -ne 0 ] && ! git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
     # merge refused outright (e.g. an untracked file would be overwritten):
     # nothing was staged, so this must NOT fall through to the commit path
     git merge --abort >/dev/null 2>&1 || true
+    clear_merge_owner
     task_fail "$id" MERGE_FAILED "git merge refused: $(tail -2 "$mlog" | tr '\n' ' ')"
     return 0
   fi
@@ -5263,6 +5623,7 @@ EOF
   conflicts=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
   if [ -n "$conflicts" ]; then
     git merge --abort 2>/dev/null || git reset --hard HEAD >/dev/null 2>&1
+    clear_merge_owner
     if [ "$(renv_get "$id" PLANNED 0)" = "1" ] && [ "$(fcfg FLEET_SUPERVISE 1)" != "0" ] \
        && [ "$(renv_get "$id" MERGE_RETRIES 0)" = "0" ]; then
       # orchestrated tasks get ONE redo from the merged HEAD (the merge-queue
@@ -5304,30 +5665,42 @@ EOF
     # ride a merge into done/ — the integration gate certifies against it
     # (same unwind as the commit-failure path below; the branch is kept)
     git merge --abort 2>/dev/null || git reset --hard HEAD >/dev/null 2>&1
+    clear_merge_owner
     task_fail "$id" MERGE_FAILED "worker evidence archive failed: ${ARCHIVE_PROBLEM:-unknown} (branch $branch kept — fix the cause, then ./loop.sh fleet merge $id, or rework the task)"
     return 0
   fi
   # shellcheck disable=SC2086  # ARCHIVE_SUPERSEDED is a single path or empty
   if ! git add -- ".loop/docs/run-archive/$id" ${ARCHIVE_SUPERSEDED:+"$ARCHIVE_SUPERSEDED"} 2>>"$mlog"; then
     git merge --abort 2>/dev/null || git reset --hard HEAD >/dev/null 2>&1
+    clear_merge_owner
     task_fail "$id" MERGE_FAILED "could not stage the worker evidence archive: $(tail -1 "$mlog" | tr '\n' ' ')(branch $branch kept)"
     return 0
   fi
 
   if git diff --cached --quiet 2>/dev/null; then
     git merge --abort 2>/dev/null || true
+    clear_merge_owner
     task_done "$id" "no changes to merge"
     return 0
   fi
-  if ! git commit -q -m "fleet: merge $id — $summary" >> "$mlog" 2>&1; then
+  if task_discard_requested "$id"; then
+    git merge --abort 2>/dev/null || true
+    clear_merge_owner
+    renv_set "$id" PHASE DISCARD_PENDING
+    return 0
+  fi
+  if ! commit_fleet_task "$id" "fleet: merge $id — $summary" "$mlog"; then
     # a commit hook / signing failure here must NOT fall through to task_done:
     # that would report "merged" with nothing committed, leave the parent stuck
     # mid-merge, and invite a `clean` that deletes the only copy of the work
     git merge --abort 2>/dev/null || git reset --hard HEAD >/dev/null 2>&1
+    clear_merge_owner
     task_fail "$id" MERGE_FAILED "merge commit failed (hook? signing?): $(tail -2 "$mlog" | tr '\n' ' ')(branch $branch kept)"
     return 0
   fi
+  renv_set "$id" MERGE_COMMIT "$(git rev-parse HEAD)"
   renv_set "$id" MERGED_AT "$(utcnow)"
+  clear_merge_owner
   task_done "$id" "merged ($branch) — clean up when ready: ./loop.sh fleet clean $id"
 }
 
@@ -5392,6 +5765,10 @@ active_slots() { # live claude-bearing children (contract gen or run)
 tick() {
   local id phase
   beat   # aliveness heartbeat: refreshed every tick and around blocking calls
+  if discard_requested; then
+    journal "-" DISCARD_OBSERVED "supervisor stopped before the next claim/merge"
+    on_supervisor_int
+  fi
   # 1. reap children that finished
   for id in $(tasks_in claimed); do
     case "$(renv_get "$id" PHASE)" in
@@ -5481,6 +5858,7 @@ tick() {
   for id in $(tasks_in claimed); do
     [ "$slots" -lt "$MAX_PARALLEL" ] || break
     if [ "$(renv_get "$id" PHASE)" = "APPROVED" ]; then
+      task_discard_requested "$id" && continue
       start_run "$id"
       slots=$((slots + 1))
     fi
@@ -5491,6 +5869,7 @@ tick() {
   local dstate
   for id in $(tasks_in new); do
     [ "$slots" -lt "$MAX_PARALLEL" ] || break
+    task_discard_requested "$id" && continue
     dstate=$(deps_state "$id")
     case "$dstate" in
       waiting)  continue ;;
@@ -5547,19 +5926,28 @@ recover_claimed() { # supervisor (re)start: adopt whatever the previous one left
           # stop` marker means the reap already parked it (STOP_HONORED) into
           # failed/ — the queue check keeps that park honored.
           if [ "$(renv_get "$id" PHASE)" = "INTERRUPTED" ] && [ "$(task_qdir "$id")" = "claimed" ]; then
-            renv_set "$id" PHASE APPROVED
-            journal "$id" RESUME "auto-resume at supervisor start"
-            fnote "[$id] resuming interrupted run"
+            case "$(renv_get "$id" STOPPED_BY "")" in
+              human) park_human_stopped "$id" ;;
+              discard|discard-peer)
+                task_fail "$id" INTERRUPTED "parked by a completed whole-plan discard — resume explicitly: ./loop.sh resume $id" ;;
+              *)
+                renv_set "$id" PHASE APPROVED
+                journal "$id" RESUME "auto-resume at supervisor start"
+                fnote "[$id] resuming interrupted run" ;;
+            esac
           fi
         fi ;;
       INTERRUPTED)
-        if [ "$(renv_get "$id" STOPPED_BY "")" = "human" ]; then
-          park_human_stopped "$id"                    # a human stop is never un-done
-        else
-          renv_set "$id" PHASE APPROVED               # interrupted before this restart
-          journal "$id" RESUME "auto-resume at supervisor start"
-          fnote "[$id] resuming interrupted run"
-        fi ;;
+        case "$(renv_get "$id" STOPPED_BY "")" in
+          human)
+            park_human_stopped "$id" ;;               # a human stop is never un-done
+          discard|discard-peer)
+            task_fail "$id" INTERRUPTED "parked by a completed whole-plan discard — resume explicitly: ./loop.sh resume $id" ;;
+          *)
+            renv_set "$id" PHASE APPROVED             # interrupted before this restart
+            journal "$id" RESUME "auto-resume at supervisor start"
+            fnote "[$id] resuming interrupted run" ;;
+        esac ;;
       CONTRACT_READY|PENDING_APPROVAL|APPROVED|MERGE_PENDING|SUPERVISE_PENDING)
         # tick handles these normally. SUPERVISE_PENDING is a persistent claimed
         # phase (reap_task sets it while the escalated worker awaits a supervisor
@@ -5625,7 +6013,11 @@ confirm_setup_cmd() { # WORKTREE_SETUP_CMD is executed code — confirm per sess
 
 on_supervisor_int() {
   echo
-  fnote "interrupt — stopping running loops (each saves state; resume with ./loop.sh fleet run)"
+  if discard_requested; then
+    fnote "whole-plan discard requested — stopping running loops; complete with ./loop.sh discard --keep-changes (or --rollback)"
+  else
+    fnote "interrupt — stopping running loops (each saves state; resume with ./loop.sh fleet run)"
+  fi
   # TERM the worker loop.sh processes FIRST so each runs its OWN on_interrupt
   # (which group-kills that worker's agent subtree) concurrently with the grace
   # below — a single-pid TERM is right here: the recorded PID is the worker loop.sh
@@ -5643,6 +6035,7 @@ on_supervisor_int() {
   # review/evidence): group-kill its whole subtree, never leave an orphan agent.
   kill_agent_group "$CHILD_PID"
   sleep 2
+  while plan_mutation_lock_owned; do release_plan_mutation_lock; done
   release_lock
   trap - EXIT
   exit 130
@@ -5653,6 +6046,7 @@ on_supervisor_int() {
 cmd_fleet_add() {
   need_project
   ensure_fleet_dirs
+  guard_no_discard_pending
   local auto=0 after="" force_after=0 args=() a dep qd id all_files=1 ahead
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -5717,6 +6111,7 @@ cmd_fleet_run() {
     fdie_next "a ./loop.sh run is starting in this repo (pid $(cat .loop/run-claim.pid 2>/dev/null)) — a root loop and the fleet must not run together" "wait for it to appear in ./loop.sh status (or stop it), then ./loop.sh fleet run"
   fi
   ensure_fleet_dirs
+  guard_no_discard_pending
   MAX_PARALLEL=$(fcfg FLEET_MAX_PARALLEL 3)
   local drain=0 args=() a auto_flag=""
   while [ $# -gt 0 ]; do
@@ -5752,6 +6147,25 @@ cmd_fleet_run() {
   MODEL_SUPERVISE=$(configured_role_model SUPERVISE)
   mkdir -p .loop/logs   # run_claude writes its call logs here (init may not have)
   [ "$AUTO_MODE" = "1" ] && auto_flag=1
+  confirm_setup_cmd
+  # Publish the supervisor lock under the same barrier used by root `run` and
+  # discard. This closes the cold-start window where discard could observe no
+  # supervisor, publish its request, and then have this process begin dispatch.
+  acquire_plan_mutation_lock \
+    || fdie_next "could not acquire the plan mutation barrier before starting Fleet" "after confirming no loop is live, run ./loop.sh fleet unlock, then ./loop.sh fleet run"
+  trap release_plan_mutation_lock EXIT
+  guard_no_discard_pending
+  if run_claim_alive; then
+    fdie_next "a ./loop.sh run is starting in this repo (pid $(cat .loop/run-claim.pid 2>/dev/null)) — a root loop and the fleet must not run together" "wait for it to appear in ./loop.sh status (or stop it), then ./loop.sh fleet run"
+  fi
+  if [ "$(cat .loop/state 2>/dev/null)" = "RUNNING" ]; then
+    # Recheck under the mutation barrier: the early probe above is only a fast
+    # refusal, while this one is the actual root-vs-supervisor linearization.
+    if single_loop_alive; then
+      fdie "a single-loop run is active (pid $(cat .loop/run.pid 2>/dev/null)) — a root loop and the fleet must not run together; wait for it or stop it (Ctrl-C / kill $(cat .loop/run.pid 2>/dev/null))"
+    fi
+    fnote "warning: .loop/state is RUNNING but no live loop process found (stale after a crash) — proceeding"
+  fi
   if [ "${#args[@]}" -ge 1 ]; then
     for a in "${args[@]}"; do
       if [ -f "$a" ]; then
@@ -5761,22 +6175,14 @@ cmd_fleet_run() {
       fi
     done
   fi
-  confirm_setup_cmd
   acquire_lock
-  trap release_lock EXIT
+  trap 'release_plan_mutation_lock; release_lock' EXIT
   trap on_supervisor_int INT TERM
+  release_plan_mutation_lock
+  trap release_lock EXIT
   # NOTE: a restart deliberately does NOT clear plan-review escalations — only
   # an explicit `./loop.sh fleet ack-plan <id>` releases the held queued phases
   supervisor_session_drop   # restart = session rotation (fresh conversation)
-  if [ "$(cat .loop/state 2>/dev/null)" = "RUNNING" ]; then
-    # split-brain refusal: a live root loop and the fleet must never share the
-    # repo (both commit + move HEAD). Refuse ONLY on a verified-live process;
-    # stale RUNNING left by a crash gets an honest warning and proceeds.
-    if single_loop_alive; then
-      fdie "a single-loop run is active (pid $(cat .loop/run.pid 2>/dev/null)) — a root loop and the fleet must not run together; wait for it or stop it (Ctrl-C / kill $(cat .loop/run.pid 2>/dev/null))"
-    fi
-    fnote "warning: .loop/state is RUNNING but no live loop process found (stale after a crash) — proceeding"
-  fi
   # same policy as ./loop.sh run: a dirty parent tree becomes a snapshot commit,
   # so worktrees branch from a defined state and serial merges are never
   # blocked by leftovers (e.g. the gitignore update right after ./loop.sh update).
@@ -5928,6 +6334,7 @@ cmd_fleet_run() {
 cmd_fleet_approve() {
   need_project
   ensure_fleet_dirs
+  guard_no_discard_pending
   local ids=() all=0 a id
   for a in "$@"; do
     case "$a" in
@@ -5997,6 +6404,10 @@ approve_one() { # $1 id — show the contract, then record approval in the workt
 cmd_fleet_status() {
   need_project
   ensure_fleet_dirs
+  if discard_request_present; then
+    echo "discard: pending (choice=$(fleet_kv_get "$DISCARD_REQUEST_FILE" CHOICE pending), authority=$(discard_request_authority))"
+    echo "         complete: ./loop.sh discard --keep-changes   # or the already-fixed --rollback choice"
+  fi
   if supervisor_alive; then
     echo "supervisor: running (pid $(supervisor_pid))"
   else
@@ -6095,6 +6506,8 @@ cmd_fleet_logs() {
 
 cmd_fleet_stop() {
   need_project
+  ensure_fleet_dirs
+  guard_no_discard_pending
   local id="${1:?usage: ./loop.sh fleet stop <task-id>}" pid
   pid=$(renv_get "$id" PID "")
   { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } || fdie_next "no live process for $id" "./loop.sh fleet status"
@@ -6114,7 +6527,7 @@ resume_class() { # $1 id -> class token (pure; the listing and the flip share th
     done)   echo "done" ;;
     new)    echo queued ;;
     failed) case "$result" in
-              CONTRACT_FAILED|BOOTSTRAP_FAILED|STALE_BOOTSTRAP|APPROVE_FAILED|DEP_FAILED) echo requeue ;;
+              CONTRACT_FAILED|BOOTSTRAP_FAILED|STALE_BOOTSTRAP|APPROVE_FAILED|DEP_FAILED|DISCARD_DEP_CANCELLED) echo requeue ;;
               MERGE_CONFLICT|MERGE_FAILED) echo merge-decision ;;
               NEEDS_SPEC_DECISION|NEEDS_ARCHITECTURE_DECISION|NEEDS_DECOMPOSITION|NEEDS_HUMAN|RISK_REQUIRES_APPROVAL) echo decision ;;
               REPLANNED) echo superseded ;;
@@ -6159,7 +6572,7 @@ fleet_resume_flip() { # $1 id, [$2 internal: "recursed" bounds the stale-running
   # inline reap to ONE recursion] — one state flip toward runnable, by
   # resume_class; fdies on every non-resumable class (the listing and the flip
   # stay in sync)
-  local id="$1" recursed="${2:-}" phase
+  local id="$1" recursed="${2:-}" phase rq_wt rq_base rq_tip
   phase=$(renv_get "$id" PHASE "")
   case "$(resume_class "$id")" in
     unknown) fdie "unknown task: $id — list sessions: ./loop.sh resume --list" ;;
@@ -6171,6 +6584,25 @@ fleet_resume_flip() { # $1 id, [$2 internal: "recursed" bounds the stale-running
       # relaunch would die at verify_approval. Scrap the artifacts and
       # re-queue the task for a completely fresh claim instead. Fail CLOSED on
       # a surviving approval slot (the fresh claim would inherit its baseline).
+      # EXCEPT: a discard-parked manual dependent (DISCARD_DEP_CANCELLED) may
+      # still hold real implementation work the whole-plan discard deliberately
+      # preserved — manual tasks get no recovery-ref pin, so the scrap below
+      # would destroy the only copy. Refuse while any work (commits past the
+      # task base, tracked edits, private files, or unreadable Git state) is
+      # present; the pre-discard requeue classes (broken or unbootstrapped
+      # worktrees) keep their scrap-and-requeue behavior unchanged.
+      if [ "$(renv_get "$id" RESULT "")" = "DISCARD_DEP_CANCELLED" ]; then
+        rq_wt=$(renv_get "$id" WT "")
+        rq_base=$(git rev-parse -q --verify "$(renv_get "$id" BASE_REF "")^{commit}" 2>/dev/null || echo "")
+        rq_tip=$(git rev-parse -q --verify "refs/heads/loop/$id^{commit}" 2>/dev/null || echo "")
+        if { [ -n "$rq_tip" ] && [ "$rq_tip" != "$rq_base" ]; } \
+           || { [ -n "$rq_wt" ] && [ -d "$rq_wt" ] \
+                && { ! git -C "$rq_wt" diff --quiet -- 2>/dev/null \
+                     || ! git -C "$rq_wt" diff --cached --quiet -- 2>/dev/null \
+                     || worktree_has_untracked_or_ignored "$rq_wt"; }; }; then
+          fdie_next "manual task $id still holds implementation work from before its planned dependency was cancelled (worktree: ${rq_wt:-none}, branch: loop/$id)" "save what you need, scrap it explicitly (git worktree remove --force ${rq_wt:-<worktree>} && git branch -D loop/$id), then rerun ./loop.sh resume $id"
+        fi
+      fi
       discard_worktree_slot "$(renv_get "$id" WT "")" \
         || fdie_next "could not remove $id's approval slot — a fresh claim would inherit the stale task baseline" "remove it by hand (under $(approval_home)), then retry: ./loop.sh resume $id"
       git worktree remove --force "$(renv_get "$id" WT "")" >/dev/null 2>&1 || true
@@ -6263,6 +6695,7 @@ fleet_resume_flip() { # $1 id, [$2 internal: "recursed" bounds the stale-running
 cmd_fleet_resume() {
   need_project
   ensure_fleet_dirs
+  guard_no_discard_pending
   local id="${1:?usage: ./loop.sh fleet resume <task-id>}"
   fleet_resume_flip "$id"
   if supervisor_alive; then
@@ -6284,6 +6717,7 @@ cmd_fleet_ack_plan() { # ./loop.sh fleet ack-plan <merged-id | --all> — a HUMA
   # a crash mid-review re-enters the review on the next supervisor run.
   need_project
   ensure_fleet_dirs
+  guard_no_discard_pending
   local id="${1:?usage: ./loop.sh fleet ack-plan <merged-task-id | --all>}" d n=0
   for d in $(tasks_in "done"); do
     [ "$id" = "--all" ] || [ "$d" = "$id" ] || continue
@@ -6308,6 +6742,7 @@ cmd_fleet_ack_plan() { # ./loop.sh fleet ack-plan <merged-id | --all> — a HUMA
 cmd_fleet_merge() {
   need_project
   ensure_fleet_dirs
+  guard_no_discard_pending
   local id="${1:?usage: ./loop.sh fleet merge <task-id>}" qd
   supervisor_alive && fdie "supervisor is running — it merges automatically (stop it to merge by hand)"
   qd=$(task_qdir "$id")
@@ -6323,9 +6758,1757 @@ cmd_fleet_merge() {
   merge_task "$id" || fdie_next "merge deferred — parent working tree is dirty" "commit or stash the parent tree, then ./loop.sh fleet merge $id"
 }
 
+# ---------- whole-plan discard + conservative rollback ----------
+
+planned_ids_for_authority() { # $1 authority -> all queue states, one id/line
+  local authority="$1" id
+  for id in $(all_task_ids); do
+    [ "$(renv_get "$id" PLANNED 0)" = "1" ] || continue
+    [ "$(renv_get "$id" PLAN_AUTHORITY "")" = "$authority" ] || continue
+    printf '%s\n' "$id"
+  done
+}
+
+all_planned_ids() { # legacy deployments have PLANNED=1 but no authority
+  local id
+  for id in $(all_task_ids); do
+    [ "$(renv_get "$id" PLANNED 0)" = "1" ] && printf '%s\n' "$id"
+  done
+}
+
+legacy_plan_queue_fingerprint() { # stable across partial authority stamping
+  local id qd task
+  for id in $(all_planned_ids); do
+    qd=$(task_qdir "$id")
+    task="$QUEUE_DIR/$qd/$id.md"
+    printf 'task:%s\nqueue:%s\n' "$id" "$qd"
+    [ -f "$task" ] || return 1
+    cat "$task" || return 1
+    printf '\n'
+  done | sha256
+}
+
+adopt_legacy_plan_for_discard() { # cancellation only; legacy plans can never rollback
+  local ids source source_refname authority tmp id plan_hash task_authority task_source task_ref
+  local generation_head queue_fingerprint
+  ids=$(all_planned_ids)
+  [ -n "$ids" ] || return 1
+  source=$(cat .loop/fleet/base-ref 2>/dev/null || echo "")
+  git rev-parse --verify "${source}^{commit}" >/dev/null 2>&1 \
+    || source=$(git rev-parse HEAD 2>/dev/null || echo "")
+  source=$(git rev-parse --verify "${source}^{commit}" 2>/dev/null) || return 1
+  source_refname=$(git symbolic-ref -q HEAD 2>/dev/null || printf '%s' DETACHED)
+  plan_hash=$(cat .loop/decompose-approved 2>/dev/null || echo unknown)
+  generation_head=$(git rev-parse HEAD 2>/dev/null) || return 1
+  queue_fingerprint=$(legacy_plan_queue_fingerprint) || return 1
+  authority="legacy-discard-$(printf '%s\n' loop-legacy-discard-v1 "$plan_hash" "$source" "$source_refname" "$generation_head" "$queue_fingerprint" | sha256)"
+  # Preflight the entire set before writing. A retry may see our deterministic
+  # partial stamps, but a foreign non-empty binding is never overwritten.
+  for id in $ids; do
+    task_authority=$(renv_get "$id" PLAN_AUTHORITY "")
+    task_source=$(renv_get "$id" PLAN_SOURCE_REF "")
+    task_ref=$(renv_get "$id" PLAN_SOURCE_REFNAME "")
+    { [ -z "$task_authority" ] || [ "$task_authority" = "$authority" ]; } \
+      && { [ -z "$task_source" ] || [ "$task_source" = "$source" ]; } \
+      && { [ -z "$task_ref" ] || [ "$task_ref" = "$source_refname" ]; } \
+      || return 1
+  done
+  for id in $ids; do
+    renv_set "$id" PLAN_AUTHORITY "$authority" || return 1
+    renv_set "$id" PLAN_SOURCE_REF "$source" || return 1
+    renv_set "$id" PLAN_SOURCE_REFNAME "$source_refname" || return 1
+  done
+  for id in $ids; do
+    [ "$(renv_get "$id" PLAN_AUTHORITY "")" = "$authority" ] \
+      && [ "$(renv_get "$id" PLAN_SOURCE_REF "")" = "$source" ] \
+      && [ "$(renv_get "$id" PLAN_SOURCE_REFNAME "")" = "$source_refname" ] \
+      || return 1
+  done
+  [ "$(git rev-parse HEAD 2>/dev/null || echo changed)" = "$generation_head" ] || return 1
+  # Authority is the completion marker and is therefore published last.
+  tmp="$PLAN_AUTHORITY_FILE.tmp.$$"
+  {
+    echo "VERSION=0"
+    echo "LEGACY=1"
+    echo "ADOPTION_STATE=COMPLETE"
+    echo "AUTHORITY=$authority"
+    echo "PLAN_HASH=$plan_hash"
+    echo "SOURCE_REF=$source"
+    echo "SOURCE_REFNAME=$source_refname"
+    echo "LEGACY_GENERATION_HEAD=$generation_head"
+    echo "LEGACY_QUEUE_FINGERPRINT=$queue_fingerprint"
+    echo "CREATED_AT=$(utcnow)"
+  } > "$tmp" || return 1
+  mv -f "$tmp" "$PLAN_AUTHORITY_FILE" || return 1
+  journal "-" LEGACY_PLAN_ADOPTED "assigned cancellation-only authority $authority; rollback disabled"
+  return 0
+}
+
+reconcile_legacy_plan_for_discard() { # complete an old/partial v0 authority atomically
+  local authority source source_refname ids id task_authority task_source task_ref tmp
+  authority=$(current_plan_authority)
+  source=$(current_plan_source_ref)
+  source_refname=$(current_plan_refname)
+  ids=$(all_planned_ids)
+  [ -n "$authority" ] && [ -n "$source" ] && [ -n "$source_refname" ] \
+    || return 1
+  [ -n "$ids" ] || [ -n "$(fleet_kv_get "$DISCARD_REQUEST_FILE" FINAL_COMMIT "")" ] || return 1
+  case "$authority" in legacy-discard-*) ;; *) return 1 ;; esac
+  git rev-parse --verify "${source}^{commit}" >/dev/null 2>&1 || return 1
+  for id in $ids; do
+    task_authority=$(renv_get "$id" PLAN_AUTHORITY "")
+    task_source=$(renv_get "$id" PLAN_SOURCE_REF "")
+    task_ref=$(renv_get "$id" PLAN_SOURCE_REFNAME "")
+    { [ -z "$task_authority" ] || [ "$task_authority" = "$authority" ]; } \
+      && { [ -z "$task_source" ] || [ "$task_source" = "$source" ]; } \
+      && { [ -z "$task_ref" ] || [ "$task_ref" = "$source_refname" ]; } \
+      || return 1
+  done
+  for id in $ids; do
+    renv_set "$id" PLAN_AUTHORITY "$authority" || return 1
+    renv_set "$id" PLAN_SOURCE_REF "$source" || return 1
+    renv_set "$id" PLAN_SOURCE_REFNAME "$source_refname" || return 1
+  done
+  tmp="$PLAN_AUTHORITY_FILE.tmp.$$"
+  {
+    grep -v '^ADOPTION_STATE=' "$PLAN_AUTHORITY_FILE" 2>/dev/null || true
+    echo "ADOPTION_STATE=COMPLETE"
+  } > "$tmp" || return 1
+  mv -f "$tmp" "$PLAN_AUTHORITY_FILE"
+}
+
+validate_bound_plan_for_discard() { # every PLANNED task must belong to one authority
+  local authority="$1" source refname id ids receipt=0 matched=0
+  source=$(current_plan_source_ref)
+  refname=$(current_plan_refname)
+  ids=$(all_planned_ids)
+  [ -z "$(fleet_kv_get "$DISCARD_REQUEST_FILE" FINAL_COMMIT "")" ] || receipt=1
+  [ -n "$ids" ] || [ "$receipt" = 1 ] || return 1
+  for id in $ids; do
+    if [ "$(renv_get "$id" PLAN_AUTHORITY "")" != "$authority" ]; then
+      [ "$receipt" = 1 ] && continue
+      return 1
+    fi
+    matched=1
+    [ "$(renv_get "$id" PLAN_AUTHORITY "")" = "$authority" ] \
+      && [ "$(renv_get "$id" PLAN_SOURCE_REF "")" = "$source" ] \
+      && [ "$(renv_get "$id" PLAN_SOURCE_REFNAME "")" = "$refname" ] \
+      || return 1
+  done
+  [ "$matched" = 1 ] || [ "$receipt" = 1 ]
+}
+
+active_plan_for_discard() { # true for an unfinished plan, including drained-before-gate
+  local authority ids st
+  discard_request_present && return 0
+  st=$(cat .loop/state 2>/dev/null || echo "")
+  authority=$(current_plan_authority)
+  if [ -n "$authority" ]; then
+    ids=$(planned_ids_for_authority "$authority")
+    case "$st" in SUCCESS|NO_OP|CANCELLED) discard_request_present || return 1 ;; esac
+    [ "$st" = "FLEET_RUNNING" ] || [ -n "$ids" ] || discard_request_present
+    return $?
+  fi
+  ids=$(all_planned_ids)
+  [ "$st" = "FLEET_RUNNING" ] && [ -n "$ids" ] && return 0
+  for id in $ids; do
+    case "$(task_qdir "$id")" in new|claimed) return 0 ;; esac
+  done
+  return 1
+}
+
+validate_discard_request() { # [$1 file] — strict keys/duplicates, then semantic binding
+  local request_file="${1:-$DISCARD_REQUEST_FILE}"
+  local version authority choice plan_version plan_hash source refname legacy expected status phase
+  [ -f "$request_file" ] && [ ! -L "$request_file" ] || return 1
+  awk '
+    BEGIN {
+      split("VERSION AUTHORITY PLAN_VERSION PLAN_HASH SOURCE_REF SOURCE_REFNAME LEGACY CHOICE REQUESTED_AT REQUESTED_BY_PID PHASE FINAL_STATUS FINAL_REASON ARCHIVE_REL FINAL_COMMIT", a, " ")
+      for (i in a) allowed[a[i]] = 1
+    }
+    {
+      p = index($0, "=")
+      if (p < 2 || $0 ~ /[\r\t]/) exit 1
+      key = substr($0, 1, p - 1)
+      if (!(key in allowed) || ++seen[key] != 1) exit 1
+    }
+  ' "$request_file" >/dev/null 2>&1 || return 1
+  version=$(fleet_kv_get "$request_file" VERSION "")
+  authority=$(fleet_kv_get "$request_file" AUTHORITY "")
+  choice=$(fleet_kv_get "$request_file" CHOICE "")
+  case "$authority" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "$choice" in pending|rollback|keep) ;; *) return 1 ;; esac
+  [ -n "$(fleet_kv_get "$request_file" REQUESTED_AT "")" ] || return 1
+  case "$(fleet_kv_get "$request_file" REQUESTED_BY_PID "")" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$version" in
+    1) ;;
+    2)
+      plan_version=$(fleet_kv_get "$request_file" PLAN_VERSION "")
+      plan_hash=$(fleet_kv_get "$request_file" PLAN_HASH "")
+      source=$(fleet_kv_get "$request_file" SOURCE_REF "")
+      refname=$(fleet_kv_get "$request_file" SOURCE_REFNAME "")
+      legacy=$(fleet_kv_get "$request_file" LEGACY "")
+      [ -n "$plan_hash" ] && [ -n "$source" ] && [ -n "$refname" ] || return 1
+      git rev-parse --verify "${source}^{commit}" >/dev/null 2>&1 || return 1
+      if [ "$refname" != DETACHED ]; then git check-ref-format "$refname" >/dev/null 2>&1 || return 1; fi
+      case "$plan_version:$legacy" in 0:1|1:0) ;; *) return 1 ;; esac
+      if [ "$plan_version" = 1 ]; then
+        expected=$(printf '%s\n' loop-plan-v1 "$plan_hash" "$source" "$refname" | sha256) || return 1
+        [ "$authority" = "$expected" ] || return 1
+      else
+        case "$authority" in legacy-discard-*) ;; *) return 1 ;; esac
+      fi ;;
+    *) return 1 ;;
+  esac
+  status=$(fleet_kv_get "$request_file" FINAL_STATUS "")
+  phase=$(fleet_kv_get "$request_file" PHASE "")
+  if grep -Eq '^(PHASE|FINAL_STATUS|FINAL_REASON|ARCHIVE_REL|FINAL_COMMIT)=' "$request_file"; then
+    [ -n "$phase" ] && [ -n "$status" ] \
+      && [ -n "$(fleet_kv_get "$request_file" FINAL_REASON "")" ] \
+      && [ -n "$(fleet_kv_get "$request_file" ARCHIVE_REL "")" ] \
+      && [ -n "$(fleet_kv_get "$request_file" FINAL_COMMIT "")" ] || return 1
+    case "$choice:$phase:$status" in
+      keep:ARCHIVE_COMMITTED:NOT_REQUESTED|rollback:ARCHIVE_COMMITTED:NOT_NEEDED|\
+      rollback:ARCHIVE_COMMITTED:UNAVAILABLE|rollback:ROLLBACK_APPLIED:APPLIED) ;;
+      *) return 1 ;;
+    esac
+  fi
+  return 0
+}
+
+validate_plan_authority_for_discard() { # immutable v1 or cancellation-only legacy v0
+  local version authority plan_hash source refname resolved expected
+  [ -f "$PLAN_AUTHORITY_FILE" ] && [ ! -L "$PLAN_AUTHORITY_FILE" ] || return 1
+  version=$(fleet_kv_get "$PLAN_AUTHORITY_FILE" VERSION "")
+  authority=$(current_plan_authority)
+  plan_hash=$(fleet_kv_get "$PLAN_AUTHORITY_FILE" PLAN_HASH "")
+  source=$(current_plan_source_ref)
+  refname=$(current_plan_refname)
+  case "$authority" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ -n "$plan_hash" ] && [ -n "$source" ] && [ -n "$refname" ] || return 1
+  resolved=$(git rev-parse --verify "${source}^{commit}" 2>/dev/null) || return 1
+  [ "$resolved" = "$source" ] || return 1
+  if [ "$refname" != DETACHED ]; then git check-ref-format "$refname" >/dev/null 2>&1 || return 1; fi
+  case "$version" in
+    1)
+      expected=$(printf '%s\n' loop-plan-v1 "$plan_hash" "$source" "$refname" | sha256) || return 1
+      [ "$authority" = "$expected" ] ;;
+    0)
+      case "$authority" in legacy-discard-*) return 0 ;; *) return 1 ;; esac ;;
+    *) return 1 ;;
+  esac
+}
+
+upgrade_discard_request_v1() { # make accepted legacy WALs self-contained before any stop
+  local version tmp plan_version legacy
+  version=$(fleet_kv_get "$DISCARD_REQUEST_FILE" VERSION "")
+  [ "$version" = 1 ] || return 0
+  validate_plan_authority_for_discard || return 1
+  plan_version=$(fleet_kv_get "$PLAN_AUTHORITY_FILE" VERSION "")
+  case "$plan_version" in 0) legacy=1 ;; 1) legacy=0 ;; *) return 1 ;; esac
+  tmp="$DISCARD_REQUEST_FILE.tmp.$$"
+  {
+    echo "VERSION=2"
+    echo "AUTHORITY=$(current_plan_authority)"
+    echo "PLAN_VERSION=$plan_version"
+    echo "PLAN_HASH=$(fleet_kv_get "$PLAN_AUTHORITY_FILE" PLAN_HASH "")"
+    echo "SOURCE_REF=$(current_plan_source_ref)"
+    echo "SOURCE_REFNAME=$(current_plan_refname)"
+    echo "LEGACY=$legacy"
+    grep -Ev '^(VERSION|AUTHORITY|PLAN_VERSION|PLAN_HASH|SOURCE_REF|SOURCE_REFNAME|LEGACY)=' \
+      "$DISCARD_REQUEST_FILE" 2>/dev/null || true
+  } > "$tmp" || return 1
+  validate_discard_request "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$DISCARD_REQUEST_FILE"
+}
+
+discard_request_matches_authority() {
+  [ "$(discard_request_authority)" = "$(current_plan_authority)" ] || return 1
+  [ "$(fleet_kv_get "$DISCARD_REQUEST_FILE" VERSION "")" = 2 ] || return 0
+  [ "$(fleet_kv_get "$DISCARD_REQUEST_FILE" PLAN_VERSION "")" = \
+      "$(fleet_kv_get "$PLAN_AUTHORITY_FILE" VERSION "")" ] \
+    && [ "$(fleet_kv_get "$DISCARD_REQUEST_FILE" PLAN_HASH "")" = \
+         "$(fleet_kv_get "$PLAN_AUTHORITY_FILE" PLAN_HASH "")" ] \
+    && [ "$(fleet_kv_get "$DISCARD_REQUEST_FILE" SOURCE_REF "")" = "$(current_plan_source_ref)" ] \
+    && [ "$(fleet_kv_get "$DISCARD_REQUEST_FILE" SOURCE_REFNAME "")" = "$(current_plan_refname)" ]
+}
+
+restore_plan_authority_from_discard_request() { # D4/receipt retry after authority unlink
+  local version authority plan_version plan_hash source refname legacy tmp
+  validate_discard_request || return 1
+  version=$(fleet_kv_get "$DISCARD_REQUEST_FILE" VERSION "")
+  [ "$version" = 2 ] || return 1
+  authority=$(discard_request_authority)
+  plan_version=$(fleet_kv_get "$DISCARD_REQUEST_FILE" PLAN_VERSION "")
+  plan_hash=$(fleet_kv_get "$DISCARD_REQUEST_FILE" PLAN_HASH "")
+  source=$(fleet_kv_get "$DISCARD_REQUEST_FILE" SOURCE_REF "")
+  refname=$(fleet_kv_get "$DISCARD_REQUEST_FILE" SOURCE_REFNAME "")
+  legacy=$(fleet_kv_get "$DISCARD_REQUEST_FILE" LEGACY "")
+  tmp="$PLAN_AUTHORITY_FILE.tmp.$$"
+  {
+    echo "VERSION=$plan_version"
+    echo "LEGACY=$legacy"
+    [ "$plan_version" != 0 ] || echo "ADOPTION_STATE=COMPLETE"
+    echo "AUTHORITY=$authority"
+    echo "PLAN_HASH=$plan_hash"
+    echo "SOURCE_REF=$source"
+    echo "SOURCE_REFNAME=$refname"
+    echo "RECOVERED_FROM_DISCARD_REQUEST=1"
+    echo "CREATED_AT=$(fleet_kv_get "$DISCARD_REQUEST_FILE" REQUESTED_AT "$(utcnow)")"
+  } > "$tmp" || return 1
+  mv -f "$tmp" "$PLAN_AUTHORITY_FILE"
+}
+
+publish_discard_request() { # $1 authority, $2 pending|rollback|keep
+  local authority="$1" choice="$2" existing tmp version legacy
+  if discard_request_present; then
+    validate_discard_request || return 1
+    existing=$(discard_request_authority)
+    [ "$existing" = "$authority" ] \
+      || fdie_next "another plan's discard request is already present" "inspect $DISCARD_REQUEST_FILE, then ./loop.sh status"
+    return 0
+  fi
+  validate_plan_authority_for_discard || return 1
+  version=$(fleet_kv_get "$PLAN_AUTHORITY_FILE" VERSION "")
+  case "$version" in 0) legacy=1 ;; 1) legacy=0 ;; *) return 1 ;; esac
+  tmp="$DISCARD_REQUEST_FILE.tmp.$$"
+  {
+    echo "VERSION=2"
+    echo "AUTHORITY=$authority"
+    echo "PLAN_VERSION=$version"
+    echo "PLAN_HASH=$(fleet_kv_get "$PLAN_AUTHORITY_FILE" PLAN_HASH "")"
+    echo "SOURCE_REF=$(current_plan_source_ref)"
+    echo "SOURCE_REFNAME=$(current_plan_refname)"
+    echo "LEGACY=$legacy"
+    echo "CHOICE=$choice"
+    echo "REQUESTED_AT=$(utcnow)"
+    echo "REQUESTED_BY_PID=$$"
+  } > "$tmp" || return 1
+  validate_discard_request "$tmp" || { rm -f "$tmp"; return 1; }
+  if ! ln "$tmp" "$DISCARD_REQUEST_FILE" 2>/dev/null; then
+    rm -f "$tmp"
+    validate_discard_request && [ "$(discard_request_authority)" = "$authority" ] || return 1
+    return 0
+  fi
+  rm -f "$tmp"
+}
+
+set_discard_request_choice() { # $1 choice — owner holds the supervisor lock
+  local choice="$1" current tmp="$DISCARD_REQUEST_FILE.tmp.$$"
+  current=$(fleet_kv_get "$DISCARD_REQUEST_FILE" CHOICE "pending")
+  case "$current" in
+    pending|"$choice") ;;
+    *) return 1 ;; # an irreversible choice is write-once across retries
+  esac
+  {
+    grep -v '^CHOICE=' "$DISCARD_REQUEST_FILE" 2>/dev/null || true
+    echo "CHOICE=$choice"
+  } > "$tmp" || return 1
+  validate_discard_request "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$DISCARD_REQUEST_FILE"
+}
+
+git_operation_in_progress() {
+  local git_path
+  git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 && return 0
+  git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1 && return 0
+  git rev-parse -q --verify REVERT_HEAD >/dev/null 2>&1 && return 0
+  git rev-parse -q --verify AM_HEAD >/dev/null 2>&1 && return 0
+  for git_path in rebase-merge rebase-apply sequencer BISECT_LOG; do
+    git_path=$(git rev-parse --git-path "$git_path" 2>/dev/null || echo "")
+    [ -z "$git_path" ] || [ ! -e "$git_path" ] || return 0
+  done
+  return 1
+}
+
+mark_tasks_for_discard_stop() { # target workers cancel; manual peers park
+  local authority="$1" id
+  for id in $(tasks_in claimed); do
+    if [ "$(renv_get "$id" PLAN_AUTHORITY "")" = "$authority" ] \
+       && [ "$(renv_get "$id" PLANNED 0)" = "1" ]; then
+      renv_set "$id" STOPPED_BY discard
+    else
+      renv_set "$id" STOPPED_BY discard-peer
+    fi
+  done
+}
+
+stop_discard_processes() { # $1 authority — request already published. On failure
+  # DISCARD_STOP_SURVIVORS names what is still live: `fleet stop` is barred while
+  # the request is pending, so the operator needs the exact pid to act on.
+  local authority="$1" id pid spid holder n
+  DISCARD_STOP_SURVIVORS=""
+  mark_tasks_for_discard_stop "$authority"
+  if supervisor_alive; then
+    spid=$(supervisor_pid)
+    fnote "discard: stopping supervisor pid $spid and its worker loops"
+    kill "$spid" 2>/dev/null || true
+  else
+    # A crashed supervisor may leave independently-running workers. Signal only
+    # when the full task liveness predicate still attributes the pid to it.
+    for id in $(tasks_in claimed); do
+      case "$(renv_get "$id" PHASE "")" in
+        CONTRACT_GEN|RUNNING)
+          if task_pid_alive "$id"; then
+            pid=$(renv_get "$id" PID "")
+            [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+          fi ;;
+      esac
+    done
+  fi
+  if run_claim_alive; then
+    holder=$(cat .loop/run-claim.pid 2>/dev/null || echo "")
+    case "$holder" in
+      ''|*[!0-9]*)
+        DISCARD_STOP_SURVIVORS="unparseable .loop/run-claim.pid"
+        return 1 ;;
+    esac
+    if ps -p "$holder" -o command= 2>/dev/null | grep -q 'loop\.sh'; then
+      kill "$holder" 2>/dev/null || true
+    else
+      DISCARD_STOP_SURVIVORS="run-claim pid $holder (not identifiable as loop.sh — verify before killing)"
+      return 1
+    fi
+  fi
+  n=0
+  while :; do
+    spid=""
+    supervisor_alive && spid=$(supervisor_pid)
+    holder=""
+    run_claim_alive && holder=$(cat .loop/run-claim.pid 2>/dev/null || echo "?")
+    pid=""
+    for id in $(tasks_in claimed); do
+      case "$(renv_get "$id" PHASE "")" in
+        CONTRACT_GEN|RUNNING) task_pid_alive "$id" && pid="$pid $id" ;;
+      esac
+    done
+    [ -z "$spid$holder$pid" ] && return 0
+    n=$((n + 1))
+    if [ "$n" -ge 50 ]; then
+      DISCARD_STOP_SURVIVORS="${spid:+supervisor pid $spid }${holder:+run-claim pid $holder }${pid:+task(s)$pid}"
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
+abort_owned_discard_merge() { # abort only a receipt-bound, untouched harness merge
+  local authority="$1" mh id pre tip receipt_authority
+  mh=$(git rev-parse -q --verify MERGE_HEAD 2>/dev/null || echo "")
+  if [ -z "$mh" ]; then
+    rm -f "$MERGE_OWNER_FILE" # stale pre-merge receipt; no Git operation to abort
+    return 0
+  fi
+  [ -s "$MERGE_OWNER_FILE" ] || return 1
+  receipt_authority=$(fleet_kv_get "$MERGE_OWNER_FILE" AUTHORITY "")
+  id=$(fleet_kv_get "$MERGE_OWNER_FILE" TASK_ID "")
+  pre=$(fleet_kv_get "$MERGE_OWNER_FILE" PRE_MERGE_HEAD "")
+  tip=$(fleet_kv_get "$MERGE_OWNER_FILE" BRANCH_TIP "")
+  [ "$receipt_authority" = "$authority" ] \
+    && [ "$(renv_get "$id" PLANNED 0)" = "1" ] \
+    && [ "$(renv_get "$id" PLAN_AUTHORITY "")" = "$authority" ] \
+    && [ "$(renv_get "$id" PHASE "")" = "MERGE_PENDING" ] \
+    && [ "$(git rev-parse HEAD 2>/dev/null || echo "")" = "$pre" ] \
+    && [ "$mh" = "$tip" ] \
+    && [ "$(renv_get "$id" MERGE_PRE_HEAD "")" = "$pre" ] \
+    && [ "$(renv_get "$id" MERGE_BRANCH_TIP "")" = "$tip" ] \
+    || return 1
+  # A conflict or an unstaged edit may contain human resolution work after the
+  # supervisor stopped. Never erase it. A pristine --no-commit merge has only
+  # staged changes; preserve those as an audit patch before aborting it.
+  [ -z "$(git ls-files -u 2>/dev/null)" ] || return 1
+  git diff --quiet 2>/dev/null || return 1
+  git diff --cached --binary "$pre" > "$FLEET_DIR/discard-merge-abort.patch" 2>/dev/null \
+    || return 1
+  git merge --abort >/dev/null 2>&1 || return 1
+  clear_merge_owner
+  journal "$id" DISCARD_MERGE_ABORTED "discard interrupted its receipt-bound uncommitted Fleet merge; staged patch archived"
+  return 0
+}
+
+park_manual_discard_peers() { # manual claimed tasks survive, explicitly resumable
+  local authority="$1" id phase
+  for id in $(tasks_in claimed); do
+    [ "$(renv_get "$id" PLAN_AUTHORITY "")" = "$authority" ] \
+      && [ "$(renv_get "$id" PLANNED 0)" = "1" ] && continue
+    phase=$(renv_get "$id" PHASE "")
+    case "$phase" in
+      CONTRACT_GEN|RUNNING) task_pid_alive "$id" && return 1 ;;
+    esac
+    renv_set "$id" STOPPED_BY discard-peer
+    renv_set "$id" PARKED_BY_DISCARD 1
+    renv_set "$id" PARKED_FROM_PHASE "$phase"
+    # Preserve every non-running phase exactly: MERGE_PENDING must still merge,
+    # approval phases must still await approval, and ready work must not be
+    # relaunched from scratch. A dead RUNNING child is the only phase converted
+    # to INTERRUPTED; normal recovery then parks it as explicitly resumable.
+    [ "$phase" != "RUNNING" ] || renv_set "$id" PHASE INTERRUPTED
+    journal "$id" DISCARD_PEER_PARKED "manual side-task preserved from phase=${phase:-none}; resume/advance after plan cancellation"
+  done
+  return 0
+}
+
+park_manual_discard_dependents() { # $1 authority — prevent missing-dep livelock
+  local authority="$1" targets="," q id dep deps kept cancelled
+  for id in $(planned_ids_for_authority "$authority"); do targets="$targets$id,"; done
+  for q in new claimed failed; do
+    for id in $(tasks_in "$q"); do
+      [ "$(renv_get "$id" PLANNED 0)" = "1" ] && continue
+      deps=$(renv_get "$id" DEPENDS_ON "")
+      [ -n "$deps" ] || continue
+      kept=""
+      cancelled=""
+      for dep in $(printf '%s' "$deps" | tr ',' ' '); do
+        case "$targets" in
+          *",$dep,"*) cancelled="${cancelled:+$cancelled,}$dep" ;;
+          *)           kept="${kept:+$kept,}$dep" ;;
+        esac
+      done
+      [ -n "$cancelled" ] || continue
+      renv_set "$id" DISCARD_CANCELLED_DEPS "$cancelled"
+      renv_set "$id" DEPENDS_ON "$kept"
+      renv_set "$id" PHASE DISCARD_DEP_CANCELLED
+      renv_set "$id" RESULT DISCARD_DEP_CANCELLED
+      renv_set "$id" ENDED_AT "$(utcnow)"
+      [ "$q" = failed ] \
+        || mv -f "$QUEUE_DIR/$q/$id.md" "$QUEUE_DIR/failed/$id.md" 2>/dev/null \
+        || return 1
+      journal "$id" DISCARD_DEP_CANCELLED "planned dependency $cancelled was cancelled; review that dependency, then ./loop.sh resume $id to requeue without it"
+    done
+  done
+  return 0
+}
+
+discard_recovery_ref() { # $1 authority, $2 task id, $3 commit — OID-stable retention
+  printf 'refs/loop-kit/discard/%s/%s/%s' "$1" "$2" "$3"
+}
+
+publish_discard_recovery_ref() { # $1 authority, $2 id, $3 pinned commit
+  local ref current commit
+  commit=$(git rev-parse --verify "${3}^{commit}" 2>/dev/null) || return 1
+  ref=$(discard_recovery_ref "$1" "$2" "$commit")
+  git check-ref-format "$ref" >/dev/null 2>&1 || return 1
+  current=$(git rev-parse -q --verify "$ref" 2>/dev/null || echo "")
+  if [ -n "$current" ]; then
+    [ "$current" = "$commit" ] || return 1
+  else
+    git update-ref "$ref" "$commit" "" || return 1
+    [ "$(git rev-parse -q --verify "$ref" 2>/dev/null || echo "")" = "$commit" ] || return 1
+  fi
+  printf '%s' "$ref"
+}
+
+discard_paths_overlap() { # same path or either path is an ancestor of the other
+  [ "$1" = "$2" ] && return 0
+  case "$1" in "$2"/*) return 0 ;; esac
+  case "$2" in "$1"/*) return 0 ;; esac
+  return 1
+}
+
+resolved_git_dir() { # $1 worktree, $2 --git-dir|--git-common-dir -> physical absolute path
+  local wt="$1" flag="$2" raw
+  raw=$(git -C "$wt" rev-parse "$flag" 2>/dev/null) || return 1
+  case "$raw" in
+    /*) (cd "$raw" 2>/dev/null && pwd -P) ;;
+    *)  (cd "$wt" 2>/dev/null && cd "$raw" 2>/dev/null && pwd -P) ;;
+  esac
+}
+
+rollback_parent_untracked_conflict() { # $1 changed-path manifest, $2 scratch zlist
+  local changed untracked
+  ROLLBACK_CONFLICT_PATH=""
+  write_worktree_untracked_zlist . "$2" \
+    || { ROLLBACK_CONFLICT_PATH="<unreadable parent untracked state>"; return 0; }
+  while IFS= read -r changed; do
+    [ -n "$changed" ] || continue
+    while IFS= read -r -d '' untracked; do
+      if discard_paths_overlap "$changed" "$untracked"; then
+        ROLLBACK_CONFLICT_PATH="$untracked"
+        return 0
+      fi
+    done < "$2"
+  done < "$1"
+  return 1
+}
+
+stage_discard_archive() { # $1 authority, $2 choice — ignored staging, no commit yet
+  local authority="$1" choice="$2" ts final stage id qd wt f base branch
+  local branch_tip wt_head wt_head_ref gitdir common_dir branch_recovery_ref wt_recovery_ref patch_tip
+  ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || echo archive)
+  final=$(unique_archive_dir ".loop/docs/run-archive/$ts-discard")
+  stage="$FLEET_DIR/discard-archive-stage.$$"
+  [ ! -e "$stage" ] || return 1
+  mkdir -p "$stage/tasks" || return 1
+  {
+    echo "VERSION=1"
+    echo "PLAN_AUTHORITY=$authority"
+    echo "PLAN_SOURCE_REF=$(current_plan_source_ref)"
+    echo "PLAN_SOURCE_REFNAME=$(current_plan_refname)"
+    echo "PARENT_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "CHOICE=$choice"
+    echo "DISPATCHED=$( [ -s "$PLAN_DISPATCHED_FILE" ] && echo 1 || echo 0 )"
+    echo "STAGED_AT=$(utcnow)"
+  } > "$stage/discard.env" || return 1
+  for f in "$PLAN_AUTHORITY_FILE" "$PLAN_DISPATCHED_FILE" "$DISCARD_REQUEST_FILE" \
+           "$FLEET_DIR/discard-merge-abort.patch" \
+           .loop/decompose-approved .loop/fleet/base-ref .loop/docs/task-plan.md; do
+    [ -f "$f" ] || continue
+    cp "$f" "$stage/$(basename "$f")" || return 1
+  done
+  for id in $(planned_ids_for_authority "$authority"); do
+    mkdir "$stage/tasks/$id" || return 1
+    qd=$(task_qdir "$id")
+    printf '%s\n' "$qd" > "$stage/tasks/$id/queue-state"
+    [ -z "$qd" ] || cp "$QUEUE_DIR/$qd/$id.md" "$stage/tasks/$id/task.md" || return 1
+    [ ! -f "$RUNS_DIR/$id.env" ] || cp "$RUNS_DIR/$id.env" "$stage/tasks/$id/run.env" || return 1
+    if [ -d ".loop/docs/run-archive/$id" ]; then
+      cp -R ".loop/docs/run-archive/$id" "$stage/tasks/$id/integration-archive" \
+        || return 1
+    fi
+    wt=$(renv_get "$id" WT "")
+    if [ -n "$wt" ] && [ -d "$wt/.loop/docs" ]; then
+      mkdir "$stage/tasks/$id/docs" || return 1
+      for f in "$wt/.loop/docs"/*.md "$wt/.loop/docs/certification.json"; do
+        [ -f "$f" ] || continue
+        cp "$f" "$stage/tasks/$id/docs/" || return 1
+      done
+    fi
+    if [ -n "$wt" ] && [ -d "$wt" ]; then
+      mkdir "$stage/tasks/$id/worker-managed-state" || return 1
+      for f in loop.sh loop.config.sh loop.models.sh loop-instruction.md \
+               fleet.sh fleet.config.sh; do
+        { [ -e "$wt/$f" ] || [ -L "$wt/$f" ]; } || continue
+        cp -P "$wt/$f" "$stage/tasks/$id/worker-managed-state/" || return 1
+      done
+    fi
+    base=$(renv_get "$id" BASE_REF "")
+    branch=$(renv_get "$id" BRANCH "")
+    branch_tip=""
+    wt_head=""
+    wt_head_ref=""
+    gitdir=""
+    common_dir=""
+    branch_recovery_ref=""
+    wt_recovery_ref=""
+    if [ -n "$branch" ]; then
+      branch_tip=$(git rev-parse -q --verify "refs/heads/${branch}^{commit}" 2>/dev/null || echo "")
+    fi
+    if [ -n "$wt" ] && [ -d "$wt" ]; then
+      wt_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "")
+      wt_head_ref=$(git -C "$wt" symbolic-ref -q HEAD 2>/dev/null || printf '%s' DETACHED)
+      gitdir=$(resolved_git_dir "$wt" --git-dir 2>/dev/null || echo "")
+      common_dir=$(resolved_git_dir "$wt" --git-common-dir 2>/dev/null || echo "")
+    fi
+    if [ -n "$branch_tip" ]; then
+      branch_recovery_ref=$(publish_discard_recovery_ref "$authority" "$id" "$branch_tip") \
+        || return 1
+    fi
+    if [ -n "$wt_head" ]; then
+      wt_recovery_ref=$(publish_discard_recovery_ref "$authority" "$id" "$wt_head") \
+        || return 1
+    fi
+    if [ -n "$wt$branch" ]; then
+      {
+        echo "BRANCH=$branch"
+        echo "WORKTREE=$wt"
+        echo "WORKTREE_GIT_DIR=$gitdir"
+        echo "WORKTREE_COMMON_DIR=$common_dir"
+        echo "WORKTREE_HEAD=$wt_head"
+        echo "WORKTREE_HEAD_REF=$wt_head_ref"
+        echo "BRANCH_TIP=$branch_tip"
+        echo "BRANCH_RECOVERY_REF=$branch_recovery_ref"
+        echo "WORKTREE_RECOVERY_REF=$wt_recovery_ref"
+      } > "$stage/tasks/$id/recovery.env" || return 1
+    fi
+    patch_tip=${wt_head:-$branch_tip}
+    if git rev-parse --verify "${base}^{commit}" >/dev/null 2>&1 \
+       && [ -n "$patch_tip" ]; then
+      git diff --binary "$base" "$patch_tip" -- . \
+        ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' \
+        > "$stage/tasks/$id/committed-product.patch" 2>/dev/null || return 1
+    fi
+    if [ -n "$wt" ] && [ -d "$wt" ]; then
+      write_worktree_untracked_manifest "$wt" "$stage/tasks/$id/untracked-files.txt" \
+        || return 1
+      git -C "$wt" diff --binary HEAD -- . \
+        ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' \
+        > "$stage/tasks/$id/uncommitted-product.patch" 2>/dev/null || return 1
+    fi
+  done
+  DISCARD_ARCHIVE_STAGE="$stage"
+  DISCARD_ARCHIVE_REL="$final"
+  return 0
+}
+
+single_commit_trailer() { # $1 commit, $2 key -> exactly one non-empty value
+  local values count
+  values=$(git show -s --format=%B "$1" 2>/dev/null \
+    | sed -n "s/^$2:[[:space:]]*//p") || return 1
+  count=$(printf '%s\n' "$values" | grep -c . || true)
+  [ "$count" -eq 1 ] || return 1
+  printf '%s' "$values"
+}
+
+record_discard_result() { # $1 status, $2 reason, $3 archive, $4 commit
+  local status="$1" reason="$2" archive="$3" commit="$4" tmp clean_reason
+  clean_reason=$(printf '%s' "$reason" | tr '\n\r\t' '   ' | cut -c1-1000)
+  [ -n "$clean_reason" ] || clean_reason="unspecified discard result"
+  tmp="$DISCARD_REQUEST_FILE.tmp.$$"
+  {
+    grep -Ev '^(PHASE|FINAL_STATUS|FINAL_REASON|ARCHIVE_REL|FINAL_COMMIT)=' \
+      "$DISCARD_REQUEST_FILE" 2>/dev/null || true
+    case "$status" in APPLIED) echo "PHASE=ROLLBACK_APPLIED" ;; *) echo "PHASE=ARCHIVE_COMMITTED" ;; esac
+    echo "FINAL_STATUS=$status"
+    printf 'FINAL_REASON=%s\n' "$clean_reason"
+    echo "ARCHIVE_REL=$archive"
+    echo "FINAL_COMMIT=$commit"
+  } > "$tmp" || return 1
+  validate_discard_request "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$DISCARD_REQUEST_FILE"
+}
+
+load_discard_result() { # 0 valid result, 1 none, 2 malformed/tampered
+  local authority="$1" status reason archive commit choice trailer_choice trailer_status trailer_archive
+  status=$(fleet_kv_get "$DISCARD_REQUEST_FILE" FINAL_STATUS "")
+  [ -n "$status" ] || return 1
+  reason=$(fleet_kv_get "$DISCARD_REQUEST_FILE" FINAL_REASON "")
+  archive=$(fleet_kv_get "$DISCARD_REQUEST_FILE" ARCHIVE_REL "")
+  commit=$(fleet_kv_get "$DISCARD_REQUEST_FILE" FINAL_COMMIT "")
+  choice=$(fleet_kv_get "$DISCARD_REQUEST_FILE" CHOICE "")
+  case "$status" in NOT_REQUESTED|NOT_NEEDED|UNAVAILABLE|APPLIED) ;; *) return 2 ;; esac
+  case "$choice:$status" in
+    keep:NOT_REQUESTED|rollback:NOT_NEEDED|rollback:UNAVAILABLE|rollback:APPLIED) ;;
+    *) return 2 ;;
+  esac
+  case "$archive" in
+    .loop/docs/run-archive/*) case "$archive" in *'..'*) return 2 ;; esac ;;
+    *) return 2 ;;
+  esac
+  git rev-parse --verify "${commit}^{commit}" >/dev/null 2>&1 || return 2
+  git merge-base --is-ancestor "$commit" HEAD >/dev/null 2>&1 || return 2
+  [ "$(single_commit_trailer "$commit" Loop-Discard-Plan-Authority 2>/dev/null || echo "")" = "$authority" ] \
+    || return 2
+  trailer_choice=$(single_commit_trailer "$commit" Loop-Discard-Choice 2>/dev/null || echo "")
+  trailer_status=$(single_commit_trailer "$commit" Loop-Discard-Status 2>/dev/null || echo "")
+  trailer_archive=$(single_commit_trailer "$commit" Loop-Discard-Archive 2>/dev/null || echo "")
+  [ "$trailer_choice" = "$choice" ] && [ "$trailer_status" = "$status" ] \
+    && [ "$trailer_archive" = "$archive" ] || return 2
+  git cat-file -e "$commit:$archive/result.env" 2>/dev/null || return 2
+  DISCARD_RECORDED_STATUS="$status"
+  DISCARD_RECORDED_REASON="$reason"
+  DISCARD_RECORDED_ARCHIVE="$archive"
+  return 0
+}
+
+reconcile_discard_result() { # recover the commit->request crash window
+  local authority="$1" choice="$2" source="$3" commit found="" status archive reason
+  if load_discard_result "$authority"; then return 0; else
+    [ "$?" -eq 1 ] || return 2
+  fi
+  for commit in $(git rev-list --first-parent "$source..HEAD" 2>/dev/null || true); do
+    [ "$(single_commit_trailer "$commit" Loop-Discard-Plan-Authority 2>/dev/null || echo "")" = "$authority" ] || continue
+    [ "$(single_commit_trailer "$commit" Loop-Discard-Choice 2>/dev/null || echo "")" = "$choice" ] || return 2
+    [ -z "$found" ] || return 2
+    found="$commit"
+  done
+  [ -n "$found" ] || return 1
+  status=$(single_commit_trailer "$found" Loop-Discard-Status 2>/dev/null || echo "")
+  archive=$(single_commit_trailer "$found" Loop-Discard-Archive 2>/dev/null || echo "")
+  case "$status" in
+    APPLIED) reason="reviewed inverse commit $found was already applied before interruption" ;;
+    NOT_REQUESTED) reason="merged product changes were retained by the fixed user choice" ;;
+    NOT_NEEDED) reason="the plan had no merged product-tree changes" ;;
+    UNAVAILABLE) reason="rollback was already recorded as unavailable; see the cancellation archive" ;;
+    *) return 2 ;;
+  esac
+  git cat-file -e "$found:$archive/result.env" 2>/dev/null || return 2
+  record_discard_result "$status" "$reason" "$archive" "$found" || return 2
+  load_discard_result "$authority"
+}
+
+write_safe_rollback_paths() { # $1 source, $2 head, $3 output; NUL-parse then reject controls
+  local source="$1" head="$2" output="$3"
+  git diff --name-only -z "$source" "$head" -- . \
+    ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' \
+    | while IFS= read -r -d '' path; do
+        case "$path" in
+          *$'\n'*|*$'\r'*|*$'\t'*) exit 42 ;;
+        esac
+        printf '%s\n' "$path"
+      done > "$output"
+}
+
+cleanup_rollback_candidate() {
+  if [ -n "${ROLLBACK_WT:-}" ] && [ -d "$ROLLBACK_WT" ]; then
+    git worktree remove --force "$ROLLBACK_WT" >/dev/null 2>&1 || true
+  fi
+  git worktree prune >/dev/null 2>&1 || true
+  if [ -n "${ROLLBACK_TMP_ROOT:-}" ] && [ -d "$ROLLBACK_TMP_ROOT" ]; then
+    rmdir "$ROLLBACK_TMP_ROOT" >/dev/null 2>&1 || true
+  fi
+  ROLLBACK_WT=""
+  ROLLBACK_TMP_ROOT=""
+}
+
+rollback_manual_peers_safe() { # $1 authority, $2 source, $3 head, $4 plan commit manifest
+  local authority="$1" source="$2" head="$3" manifest="$4"
+  local q id deps dep candidate base branch wt tip merge anchors
+  [ -s "$manifest" ] || return 0
+  for q in new claimed failed; do
+    for id in $(tasks_in "$q"); do
+      [ "$(renv_get "$id" PLANNED 0)" = "1" ] \
+        && [ "$(renv_get "$id" PLAN_AUTHORITY "")" = "$authority" ] && continue
+      deps="$(renv_get "$id" DEPENDS_ON "") $(renv_get "$id" DISCARD_CANCELLED_DEPS "")"
+      for dep in $(printf '%s' "$deps" | tr ',' ' '); do
+        [ "$(renv_get "$dep" PLANNED 0)" = "1" ] \
+          && [ "$(renv_get "$dep" PLAN_AUTHORITY "")" = "$authority" ] || continue
+        ROLLBACK_REASON="manual peer $id in $q depends on cancelled planned task $dep"
+        return 1
+      done
+      [ "$q" != new ] || continue
+      anchors=""
+      base=$(renv_get "$id" BASE_REF "")
+      branch=$(renv_get "$id" BRANCH "")
+      wt=$(renv_get "$id" WT "")
+      [ -z "$base" ] || anchors="$anchors $(git rev-parse -q --verify "${base}^{commit}" 2>/dev/null || echo unresolved)"
+      [ -z "$branch" ] || anchors="$anchors $(git rev-parse -q --verify "refs/heads/${branch}^{commit}" 2>/dev/null || echo unresolved)"
+      if [ -n "$wt" ] && [ -d "$wt" ]; then
+        anchors="$anchors $(git -C "$wt" rev-parse HEAD 2>/dev/null || echo unresolved)"
+      fi
+      [ -n "$anchors" ] \
+        || { ROLLBACK_REASON="manual peer $id in $q has no trustworthy base/head evidence"; return 1; }
+      while IFS=$'\t' read -r candidate _; do
+        [ -n "$candidate" ] || continue
+        for tip in $anchors; do
+          [ "$tip" != unresolved ] \
+            || { ROLLBACK_REASON="manual peer $id in $q has unresolved base/head evidence"; return 1; }
+          if git merge-base --is-ancestor "$candidate" "$tip" >/dev/null 2>&1; then
+            ROLLBACK_REASON="manual peer $id in $q is based on rollback candidate commit $candidate"
+            return 1
+          fi
+        done
+      done < "$manifest"
+    done
+  done
+  for id in $(tasks_in "done"); do
+    [ "$(renv_get "$id" PLANNED 0)" = "1" ] \
+      && [ "$(renv_get "$id" PLAN_AUTHORITY "")" = "$authority" ] && continue
+    merge=$(renv_get "$id" MERGE_COMMIT "")
+    [ -n "$merge" ] || continue
+    if [ "$merge" != "$source" ] \
+       && git merge-base --is-ancestor "$source" "$merge" >/dev/null 2>&1 \
+       && git merge-base --is-ancestor "$merge" "$head" >/dev/null 2>&1; then
+      ROLLBACK_REASON="manual peer $id merged after the plan source and may depend on rollback candidates"
+      return 1
+    fi
+  done
+  return 0
+}
+
+prepare_rollback_candidate() { # $1 authority, $2 source — parent stays untouched
+  local authority="$1" source="$2" head commits commit diff_rc trailer_source trailer_ref task
+  local parents commit_oid first_parent second_parent extra pre archive_pre archive_auth archive_ref merge_oid seen=0 tmp wt patch_abs net_zero=0
+  ROLLBACK_REASON=""
+  ROLLBACK_STATUS="BLOCKED"
+  ROLLBACK_HEAD=""
+  ROLLBACK_WT=""
+  ROLLBACK_TMP_ROOT=""
+  [ "$(fleet_kv_get "$PLAN_AUTHORITY_FILE" VERSION "")" = "1" ] \
+    || { ROLLBACK_REASON="legacy plan: no immutable v1 plan authority"; return 1; }
+  printf '%s\n' "$authority" | grep -Eq '^[0-9a-f]{64}$' \
+    || { ROLLBACK_REASON="plan authority is not a canonical SHA-256 token"; return 1; }
+  [ "$(current_plan_refname)" != "DETACHED" ] \
+    || { ROLLBACK_REASON="the approved plan was created on detached HEAD"; return 1; }
+  plan_ref_matches \
+    || { ROLLBACK_REASON="the current branch is not the plan's approved source branch"; return 1; }
+  git rev-parse --verify "${source}^{commit}" >/dev/null 2>&1 \
+    || { ROLLBACK_REASON="recorded plan source commit is missing"; return 1; }
+  head=$(git rev-parse HEAD 2>/dev/null) \
+    || { ROLLBACK_REASON="cannot resolve the current parent HEAD"; return 1; }
+  git merge-base --is-ancestor "$source" "$head" >/dev/null 2>&1 \
+    || { ROLLBACK_REASON="recorded plan source is no longer an ancestor of HEAD"; return 1; }
+  if git_operation_in_progress; then
+    ROLLBACK_REASON="a merge/cherry-pick/revert/rebase/bisect operation is in progress"
+    return 1
+  fi
+  [ -z "$(git status --porcelain -uno)" ] \
+    || { ROLLBACK_REASON="the parent tracked tree or index has concurrent changes"; return 1; }
+  mkdir -p .loop/fleet/rollback-review || { ROLLBACK_REASON="cannot create rollback review staging"; return 1; }
+  write_safe_rollback_paths "$source" "$head" .loop/fleet/rollback-review/changed-files.txt 2>/dev/null \
+    || { ROLLBACK_REASON="candidate paths are unreadable or contain unsupported control characters"; return 1; }
+  : > .loop/fleet/rollback-review/commit-task-set.txt \
+    || { ROLLBACK_REASON="cannot create the rollback commit/task manifest"; return 1; }
+  [ -s .loop/fleet/rollback-review/changed-files.txt ] || net_zero=1
+  if [ "$net_zero" != 1 ] && rollback_parent_untracked_conflict \
+       .loop/fleet/rollback-review/changed-files.txt \
+       .loop/fleet/rollback-review/parent-untracked-before.zlist; then
+    ROLLBACK_REASON="parent untracked/ignored path overlaps the rollback candidate: $ROLLBACK_CONFLICT_PATH"
+    return 1
+  fi
+  commits=$(git rev-list --first-parent --reverse "$source..$head" 2>/dev/null) \
+    || { ROLLBACK_REASON="cannot enumerate first-parent history from the plan source"; return 1; }
+  for commit in $commits; do
+    diff_rc=0
+    git diff --quiet "${commit}^1" "$commit" -- . \
+      ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' \
+      || diff_rc=$?
+    case "$diff_rc" in
+      0) continue ;;
+      1) ;;
+      *) ROLLBACK_REASON="cannot inspect product changes in commit $commit"; return 1 ;;
+    esac
+    seen=$((seen + 1))
+    [ "$(single_commit_trailer "$commit" Loop-Plan-Authority 2>/dev/null || echo "")" = "$authority" ] \
+      || { ROLLBACK_REASON="product commit $commit is manual, parallel, or has invalid plan provenance"; return 1; }
+    trailer_source=$(single_commit_trailer "$commit" Loop-Plan-Source 2>/dev/null || echo "")
+    [ "$trailer_source" = "$source" ] \
+      || { ROLLBACK_REASON="product commit $commit is bound to a different source"; return 1; }
+    trailer_ref=$(single_commit_trailer "$commit" Loop-Plan-Refname 2>/dev/null || echo "")
+    [ "$trailer_ref" = "$(current_plan_refname)" ] \
+      || { ROLLBACK_REASON="product commit $commit is bound to a different source branch"; return 1; }
+    task=$(single_commit_trailer "$commit" Loop-Task 2>/dev/null || echo "")
+    case "$task" in ''|*[!a-z0-9-]*) ROLLBACK_REASON="product commit $commit has an invalid task trailer"; return 1 ;; esac
+    parents=$(git rev-list --parents -n 1 "$commit" 2>/dev/null || echo "")
+    IFS=' ' read -r commit_oid first_parent second_parent extra <<EOF
+$parents
+EOF
+    [ "$commit_oid" = "$commit" ] && [ -n "$first_parent" ] \
+      && [ -n "$second_parent" ] && [ -z "$extra" ] \
+      || { ROLLBACK_REASON="product commit $commit is not one ordinary two-parent Fleet merge"; return 1; }
+    pre=$(single_commit_trailer "$commit" Loop-Pre-Merge-Head 2>/dev/null || echo "")
+    [ "$pre" = "$first_parent" ] \
+      || { ROLLBACK_REASON="product commit $commit does not bind its first parent"; return 1; }
+    [ "$(single_commit_trailer "$commit" Loop-Branch-Tip 2>/dev/null || echo "")" = "$second_parent" ] \
+      || { ROLLBACK_REASON="product commit $commit does not bind its merged branch tip"; return 1; }
+    [ -f "$DISCARD_ARCHIVE_STAGE/tasks/$task/integration-archive/integration.env" ] \
+      || { ROLLBACK_REASON="integration archive is missing for task $task"; return 1; }
+    archive_auth=$(fleet_kv_get "$DISCARD_ARCHIVE_STAGE/tasks/$task/integration-archive/integration.env" PLAN_AUTHORITY "")
+    archive_pre=$(fleet_kv_get "$DISCARD_ARCHIVE_STAGE/tasks/$task/integration-archive/integration.env" PRE_MERGE_HEAD "")
+    archive_ref=$(fleet_kv_get "$DISCARD_ARCHIVE_STAGE/tasks/$task/integration-archive/integration.env" PLAN_SOURCE_REFNAME "")
+    [ "$archive_auth" = "$authority" ] && [ "$archive_pre" = "$pre" ] \
+      && [ "$archive_ref" = "$(current_plan_refname)" ] \
+      || { ROLLBACK_REASON="integration archive disagrees with commit $commit"; return 1; }
+    merge_oid=$(fleet_kv_get "$DISCARD_ARCHIVE_STAGE/tasks/$task/run.env" MERGE_COMMIT "")
+    [ "$merge_oid" = "$commit" ] \
+      || { ROLLBACK_REASON="task $task has no exact post-commit merge receipt (possible crash/tamper)"; return 1; }
+    printf '%s\t%s\t%s\n' "$commit" "$task" "$second_parent" \
+      >> .loop/fleet/rollback-review/commit-task-set.txt \
+      || { ROLLBACK_REASON="cannot record the rollback commit/task manifest"; return 1; }
+  done
+  if [ "$seen" -eq 0 ] && [ "$net_zero" != 1 ]; then
+    ROLLBACK_REASON="product changes exist but none are attributable to this plan"
+    return 1
+  fi
+  rollback_manual_peers_safe "$authority" "$source" "$head" \
+    .loop/fleet/rollback-review/commit-task-set.txt || return 1
+  git diff --binary "$head" "$source" -- . \
+    ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' \
+    > .loop/fleet/rollback-review/rollback.patch 2>/dev/null \
+    || { ROLLBACK_REASON="cannot materialize the inverse product patch"; return 1; }
+  {
+    echo "# Fleet rollback safety review"
+    echo
+    echo "- Deterministic assessor: ELIGIBLE"
+    echo "- Plan authority: $authority"
+    echo "- Plan source: $source"
+    echo "- Current parent HEAD: $head"
+    echo "- Cancellation archive staging: $DISCARD_ARCHIVE_STAGE"
+    echo "- Attributed commit/task set: .loop/fleet/rollback-review/commit-task-set.txt"
+    echo "- Candidate changes: .loop/fleet/rollback-review/changed-files.txt"
+    echo "- Exact inverse patch: .loop/fleet/rollback-review/rollback.patch"
+    echo
+    echo "Reject this candidate if Git evidence cannot undo an external side effect,"
+    echo "if manual/parallel work may be included, or if any provenance is uncertain."
+  } > .loop/fleet/rollback-review/request.md \
+    || { ROLLBACK_REASON="cannot write the rollback review request"; return 1; }
+  if [ "$net_zero" = 1 ]; then
+    ROLLBACK_HEAD="$head"
+    if [ "$seen" -eq 0 ] && [ ! -s "$PLAN_DISPATCHED_FILE" ]; then
+      ROLLBACK_STATUS="NOT_NEEDED"
+      ROLLBACK_REASON="the plan dispatched no implementation and has no merged product changes"
+    else
+      ROLLBACK_STATUS="ELIGIBLE_NO_CHANGES"
+      ROLLBACK_REASON="the product tree already matches the plan source; independent side-effect review is still required"
+    fi
+    return 0
+  fi
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/loop-discard.XXXXXX") \
+    || { ROLLBACK_REASON="cannot create an isolated rollback directory"; return 1; }
+  wt="$tmp/worktree"
+  if ! git worktree add --detach "$wt" "$head" >/dev/null 2>&1; then
+    rmdir "$tmp" >/dev/null 2>&1 || true
+    ROLLBACK_REASON="cannot create a detached rollback worktree"
+    return 1
+  fi
+  ROLLBACK_TMP_ROOT="$tmp"
+  ROLLBACK_WT="$wt"
+  patch_abs="$(pwd)/.loop/fleet/rollback-review/rollback.patch"
+  if ! git -C "$wt" apply --index "$patch_abs" >/dev/null 2>&1; then
+    ROLLBACK_REASON="the inverse patch does not apply cleanly to the pinned HEAD"
+    cleanup_rollback_candidate
+    return 1
+  fi
+  if ! git -C "$wt" diff --quiet "$source" -- . \
+       ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex'; then
+    ROLLBACK_REASON="the isolated candidate does not exactly restore the source product tree"
+    cleanup_rollback_candidate
+    return 1
+  fi
+  ROLLBACK_HEAD="$head"
+  ROLLBACK_STATUS="ELIGIBLE"
+  ROLLBACK_REASON="all product commits and the isolated inverse candidate match plan provenance"
+  return 0
+}
+
+rollback_agent_ready() { # sets ROLLBACK_REASON on failure; no dying preflight
+  local agent model
+  agent=$(configured_agent ROLLBACK)
+  model=$(configured_role_model ROLLBACK)
+  case "$agent" in
+    codex)
+      command -v "$CODEX_CMD" >/dev/null 2>&1 \
+        || { ROLLBACK_REASON="configured rollback reviewer Codex CLI is unavailable"; return 1; }
+      [ -f .agents/skills/loop-rollback-review/SKILL.md ] \
+        || { ROLLBACK_REASON="managed Codex rollback-review skill is missing"; return 1; }
+      case "$model" in
+        opus|sonnet|haiku|fable|claude-*)
+          ROLLBACK_REASON="AGENT_ROLLBACK=codex but MODEL_ROLLBACK is a Claude alias"; return 1 ;;
+      esac ;;
+    *)
+      command -v "$CLAUDE_CMD" >/dev/null 2>&1 \
+        || { ROLLBACK_REASON="configured rollback reviewer Claude CLI is unavailable"; return 1; }
+      [ -f .claude/skills/loop-rollback-review/SKILL.md ] \
+        || { ROLLBACK_REASON="managed Claude rollback-review skill is missing"; return 1; }
+      case "$model" in
+        gpt-*) ROLLBACK_REASON="AGENT_ROLLBACK=claude but MODEL_ROLLBACK is a Codex slug"; return 1 ;;
+      esac ;;
+  esac
+  return 0
+}
+
+discard_config_is_approved() { # emergency cancellation continues, unapproved timeouts do not
+  local hash slot
+  [ -f .loop/approved ] || return 1
+  hash=$(contract_hash) || return 1
+  [ "$(cat .loop/approved 2>/dev/null || echo mismatch)" = "$hash" ] || return 1
+  [ "$(approval_home)" = repo ] && return 0
+  slot=$(approval_slot 2>/dev/null) || return 1
+  [ -f "$slot/approved" ] \
+    && [ "$(cat "$slot/approved" 2>/dev/null || echo mismatch)" = "$hash" ]
+}
+
+run_rollback_review() { # eligible deterministic candidate -> SAFE/UNSAFE only
+  local base_timeout role_timeout res verdict base n=2
+  rollback_agent_ready || return 1
+  if discard_config_is_approved; then
+    base_timeout=$(get_config_scalar MAX_ITER_SECONDS 900)
+    case "$base_timeout" in ''|*[!0-9]*|0) base_timeout=900 ;; esac
+    role_timeout=$(get_config_scalar TIMEOUT_ROLLBACK "")
+    case "$role_timeout" in ''|*[!0-9]*|0) role_timeout="" ;; esac
+  else
+    base_timeout=900
+    role_timeout=""
+    journal_append "discard" "ROLLBACK_TIMEOUT_DEFAULTED" "unapproved loop.config.sh ignored; using the 900s rollback-review default"
+  fi
+  MAX_ITER_SECONDS="$base_timeout"
+  export TIMEOUT_ROLLBACK="$role_timeout"
+  MODEL_ROLLBACK=$(configured_role_model ROLLBACK)
+  MAX_COST_USD=""
+  TASK_ID="discard"
+  RUN_ID="discard-$(date -u '+%Y%m%d-%H%M%S' 2>/dev/null || echo unknown)"
+  base="$RUN_ID"
+  mkdir -p ".loop/logs/$TASK_ID"
+  while ! mkdir ".loop/logs/$TASK_ID/$RUN_ID" 2>/dev/null; do
+    RUN_ID="$base-$n"; n=$((n + 1))
+  done
+  restore_total_cost
+  if ! run_claude "rollback-review" "/loop-rollback-review" "$MODEL_ROLLBACK" reader ROLLBACK; then
+    ROLLBACK_REASON="rollback reviewer unavailable: ${AGENT_FAIL_DIAG:-agent call failed}"
+    journal_append "discard" "ROLLBACK_REVIEW" "UNSAFE — $ROLLBACK_REASON"
+    return 1
+  fi
+  res=$(agent_result "rollback-review")
+  printf '%s\n' "$res" > "$DISCARD_ARCHIVE_STAGE/rollback-review.txt" 2>/dev/null || true
+  verdict=$(extract_verdict "$res" "ROLLBACK-REVIEW: (SAFE|UNSAFE)")
+  case "$verdict" in
+    "ROLLBACK-REVIEW: SAFE"*)
+      journal_append "discard" "ROLLBACK_REVIEW" "$verdict"
+      ROLLBACK_REASON="${verdict#ROLLBACK-REVIEW: SAFE }"
+      return 0 ;;
+    "ROLLBACK-REVIEW: UNSAFE"*)
+      ROLLBACK_REASON="${verdict#ROLLBACK-REVIEW: UNSAFE }"
+      journal_append "discard" "ROLLBACK_REVIEW" "$verdict"
+      return 1 ;;
+    *)
+      ROLLBACK_REASON="rollback reviewer returned no strict SAFE verdict"
+      journal_append "discard" "ROLLBACK_REVIEW" "UNSAFE — unparseable output"
+      return 1 ;;
+  esac
+}
+
+copy_rollback_assessment_to_archive() { # $1 status, $2 reason
+  local status="$1" reason="$2" f
+  mkdir -p "$DISCARD_ARCHIVE_STAGE/rollback-review" || return 1
+  for f in .loop/fleet/rollback-review/request.md \
+           .loop/fleet/rollback-review/commit-task-set.txt \
+           .loop/fleet/rollback-review/changed-files.txt \
+           .loop/fleet/rollback-review/parent-untracked-before.zlist \
+           .loop/fleet/rollback-review/parent-untracked-final.zlist \
+           .loop/fleet/rollback-review/rollback.patch; do
+    [ -f "$f" ] || continue
+    cp "$f" "$DISCARD_ARCHIVE_STAGE/rollback-review/" || return 1
+  done
+  {
+    echo "STATUS=$status"
+    printf 'REASON=%s\n' "$(printf '%s' "$reason" | tr '\n' ' ' | cut -c1-1000)"
+    echo "ASSESSED_AT=$(utcnow)"
+  } > "$DISCARD_ARCHIVE_STAGE/rollback-assessment.env"
+}
+
+remove_discard_archive_stage() {
+  case "${DISCARD_ARCHIVE_STAGE:-}" in
+    "$FLEET_DIR"/discard-archive-stage.*)
+      rm -rf -- "$DISCARD_ARCHIVE_STAGE" 2>/dev/null || true ;;
+  esac
+  DISCARD_ARCHIVE_STAGE=""
+}
+
+cleanup_keep_candidate() {
+  if [ -n "${KEEP_WT:-}" ] && [ -d "$KEEP_WT" ]; then
+    git worktree remove --force "$KEEP_WT" >/dev/null 2>&1 || true
+  fi
+  git worktree prune >/dev/null 2>&1 || true
+  if [ -n "${KEEP_TMP_ROOT:-}" ] && [ -d "$KEEP_TMP_ROOT" ]; then
+    rmdir "$KEEP_TMP_ROOT" >/dev/null 2>&1 || true
+  fi
+  KEEP_WT=""
+  KEEP_TMP_ROOT=""
+}
+
+publish_discard_archive_keep() { # $1 status, $2 reason — product tree unchanged
+  local status="$1" reason="$2" short tracked_plan=0 choice parent tmp wt candidate current
+  KEEP_WT=""
+  KEEP_TMP_ROOT=""
+  copy_rollback_assessment_to_archive "$status" "$reason" || return 1
+  parent=$(fleet_kv_get "$DISCARD_ARCHIVE_STAGE/discard.env" PARENT_BEFORE "")
+  if [ -z "$parent" ] \
+     || [ "$(git rev-parse HEAD 2>/dev/null || echo "")" != "$parent" ] \
+     || ! plan_ref_matches \
+     || git_operation_in_progress; then
+    return 1
+  fi
+  {
+    echo "FINAL_STATUS=$status"
+    printf 'FINAL_REASON=%s\n' "$(printf '%s' "$reason" | tr '\n' ' ' | cut -c1-1000)"
+    echo "PARENT_AFTER=$parent"
+    echo "FINALIZED_AT=$(utcnow)"
+  } > "$DISCARD_ARCHIVE_STAGE/result.env" || return 1
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/loop-discard-keep.XXXXXX") || return 1
+  wt="$tmp/worktree"
+  git worktree add --detach "$wt" "$parent" >/dev/null 2>&1 \
+    || { rmdir "$tmp" >/dev/null 2>&1 || true; return 1; }
+  KEEP_TMP_ROOT="$tmp"
+  KEEP_WT="$wt"
+  mkdir -p "$wt/$(dirname "$DISCARD_ARCHIVE_REL")" \
+    || { cleanup_keep_candidate; return 1; }
+  cp -R "$DISCARD_ARCHIVE_STAGE" "$wt/$DISCARD_ARCHIVE_REL" \
+    || { cleanup_keep_candidate; return 1; }
+  git -C "$wt" ls-files --error-unmatch .loop/docs/task-plan.md >/dev/null 2>&1 \
+    && tracked_plan=1
+  rm -f "$wt/.loop/docs/task-plan.md"
+  if [ "$tracked_plan" = 1 ]; then
+    git -C "$wt" add -A -- "$DISCARD_ARCHIVE_REL" .loop/docs/task-plan.md 2>/dev/null \
+      || { cleanup_keep_candidate; return 1; }
+  else
+    git -C "$wt" add -A -- "$DISCARD_ARCHIVE_REL" 2>/dev/null \
+      || { cleanup_keep_candidate; return 1; }
+  fi
+  short=$(printf '%s' "$(current_plan_authority)" | cut -c1-12)
+  choice=$(fleet_kv_get "$DISCARD_REQUEST_FILE" CHOICE "")
+  git -C "$wt" -c core.hooksPath=/dev/null commit -q \
+    -m "fleet: discard plan $short — keep product changes" \
+    -m "Loop-Discard-Plan-Authority: $(current_plan_authority)
+Loop-Discard-Choice: $choice
+Loop-Discard-Status: $status
+Loop-Discard-Archive: $DISCARD_ARCHIVE_REL
+Loop-Discard-Parent: $parent" \
+    || { cleanup_keep_candidate; return 1; }
+  candidate=$(git -C "$wt" rev-parse HEAD) \
+    || { cleanup_keep_candidate; return 1; }
+  current=$(git rev-parse HEAD 2>/dev/null || echo "")
+  if [ "$current" != "$parent" ] || ! plan_ref_matches \
+     || git_operation_in_progress \
+     || ! git diff --quiet -- .loop/docs/task-plan.md \
+     || ! git diff --cached --quiet -- .loop/docs/task-plan.md \
+     || [ -e "$DISCARD_ARCHIVE_REL" ]; then
+    cleanup_keep_candidate
+    return 1
+  fi
+  git -c core.hooksPath=/dev/null merge --ff-only "$candidate" >/dev/null 2>&1 \
+    || { cleanup_keep_candidate; return 1; }
+  DISCARD_ARCHIVE_COMMIT=$(git rev-parse HEAD)
+  record_discard_result "$status" "$reason" "$DISCARD_ARCHIVE_REL" "$DISCARD_ARCHIVE_COMMIT" \
+    || journal_append "discard" "DISCARD_RECEIPT_REPAIR_NEEDED" "archive committed at $DISCARD_ARCHIVE_COMMIT; retry reconciles trailers"
+  cleanup_keep_candidate
+  remove_discard_archive_stage
+  return 0
+}
+
+finalize_rollback_candidate() { # reviewer SAFE; one inverse commit, parent FF only
+  local authority="$1" source="$2" short candidate parent_now
+  [ -n "${ROLLBACK_WT:-}" ] && [ -d "$ROLLBACK_WT" ] \
+    || { ROLLBACK_REASON="isolated rollback worktree disappeared after review"; return 1; }
+  copy_rollback_assessment_to_archive SAFE "$ROLLBACK_REASON" \
+    || { ROLLBACK_REASON="could not archive the SAFE rollback assessment"; return 1; }
+  {
+    echo "FINAL_STATUS=ROLLED_BACK"
+    echo "PLAN_AUTHORITY=$authority"
+    echo "PLAN_SOURCE_REF=$source"
+    echo "PARENT_BEFORE=$ROLLBACK_HEAD"
+    printf 'REVIEW_REASON=%s\n' "$(printf '%s' "$ROLLBACK_REASON" | tr '\n' ' ' | cut -c1-1000)"
+    echo "FINALIZED_AT=$(utcnow)"
+  } > "$DISCARD_ARCHIVE_STAGE/result.env" \
+    || { ROLLBACK_REASON="could not write the rollback result receipt"; return 1; }
+  mkdir -p "$ROLLBACK_WT/$(dirname "$DISCARD_ARCHIVE_REL")" \
+    || { ROLLBACK_REASON="could not create the rollback archive destination"; return 1; }
+  cp -R "$DISCARD_ARCHIVE_STAGE" "$ROLLBACK_WT/$DISCARD_ARCHIVE_REL" \
+    || { ROLLBACK_REASON="could not copy the cancellation archive into the rollback candidate"; return 1; }
+  rm -f "$ROLLBACK_WT/.loop/docs/task-plan.md"
+  git -C "$ROLLBACK_WT" add -A -- .loop/docs \
+    || { ROLLBACK_REASON="could not stage the rollback archive and task-plan deletion"; return 1; }
+  if ! git -C "$ROLLBACK_WT" diff --quiet "$source" -- . \
+       ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex'; then
+    ROLLBACK_REASON="candidate product tree changed after the read-only review"
+    return 1
+  fi
+  short=$(printf '%s' "$authority" | cut -c1-12)
+  git -C "$ROLLBACK_WT" -c core.hooksPath=/dev/null commit -q \
+    -m "fleet: discard rollback $short" \
+    -m "Loop-Rollback-Plan-Authority: $authority
+Loop-Rollback-Source: $source
+Loop-Rollback-Parent: $ROLLBACK_HEAD
+Loop-Discard-Plan-Authority: $authority
+Loop-Discard-Choice: rollback
+Loop-Discard-Status: APPLIED
+Loop-Discard-Archive: $DISCARD_ARCHIVE_REL
+Loop-Discard-Parent: $ROLLBACK_HEAD" \
+    || { ROLLBACK_REASON="could not create the isolated inverse commit"; return 1; }
+  candidate=$(git -C "$ROLLBACK_WT" rev-parse HEAD) \
+    || { ROLLBACK_REASON="could not resolve the isolated inverse commit"; return 1; }
+  parent_now=$(git rev-parse HEAD 2>/dev/null || echo "")
+  [ "$parent_now" = "$ROLLBACK_HEAD" ] \
+    || { ROLLBACK_REASON="parent HEAD changed while the rollback candidate was reviewed"; return 1; }
+  [ -z "$(git status --porcelain -uno)" ] \
+    || { ROLLBACK_REASON="parent tracked tree changed while the rollback candidate was reviewed"; return 1; }
+  plan_ref_matches \
+    || { ROLLBACK_REASON="parent branch changed while the rollback candidate was reviewed"; return 1; }
+  ! git_operation_in_progress \
+    || { ROLLBACK_REASON="a Git operation began while the rollback candidate was reviewed"; return 1; }
+  if rollback_parent_untracked_conflict \
+       .loop/fleet/rollback-review/changed-files.txt \
+       .loop/fleet/rollback-review/parent-untracked-final.zlist; then
+    ROLLBACK_REASON="parent untracked/ignored path appeared under the reviewed rollback candidate: $ROLLBACK_CONFLICT_PATH"
+    return 1
+  fi
+  git -c core.hooksPath=/dev/null merge --ff-only "$candidate" >/dev/null 2>&1 \
+    || { ROLLBACK_REASON="parent could not fast-forward to the reviewed inverse commit"; return 1; }
+  ROLLBACK_COMMIT=$(git rev-parse HEAD)
+  record_discard_result APPLIED "$ROLLBACK_REASON" "$DISCARD_ARCHIVE_REL" "$ROLLBACK_COMMIT" \
+    || journal_append "discard" "DISCARD_RECEIPT_REPAIR_NEEDED" "rollback applied at $ROLLBACK_COMMIT; retry reconciles trailers"
+  cleanup_rollback_candidate
+  remove_discard_archive_stage
+  return 0
+}
+
+discard_task_archive_get() { # committed run.env is the cleanup authority
+  fleet_kv_get "$DISCARD_ARCHIVE_REL/tasks/$1/run.env" "$2" "${3:-}"
+}
+
+discard_task_recovery_get() { # committed archive is the cleanup authority
+  fleet_kv_get "$DISCARD_ARCHIVE_REL/tasks/$1/recovery.env" "$2" "${3:-}"
+}
+
+worker_managed_state_matches_archive() { # $1 id, $2 worker; detects post-stage drift
+  local id="$1" wt="$2" f live archived
+  for f in loop.sh loop.config.sh loop.models.sh loop-instruction.md \
+           fleet.sh fleet.config.sh; do
+    live="$wt/$f"
+    archived="$DISCARD_ARCHIVE_REL/tasks/$id/worker-managed-state/$f"
+    if [ -L "$live" ] || [ -L "$archived" ]; then
+      [ -L "$live" ] && [ -L "$archived" ] \
+        && [ "$(readlink "$live" 2>/dev/null || echo live-mismatch)" = \
+             "$(readlink "$archived" 2>/dev/null || echo archive-mismatch)" ] \
+        || return 1
+    elif [ -e "$live" ] || [ -e "$archived" ]; then
+      [ -f "$live" ] && [ -f "$archived" ] && cmp -s "$live" "$archived" \
+        || return 1
+    fi
+  done
+  return 0
+}
+
+discard_target_ids() { # live indices plus the committed cancellation manifest
+  local authority="$1" id dir seen=""
+  for id in $(planned_ids_for_authority "$authority"); do
+    seen="$seen $id"
+    printf '%s\n' "$id"
+  done
+  [ -n "${DISCARD_ARCHIVE_REL:-}" ] || return 0
+  for dir in "$DISCARD_ARCHIVE_REL"/tasks/*; do
+    [ -d "$dir" ] || continue
+    id=${dir##*/}
+    case "$id" in ''|*[!a-z0-9-]*) continue ;; esac
+    case " $seen " in *" $id "*) continue ;; esac
+    [ "$(fleet_kv_get "$dir/run.env" PLAN_AUTHORITY "")" = "$authority" ] || continue
+    seen="$seen $id"
+    printf '%s\n' "$id"
+  done
+}
+
+discard_live_state_matches_archive() { # $1 id — absence is an idempotent partial cleanup
+  local id="$1" qd archived_qd live_task archive_task live_env archive_env
+  qd=$(task_qdir "$id")
+  archived_qd=$(cat "$DISCARD_ARCHIVE_REL/tasks/$id/queue-state" 2>/dev/null || echo "")
+  if [ -n "$qd" ]; then
+    [ "$qd" = "$archived_qd" ] || return 1
+    live_task="$QUEUE_DIR/$qd/$id.md"
+    archive_task="$DISCARD_ARCHIVE_REL/tasks/$id/task.md"
+    [ -f "$live_task" ] && [ -f "$archive_task" ] \
+      && cmp -s "$live_task" "$archive_task" || return 1
+  fi
+  live_env="$RUNS_DIR/$id.env"
+  archive_env="$DISCARD_ARCHIVE_REL/tasks/$id/run.env"
+  if [ -e "$live_env" ]; then
+    [ -f "$live_env" ] && [ -f "$archive_env" ] \
+      && cmp -s "$live_env" "$archive_env" || return 1
+  fi
+  return 0
+}
+
+preserve_discard_file() { # $1 live file, $2 quarantine file — publish before unlink
+  local source="$1" target="$2"
+  [ -e "$source" ] || return 0
+  if [ -e "$target" ]; then
+    cmp -s "$source" "$target" || return 1
+  else
+    ln "$source" "$target" 2>/dev/null || return 1
+  fi
+  rm -f "$source" || return 1
+  [ ! -e "$source" ]
+}
+
+quarantine_discard_task_state() { # $1 authority, $2 id — recoverable queue drift
+  local authority="$1" id="$2" qd dir tmp
+  case "$authority" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "$id" in ''|*[!a-z0-9-]*) return 1 ;; esac
+  dir="$FLEET_DIR/discard-quarantine/$authority/$id"
+  mkdir -p "$dir" || return 1
+  qd=$(task_qdir "$id")
+  if [ -n "$qd" ]; then
+    preserve_discard_file "$QUEUE_DIR/$qd/$id.md" "$dir/queue-$qd.md" || return 1
+  fi
+  preserve_discard_file "$RUNS_DIR/$id.env" "$dir/run.env" || return 1
+  if [ ! -e "$dir/quarantine.env" ]; then
+    tmp="$dir/quarantine.env.tmp.$$"
+    {
+      echo "PLAN_AUTHORITY=$authority"
+      echo "TASK_ID=$id"
+      echo "ARCHIVE_REL=$DISCARD_ARCHIVE_REL"
+      echo "QUARANTINED_AT=$(utcnow)"
+      echo "REASON=live queue or run metadata changed after discard archive staging"
+    } > "$tmp" || return 1
+    ln "$tmp" "$dir/quarantine.env" 2>/dev/null || [ -e "$dir/quarantine.env" ] \
+      || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+  fi
+  return 0
+}
+
+discard_plan_execution_state() { # $1 authority — queue authority removed even if artifacts quarantine
+  local authority="$1" id qd wt branch slot_ok ids expected_tip expected_wt expected_gitdir
+  local expected_common expected_head expected_head_ref branch_recovery_ref wt_recovery_ref
+  local current_tip current_gitdir current_common current_head current_head_ref expected_ref branch_ref
+  local branch_pin_ok wt_pin_ok parent_common deterministic_wt target_ok
+  DISCARD_CLEANUP_WARN=""
+  parent_common=$(resolved_git_dir . --git-common-dir 2>/dev/null) || return 1
+  ids=$(discard_target_ids "$authority")
+  # First pass is non-destructive: never partially clean while one target loop
+  # is still alive underneath us.
+  for id in $ids; do
+    case "$(renv_get "$id" PHASE "")" in
+      CONTRACT_GEN|RUNNING) task_pid_alive "$id" && return 1 ;;
+    esac
+  done
+  # The committed archive is a delete receipt, not a license to delete a newer
+  # task with the same id. Move any post-staging drift out of the active queue.
+  for id in $ids; do
+    if ! discard_live_state_matches_archive "$id"; then
+      quarantine_discard_task_state "$authority" "$id" || return 1
+      DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN queue-drift:$id"
+    fi
+  done
+  for id in $ids; do
+    qd=$(task_qdir "$id")
+    wt=$(discard_task_archive_get "$id" WT "")
+    branch=$(discard_task_archive_get "$id" BRANCH "")
+    slot_ok=1
+    branch_pin_ok=1
+    wt_pin_ok=1
+    target_ok=1
+    deterministic_wt=$(wt_path "$id")
+    expected_tip=$(discard_task_recovery_get "$id" BRANCH_TIP "")
+    expected_wt=$(discard_task_recovery_get "$id" WORKTREE "")
+    expected_gitdir=$(discard_task_recovery_get "$id" WORKTREE_GIT_DIR "")
+    expected_common=$(discard_task_recovery_get "$id" WORKTREE_COMMON_DIR "")
+    expected_head=$(discard_task_recovery_get "$id" WORKTREE_HEAD "")
+    expected_head_ref=$(discard_task_recovery_get "$id" WORKTREE_HEAD_REF "")
+    branch_recovery_ref=$(discard_task_recovery_get "$id" BRANCH_RECOVERY_REF "")
+    wt_recovery_ref=$(discard_task_recovery_get "$id" WORKTREE_RECOVERY_REF "")
+    if [ -n "$wt$branch" ]; then
+      if [ "$branch" != "loop/$id" ]; then
+        target_ok=0
+        DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN branch-target:${branch:-missing}"
+      fi
+      if [ -n "$wt" ] \
+         && { [ "$wt" != "$deterministic_wt" ] \
+              || [ "$expected_wt" != "$deterministic_wt" ] \
+              || [ "$expected_common" != "$parent_common" ] \
+              || [ "$expected_head_ref" != "refs/heads/loop/$id" ]; }; then
+        target_ok=0
+        DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN worktree-target:$wt"
+      fi
+    fi
+    if [ -n "$branch" ]; then
+      expected_ref=$(discard_recovery_ref "$authority" "$id" "$expected_tip")
+      if [ -z "$expected_tip" ] || [ "$branch_recovery_ref" != "$expected_ref" ] \
+         || [ "$(git rev-parse -q --verify "$branch_recovery_ref" 2>/dev/null || echo "")" != "$expected_tip" ]; then
+        branch_pin_ok=0
+        DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN recovery-pin:$id"
+      fi
+    fi
+    if [ -n "$wt" ]; then
+      expected_ref=$(discard_recovery_ref "$authority" "$id" "$expected_head")
+      if [ -z "$expected_head" ] || [ "$wt_recovery_ref" != "$expected_ref" ] \
+         || [ "$(git rev-parse -q --verify "$wt_recovery_ref" 2>/dev/null || echo "")" != "$expected_head" ]; then
+        wt_pin_ok=0
+        DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN worktree-recovery-pin:$id"
+      fi
+    fi
+    if [ -n "$wt" ] && [ -d "$wt" ]; then
+      current_gitdir=$(resolved_git_dir "$wt" --git-dir 2>/dev/null || echo "")
+      current_common=$(resolved_git_dir "$wt" --git-common-dir 2>/dev/null || echo "")
+      current_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "")
+      current_head_ref=$(git -C "$wt" symbolic-ref -q HEAD 2>/dev/null || printf '%s' DETACHED)
+      if [ -n "$branch" ]; then
+        current_tip=$(git rev-parse -q --verify "refs/heads/$branch" 2>/dev/null || echo "")
+        if [ "$branch_pin_ok" != 1 ] || [ "$current_tip" != "$expected_tip" ]; then
+          slot_ok=0
+          DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN branch-advanced:$branch"
+        fi
+      fi
+      if [ "$target_ok" != 1 ] || [ "$wt_pin_ok" != 1 ] || [ "$expected_wt" != "$wt" ] \
+         || [ -z "$expected_gitdir" ] || [ "$current_gitdir" != "$expected_gitdir" ] \
+         || [ -z "$expected_common" ] || [ "$current_common" != "$expected_common" ] \
+         || [ "$current_head" != "$expected_head" ] \
+         || [ "$current_head_ref" != "$expected_head_ref" ]; then
+        slot_ok=0
+        DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN worktree-identity:$wt"
+      elif ! worker_managed_state_matches_archive "$id" "$wt"; then
+        slot_ok=0
+        DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN managed-state:$wt"
+      elif worktree_has_untracked_or_ignored "$wt"; then
+        slot_ok=0
+        DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN untracked-or-ignored:$wt"
+      elif ! git -C "$wt" diff --quiet -- 2>/dev/null \
+           || ! git -C "$wt" diff --cached --quiet -- 2>/dev/null; then
+        slot_ok=0
+        DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN tracked-changes:$wt"
+      fi
+      if [ "$slot_ok" = 1 ]; then
+        discard_worktree_slot "$wt" || slot_ok=0
+        [ "$slot_ok" = 1 ] \
+          || DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN approval-slot:$wt"
+      else
+        :
+      fi
+      if [ "$slot_ok" = 1 ]; then
+        git worktree remove "$wt" >/dev/null 2>&1 || true
+      fi
+      if [ -d "$wt" ]; then
+        DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN worktree:$wt"
+      fi
+    fi
+    if [ -n "$branch" ] && [ ! -d "$wt" ]; then
+      branch_ref="refs/heads/$branch"
+      current_tip=$(git rev-parse -q --verify "$branch_ref" 2>/dev/null || echo "")
+      if [ -n "$current_tip" ]; then
+        if [ "$target_ok" = 1 ] && [ "$branch_pin_ok" = 1 ] \
+           && [ "$branch" = "loop/$id" ] \
+           && [ "$current_tip" = "$expected_tip" ] \
+           && [ "$(git symbolic-ref -q HEAD 2>/dev/null || echo "")" != "$branch_ref" ]; then
+          git update-ref -d "$branch_ref" "$expected_tip" >/dev/null 2>&1 || true
+        else
+          DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN branch-advanced:$branch"
+        fi
+      fi
+    fi
+    if [ -n "$branch" ] && git rev-parse -q --verify "refs/heads/$branch" >/dev/null 2>&1; then
+      DISCARD_CLEANUP_WARN="$DISCARD_CLEANUP_WARN branch:$branch"
+    fi
+    if [ -n "$qd" ]; then
+      rm -f "$QUEUE_DIR/$qd/$id.md" || return 1
+      [ ! -e "$QUEUE_DIR/$qd/$id.md" ] || return 1
+    fi
+    rm -f "$RUNS_DIR/$id.env" || return 1
+    [ ! -e "$RUNS_DIR/$id.env" ] || return 1
+    journal "$id" PLAN_DISCARDED "queue/env authority removed; cancellation archive: $DISCARD_ARCHIVE_REL"
+  done
+  git worktree prune >/dev/null 2>&1 || true
+  rm -rf -- .loop/fleet/plan .loop/fleet/plan-candidate \
+    .loop/fleet/fixup-plan .loop/fleet/rollback-review || return 1
+  rm -f .loop/fleet/enqueue-pending .loop/fleet/fixup.md .loop/fleet/fixup.err \
+    .loop/fleet/fixup-count .loop/fleet/replan-count .loop/fleet/plan-review-count \
+    .loop/fleet/manual-manifest.md "$MERGE_OWNER_FILE" \
+    "$FLEET_DIR/discard-merge-abort.patch" .loop/decompose-approved \
+    .loop/decompose-feedback.md .loop/decompose-review-feedback.md || return 1
+  return 0
+}
+
+finish_discard() { # $1 authority, $2 archive, $3 status, $4 reason, $5 rc
+  local authority="$1" archive="$2" status="$3" reason="$4" rc="$5"
+  load_discard_result "$authority" \
+    || fdie_next "the final discard receipt is missing or invalid; the request marker was retained" "rerun ./loop.sh discard $(discard_choice_flag "$(fleet_kv_get "$DISCARD_REQUEST_FILE" CHOICE keep)")"
+  [ "$DISCARD_RECORDED_STATUS" = "$status" ] \
+    && [ "$DISCARD_RECORDED_ARCHIVE" = "$archive" ] \
+    || fdie_next "the final discard receipt disagrees with the cleanup result; the request marker was retained" "inspect $DISCARD_REQUEST_FILE and git log; then rerun the fixed discard choice"
+  reason="$DISCARD_RECORDED_REASON"
+  rm -f .loop/run-checkpoint .loop/run.pid .loop/run.heartbeat .loop/run-claim.pid
+  echo CANCELLED > .loop/state
+  echo 0 > .loop/last-cost
+  echo 0 > .loop/last-turns
+  journal "-" PLAN_DISCARD_COMPLETE "authority=$authority status=$status archive=$archive"
+  journal_append "final" "CANCELLED" "$status — $reason; archive: $archive"
+  # Linearization point: only after queue authority, root state and both journals
+  # are durable may a future run stop seeing the cancellation request.
+  rm -f "$PLAN_DISPATCHED_FILE" \
+    || fdie_next "could not remove the dispatched-plan marker; discard remains pending" "fix permissions, then rerun ./loop.sh discard $(discard_choice_flag "$(fleet_kv_get "$DISCARD_REQUEST_FILE" CHOICE keep)")"
+  [ ! -e "$PLAN_DISPATCHED_FILE" ] \
+    || fdie_next "the dispatched-plan marker survived cleanup; discard remains pending" "inspect $PLAN_DISPATCHED_FILE, then rerun the fixed discard choice"
+  rm -f "$PLAN_AUTHORITY_FILE" \
+    || fdie_next "could not retire plan authority; discard remains pending" "fix permissions, then rerun the fixed discard choice"
+  [ ! -e "$PLAN_AUTHORITY_FILE" ] \
+    || fdie_next "plan authority survived cleanup; discard remains pending" "inspect $PLAN_AUTHORITY_FILE, then rerun the fixed discard choice"
+  rm -f "$DISCARD_REQUEST_FILE" \
+    || fdie_next "discard completed but its request marker could not be retired" "fix permissions, then rerun the same discard command"
+  ! discard_request_present \
+    || fdie_next "discard request marker survived finalization" "inspect $DISCARD_REQUEST_FILE, then rerun the same discard command"
+  echo
+  echo "══════════════════════════════════════════════════"
+  echo " RESULT: CANCELLED"
+  echo " planned implementation queue removed as one unit"
+  echo " rollback: $status — $reason"
+  echo " archive:  $archive"
+  if [ -n "${DISCARD_CLEANUP_WARN:-}" ]; then
+    echo " quarantined artifact(s):${DISCARD_CLEANUP_WARN}"
+    echo " next: inspect/save those worktrees and .loop/fleet/discard-quarantine; then run ./loop.sh fleet clean --orphans"
+    rc=4
+  else
+    echo " next: ./loop.sh start \"<next requirement>\""
+  fi
+  if [ -n "$(tasks_in new)$(tasks_in claimed)$(tasks_in failed)" ]; then
+    echo " manual side-task(s) were retained/parked: ./loop.sh fleet status"
+  fi
+  echo "══════════════════════════════════════════════════"
+  exit "$rc"
+}
+
+cmd_discard() {
+  need_project
+  ensure_fleet_dirs
+  # authority hashing and WAL validation need these from the first check on —
+  # fail at the command boundary, never mid-transaction (same posture as
+  # cmd_decompose / cmd_approve)
+  need_sha
+  need_awk
+  local choice="" seen_rollback=0 seen_keep=0 a authority source request_choice
+  local rollback_status rollback_reason choice_flag result_rc rc=0
+  while [ $# -gt 0 ]; do
+    a="$1"; shift
+    case "$a" in
+      --rollback) seen_rollback=1; choice=rollback ;;
+      --keep-changes) seen_keep=1; choice=keep ;;
+      *) fdie_next "unknown discard option: $a" "use ./loop.sh discard --rollback or ./loop.sh discard --keep-changes" ;;
+    esac
+  done
+  [ "$seen_rollback" = 0 ] || [ "$seen_keep" = 0 ] \
+    || fdie_next "--rollback and --keep-changes are mutually exclusive" "choose exactly one: ./loop.sh discard --rollback | ./loop.sh discard --keep-changes"
+  # Refuse a brand-new non-interactive transaction before legacy authority
+  # adoption or any other cancellation metadata is written. A pending request
+  # is handled below because it may already carry the durable fixed choice.
+  if [ -z "$choice" ] && [ ! -t 0 ] && ! discard_request_present; then
+    fdie_next "non-interactive discard requires an explicit rollback choice (nothing else was mutated)" "./loop.sh discard --keep-changes   # or: ./loop.sh discard --rollback"
+  fi
+  acquire_plan_mutation_lock \
+    || fdie_next "could not acquire the plan mutation barrier; no new discard request was published" "wait for a live boundary; if none is live, ./loop.sh fleet unlock; then retry ./loop.sh discard${choice:+ $(discard_choice_flag "$choice")}"
+  trap release_plan_mutation_lock EXIT
+  active_plan_for_discard \
+    || fdie_next "there is no active planned Fleet orchestration to discard" "inspect current work: ./loop.sh status"
+  if discard_request_present; then
+    validate_discard_request \
+      || fdie_next "the durable discard request is malformed or internally inconsistent" "inspect $DISCARD_REQUEST_FILE; keep it in place and do not run other queue commands"
+    if [ -z "$(current_plan_authority)" ]; then
+      restore_plan_authority_from_discard_request \
+        || fdie_next "discard authority is missing and the request cannot safely reconstruct it" "inspect $DISCARD_REQUEST_FILE and the committed discard archive; do not create a legacy authority"
+    fi
+    validate_plan_authority_for_discard \
+      || fdie_next "the plan authority record is malformed or fails its immutable hash binding" "inspect $PLAN_AUTHORITY_FILE; no worker was stopped"
+    discard_request_matches_authority \
+      || fdie_next "discard request and plan authority disagree" "inspect $DISCARD_REQUEST_FILE and $PLAN_AUTHORITY_FILE; do not run other queue commands"
+  elif [ -z "$(current_plan_authority)" ]; then
+    adopt_legacy_plan_for_discard \
+      || fdie_next "the active legacy plan could not be assigned cancellation authority" "inspect .loop/fleet and retry: ./loop.sh discard --keep-changes"
+  fi
+  case "$(fleet_kv_get "$PLAN_AUTHORITY_FILE" VERSION "")" in
+    0) reconcile_legacy_plan_for_discard \
+         || fdie_next "legacy plan authority is partial or conflicts with a task binding" "inspect $PLAN_AUTHORITY_FILE and runs/*.env; conflicting non-empty bindings were not overwritten" ;;
+    1) ;;
+    *) fdie_next "plan authority has an unsupported VERSION" "inspect $PLAN_AUTHORITY_FILE; keep the planned queue intact" ;;
+  esac
+  validate_plan_authority_for_discard \
+    || fdie_next "the plan authority record is malformed or fails its immutable hash binding" "inspect $PLAN_AUTHORITY_FILE; no worker was stopped"
+  if discard_request_present; then
+    upgrade_discard_request_v1 \
+      || fdie_next "the existing discard request could not be upgraded to a self-contained WAL" "inspect $DISCARD_REQUEST_FILE and $PLAN_AUTHORITY_FILE; no worker was stopped"
+    if ! validate_discard_request || ! discard_request_matches_authority; then
+      fdie_next "the upgraded discard request does not match plan authority" "inspect $DISCARD_REQUEST_FILE and $PLAN_AUTHORITY_FILE; no worker was stopped"
+    fi
+  fi
+  authority=$(current_plan_authority)
+  validate_bound_plan_for_discard "$authority" \
+    || fdie_next "planned tasks are not consistently bound to the discard authority/source" "inspect ./loop.sh fleet status and $PLAN_AUTHORITY_FILE; no queue entry was deleted"
+  source=$(current_plan_source_ref)
+  request_choice=$(fleet_kv_get "$DISCARD_REQUEST_FILE" CHOICE "")
+  case "$request_choice" in
+    rollback|keep)
+      [ -z "$choice" ] || [ "$choice" = "$request_choice" ] \
+        || fdie_next "this discard transaction already fixed CHOICE=$request_choice; it cannot be changed on retry" "rerun ./loop.sh discard $(discard_choice_flag "$request_choice")"
+      choice="$request_choice" ;;
+    ""|pending) ;;
+    *) fdie_next "the durable discard request has an invalid CHOICE='$request_choice'" "inspect $DISCARD_REQUEST_FILE; do not run other queue commands" ;;
+  esac
+  if [ -z "$choice" ] && [ ! -t 0 ]; then
+    fdie_next "non-interactive discard requires an explicit rollback choice (nothing else was mutated)" "./loop.sh discard --keep-changes   # or: ./loop.sh discard --rollback"
+  fi
+  request_choice="${choice:-pending}"
+  choice_flag=$(discard_choice_flag "$choice")
+  publish_discard_request "$authority" "$request_choice" \
+    || fdie_next "could not publish the durable discard request (nothing was deleted)" "inspect $DISCARD_REQUEST_FILE, then retry ./loop.sh discard"
+  release_plan_mutation_lock
+  trap - EXIT
+  journal "-" PLAN_DISCARD_REQUESTED "authority=$authority choice=$request_choice"
+  if ! stop_discard_processes "$authority"; then
+    fdie_next "discard request is durable, but one attributed loop did not stop safely${DISCARD_STOP_SURVIVORS:+ — still live: $DISCARD_STOP_SURVIVORS}" "stop it (kill <pid> above; fleet stop is barred while the request is pending), then rerun ./loop.sh discard $choice_flag"
+  fi
+  acquire_lock
+  trap release_lock EXIT
+  if ! validate_discard_request || ! discard_request_matches_authority; then
+    fdie_next "discard authority changed before the supervisor lock was acquired" "inspect $DISCARD_REQUEST_FILE and ./loop.sh status"
+  fi
+  plan_ref_matches \
+    || fdie_next "the checked-out branch no longer matches the plan's recorded source branch ($(current_plan_refname))" "checkout that branch without rewriting history, then rerun ./loop.sh discard $choice_flag"
+  abort_owned_discard_merge "$authority" \
+    || fdie_next "an unrelated or unattributable Git merge is in progress; it was not aborted" "resolve/abort that merge, then rerun ./loop.sh discard $choice_flag"
+  ! git_operation_in_progress \
+    || fdie_next "an unrelated Git merge/cherry-pick/revert/rebase/bisect is in progress; discard will not commit into it" "finish or abort that Git operation, then rerun ./loop.sh discard $choice_flag"
+  park_manual_discard_peers "$authority" \
+    || fdie_next "a manual side-task is still live and could not be parked" "stop it, then rerun ./loop.sh discard $choice_flag"
+  park_manual_discard_dependents "$authority" \
+    || fdie_next "a manual side-task could not be parked after its planned dependency was cancelled" "inspect ./loop.sh fleet status, then rerun ./loop.sh discard $choice_flag"
+  if [ -n "$choice" ]; then
+    result_rc=0
+    reconcile_discard_result "$authority" "$choice" "$source" || result_rc=$?
+    case "$result_rc" in
+      0)
+        DISCARD_ARCHIVE_REL="$DISCARD_RECORDED_ARCHIVE"
+        rollback_status="$DISCARD_RECORDED_STATUS"
+        rollback_reason="$DISCARD_RECORDED_REASON"
+        [ "$rollback_status" != "UNAVAILABLE" ] || rc=4
+        discard_plan_execution_state "$authority" \
+          || fdie_next "the recorded cancellation result is safe, but a target task is still live" "stop it, then rerun ./loop.sh discard $choice_flag"
+        finish_discard "$authority" "$DISCARD_ARCHIVE_REL" "$rollback_status" "$rollback_reason" "$rc" ;;
+      1) ;; # no irreversible result yet — continue the transaction
+      *) fdie_next "the durable discard result/commit receipts disagree; refusing to guess" "inspect $DISCARD_REQUEST_FILE and git log --show-signature; keep the request marker in place" ;;
+    esac
+  fi
+  if [ -z "$choice" ]; then
+    printf 'fleet: also roll back already-merged product changes when provably safe? [y/N] '
+    read -r a || a=n
+    case "$a" in y|Y|yes|YES) choice=rollback ;; *) choice=keep ;; esac
+  fi
+  choice_flag=$(discard_choice_flag "$choice")
+  set_discard_request_choice "$choice" \
+    || fdie_next "could not persist the discard choice" "inspect $DISCARD_REQUEST_FILE, then rerun ./loop.sh discard $choice_flag"
+  stage_discard_archive "$authority" "$choice" \
+    || fdie_next "could not stage the cancellation archive; queue authority was kept" "fix permissions/disk space, then rerun ./loop.sh discard $choice_flag"
+
+  if [ "$choice" = keep ]; then
+    rollback_status="NOT_REQUESTED"
+    rollback_reason="merged product changes were retained by user choice"
+    publish_discard_archive_keep "$rollback_status" "$rollback_reason" \
+      || fdie_next "could not commit the cancellation archive; queue authority was kept" "fix Git/permissions, then rerun ./loop.sh discard --keep-changes"
+  else
+    if prepare_rollback_candidate "$authority" "$source"; then
+      if [ "$ROLLBACK_STATUS" = "NOT_NEEDED" ]; then
+        rollback_status="NOT_NEEDED"
+        rollback_reason="$ROLLBACK_REASON"
+        publish_discard_archive_keep "$rollback_status" "$rollback_reason" \
+          || fdie_next "could not commit the cancellation archive; queue authority was kept" "fix Git/permissions, then rerun ./loop.sh discard --rollback"
+      elif run_rollback_review; then
+        if [ "$ROLLBACK_STATUS" = "ELIGIBLE_NO_CHANGES" ]; then
+          rollback_status="NOT_NEEDED"
+          rollback_reason="independent review found no unsafe external side effect; the product tree already matched the plan source — $ROLLBACK_REASON"
+          publish_discard_archive_keep "$rollback_status" "$rollback_reason" \
+            || fdie_next "could not commit the reviewed cancellation archive; queue authority was kept" "fix Git/permissions, then rerun ./loop.sh discard --rollback"
+        elif finalize_rollback_candidate "$authority" "$source"; then
+          rollback_status="APPLIED"
+          rollback_reason="reviewed inverse commit $ROLLBACK_COMMIT restored the plan source product tree"
+        else
+          rollback_status="UNAVAILABLE"
+          rollback_reason="$ROLLBACK_REASON"
+          cleanup_rollback_candidate
+          publish_discard_archive_keep "$rollback_status" "$rollback_reason" \
+            || fdie_next "rollback was unavailable and the cancellation archive could not be committed" "fix Git/permissions, then rerun ./loop.sh discard --rollback"
+          rc=4
+        fi
+      else
+        rollback_status="UNAVAILABLE"
+        rollback_reason="$ROLLBACK_REASON"
+        cleanup_rollback_candidate
+        publish_discard_archive_keep "$rollback_status" "$rollback_reason" \
+          || fdie_next "rollback was unavailable and the cancellation archive could not be committed" "fix Git/permissions, then rerun ./loop.sh discard --rollback"
+        rc=4
+      fi
+    else
+      rollback_status="UNAVAILABLE"
+      rollback_reason="$ROLLBACK_REASON"
+      cleanup_rollback_candidate
+      publish_discard_archive_keep "$rollback_status" "$rollback_reason" \
+        || fdie_next "rollback was unavailable and the cancellation archive could not be committed" "fix Git/permissions, then rerun ./loop.sh discard --rollback"
+      rc=4
+    fi
+  fi
+
+  discard_plan_execution_state "$authority" \
+    || fdie_next "the cancellation archive is safe, but a target task is still live; queue authority was kept" "stop it, then rerun ./loop.sh discard $choice_flag"
+  finish_discard "$authority" "$DISCARD_ARCHIVE_REL" "$rollback_status" "$rollback_reason" "$rc"
+}
+
 cmd_fleet_clean() {
   need_project
   ensure_fleet_dirs
+  guard_no_discard_pending
   local force=0 all_done=0 orphans=0 ids=() a id
   for a in "$@"; do
     case "$a" in
@@ -6336,7 +8519,7 @@ cmd_fleet_clean() {
     esac
   done
   if [ "$orphans" = 1 ]; then
-    clean_orphans
+    clean_orphans "$force"
     { [ "$all_done" = 1 ] || [ "${#ids[@]}" -ge 1 ]; } || return 0
   fi
   if [ "$all_done" = 1 ] && [ "${#ids[@]}" -eq 0 ]; then
@@ -6355,11 +8538,14 @@ cmd_fleet_clean() {
   git worktree prune 2>/dev/null || true
 }
 
-clean_orphans() { # gc: worktrees under $WT_ROOT and loop/* branches whose task has
-  # NO queue entry AND no runs/<id>.env — a live task always has both indices, so
-  # only true leftovers (crash mid-clean, manual surgery) qualify; anything else
-  # is a task's property and is never touched. Removal mirrors clean_one.
-  local cand="" seen="" line b id wt pid any=0
+clean_orphans() { # [$1 force] — gc: worktrees under $WT_ROOT and loop/* branches whose
+  # task has NO queue entry AND no runs/<id>.env — a live task always has both
+  # indices, so only true leftovers (crash mid-clean, manual surgery, a
+  # quarantining whole-plan discard) qualify; anything else is a task's property
+  # and is never touched. Removal mirrors clean_one. force=1 is the explicit
+  # human boundary that also deletes an orphan's un(tracked)/ignored content —
+  # it never skips the live-pid or approval-slot guards.
+  local force="${1:-0}" cand="" seen="" line b id wt pid any=0
   while IFS= read -r line; do
     case "$line" in
       "worktree $WT_ROOT/"*) id="${line#worktree "$WT_ROOT"/}"; id="${id%%/*}"; cand="$cand $id" ;;
@@ -6389,11 +8575,24 @@ clean_orphans() { # gc: worktrees under $WT_ROOT and loop/* branches whose task 
       fnote "[$id] a live process (pid $pid) holds .loop/run.pid in this worktree — not cleaning; stop it first"
       continue
     fi
+    if [ "$force" != 1 ] && [ -d "$wt" ] \
+       && { ! git -C "$wt" diff --quiet -- 2>/dev/null \
+            || ! git -C "$wt" diff --cached --quiet -- 2>/dev/null \
+            || worktree_has_untracked_or_ignored "$wt"; }; then
+      fnote "[$id] orphan worktree has tracked, untracked, or ignored changes — kept; inspect/save $wt, then delete it AND those changes with: ./loop.sh fleet clean --orphans --force"
+      continue
+    fi
     if ! discard_worktree_slot "$wt"; then
       fnote "[$id] could not remove its approval slot — not cleaning (a successor at this path would inherit the stale task baseline); remove it by hand (under $(approval_home)), then retry"
       continue
     fi
-    [ ! -d "$wt" ] || git worktree remove --force "$wt" >/dev/null 2>&1 || true
+    if [ -d "$wt" ]; then
+      if [ "$force" = 1 ]; then
+        git worktree remove --force "$wt" >/dev/null 2>&1 || true
+      else
+        git worktree remove "$wt" >/dev/null 2>&1 || true
+      fi
+    fi
     git branch -D "loop/$id" >/dev/null 2>&1 || true
     if git rev-parse -q --verify "loop/$id" >/dev/null 2>&1; then
       # never silently leave an orphan branch behind (git busy — e.g. a supervisor merging)
@@ -6444,13 +8643,32 @@ clean_one() { # $1 id, $2 force
 }
 
 cmd_fleet_unlock() {
+  need_project
+  ensure_fleet_dirs
+  local owner id
   if supervisor_alive; then
     fdie "supervisor pid $(supervisor_pid) is alive — not removing its lock"
   fi
+  if run_claim_alive || { [ "$(cat .loop/state 2>/dev/null)" = "RUNNING" ] && single_loop_alive; }; then
+    fdie_next "a root loop is live — not removing Fleet mutation locks" "stop it first, then ./loop.sh fleet unlock"
+  fi
+  for id in $(tasks_in claimed); do
+    task_pid_alive "$id" \
+      && fdie_next "task '$id' is still live — not removing Fleet mutation locks" "stop it first, then ./loop.sh fleet unlock"
+  done
+  owner=$(cat "$PLAN_MUTATION_LOCK" 2>/dev/null || echo "")
+  case "$owner" in
+    ''|*[!0-9]*) ;;
+    *) kill -0 "$owner" 2>/dev/null \
+         && fdie_next "plan mutation lock owner pid $owner is alive" "wait for it, or stop that loop before ./loop.sh fleet unlock" ;;
+  esac
   # unconditional removal (release_lock is owner-checked and would no-op here):
-  # the holder was just verified dead, and this is an explicit human command
+  # all known loop/task holders were just verified dead, and this is an
+  # explicit human recovery boundary (automatic stale-lock stealing is banned).
+  rm -f "$PLAN_MUTATION_LOCK"
+  case "$owner" in ''|*[!0-9]*) ;; *) rm -f "$PLAN_MUTATION_LOCK.$owner" ;; esac
   rm -rf "$LOCK_DIR"
-  fnote "lock removed"
+  fnote "stale supervisor/plan-mutation locks removed"
 }
 
 cmd_fleet() { # ./loop.sh fleet <subcommand> — the former standalone fleet.sh surface
@@ -6467,6 +8685,7 @@ cmd_fleet() { # ./loop.sh fleet <subcommand> — the former standalone fleet.sh 
     resume)  cmd_fleet_resume "$@" ;;
     ack-plan) cmd_fleet_ack_plan "$@" ;;
     merge)   cmd_fleet_merge "$@" ;;
+    discard) cmd_discard "$@" ;;
     clean)   cmd_fleet_clean "$@" ;;
     unlock)  cmd_fleet_unlock ;;
     ""|-h|--help|help) fleet_usage ;;
@@ -6719,26 +8938,76 @@ validate_task_plan() { # $1 out-dir, $2 "id id ...", $3 verdict-n(""=skip), $4 c
 enqueue_task_planned() { # $1 id, $2 body-file, $3 out-dir — fixed-id enqueue of a
   # decomposed task (parked manual tasks may share the queue — the enqueue loop
   # in cmd_decompose_flow fails loudly on an id collision before calling this)
-  local id="$1" body="$2" out="$3" deps
+  # Metadata is complete BEFORE the queue link is published. claim_task treats
+  # new/<id>.md as dispatch authority; publishing the file first would let a
+  # concurrent supervisor claim a planned task while PLANNED/PLAN_AUTHORITY were
+  # still absent and therefore misclassify it as a manual side-task.
+  local id="$1" body="$2" out="$3" deps authority source tmp
   { [ -z "$(task_qdir "$id")" ] && [ ! -f "$RUNS_DIR/$id.env" ]; } \
     || { plan_perr "task id '$id' already exists in the queue"; return 1; }
-  cp "$body" "$QUEUE_DIR/tmp/$id.$$.md" || return 1
-  ln "$QUEUE_DIR/tmp/$id.$$.md" "$QUEUE_DIR/new/$id.md" || { rm -f "$QUEUE_DIR/tmp/$id.$$.md"; return 1; }
-  rm -f "$QUEUE_DIR/tmp/$id.$$.md"
+  authority=$(current_plan_authority)
+  source=$(current_plan_source_ref)
+  [ -n "$authority" ] && [ -n "$source" ] \
+    || { plan_perr "planned task '$id' has no active plan authority/source"; return 1; }
+  tmp="$QUEUE_DIR/tmp/$id.$$.md"
+  cp "$body" "$tmp" || return 1
   renv_set "$id" SUMMARY "$(plan_meta "$out" "$id" SUMMARY)"
   renv_set "$id" SRC "task-plan"
   renv_set "$id" AUTO 1
   renv_set "$id" PLANNED 1
+  renv_set "$id" PLAN_AUTHORITY "$authority"
+  renv_set "$id" PLAN_SOURCE_REF "$source"
+  renv_set "$id" PLAN_SOURCE_REFNAME "$(current_plan_refname)"
   renv_set "$id" REQS "$(plan_meta "$out" "$id" REQS)"
   renv_set "$id" SCOPE "$(plan_meta "$out" "$id" SCOPE)"
   deps=$(plan_meta "$out" "$id" DEPENDS)
   [ "$deps" = "-" ] || renv_set "$id" DEPENDS_ON "$deps"
   renv_set "$id" ADDED_AT "$(utcnow)"
+  if ! ln "$tmp" "$QUEUE_DIR/new/$id.md" 2>/dev/null; then
+    rm -f "$tmp" "$RUNS_DIR/$id.env"
+    return 1
+  fi
+  rm -f "$tmp"
   journal "$id" ADDED "planned: $(plan_meta "$out" "$id" SUMMARY)"
 }
 
 decompose_plan_hash() { # contract + plan — the reuse marker's identity
   cat .loop/docs/product-contract.md .loop/docs/task-plan.md 2>/dev/null | sha256
+}
+
+ensure_plan_authority() { # publish one durable identity/source for this whole plan
+  # The task-plan hash alone is not enough once fix-ups/replans join the same
+  # orchestration. Bind it to the parent commit from which product work begins;
+  # every planned task inherits this token and every merge records it.
+  local plan_hash source source_refname authority existing_hash existing_source tmp
+  plan_hash=$(decompose_plan_hash)
+  existing_hash=$(fleet_kv_get "$PLAN_AUTHORITY_FILE" PLAN_HASH "")
+  existing_source=$(current_plan_source_ref)
+  if [ -s "$PLAN_AUTHORITY_FILE" ]; then
+    if [ "$existing_hash" = "$plan_hash" ] && [ -n "$existing_source" ] \
+       && git rev-parse --verify "${existing_source}^{commit}" >/dev/null 2>&1 \
+       && plan_ref_matches; then
+      return 0
+    fi
+    plan_perr "the active plan-authority record does not match this approved task plan"
+    return 1
+  fi
+  ! discard_request_present \
+    || { plan_perr "a prior discard transaction is still pending"; return 1; }
+  source=$(git rev-parse HEAD 2>/dev/null) || return 1
+  source_refname=$(git symbolic-ref -q HEAD 2>/dev/null || printf '%s' DETACHED)
+  authority=$(printf '%s\n' loop-plan-v1 "$plan_hash" "$source" "$source_refname" | sha256) || return 1
+  tmp="$PLAN_AUTHORITY_FILE.tmp.$$"
+  {
+    echo "VERSION=1"
+    echo "AUTHORITY=$authority"
+    echo "PLAN_HASH=$plan_hash"
+    echo "SOURCE_REF=$source"
+    echo "SOURCE_REFNAME=$source_refname"
+    echo "CREATED_AT=$(utcnow)"
+  } > "$tmp" || return 1
+  mv -f "$tmp" "$PLAN_AUTHORITY_FILE"
+  rm -f "$PLAN_DISPATCHED_FILE"
 }
 
 plan_rationale() { # first prose line of the task plan (≤200 chars) — the skill
@@ -7340,6 +9609,8 @@ cmd_decompose_flow() { # $1 force(0|1), $2 enqueue(0|1) — the routing brain.
     if [ -n "$(tasks_in "done")$(tasks_in failed)" ]; then
       die "previous fleet tasks remain in the queue — if the last orchestration was interrupted or stopped early, resume it instead: ./loop.sh run (queue dispatch + the integration gate). Archiving them (./loop.sh fleet clean --done) skips the mandatory integration gate for that run — only do that after a fully completed run (and inspect failed/: ./loop.sh fleet status)"
     fi
+    ensure_plan_authority \
+      || finish BLOCKED "could not publish a durable authority/source record for the approved task plan — inspect .loop/fleet/plan-authority.env, then ./loop.sh run"
     # partial-enqueue marker: a crash between the first and the last publish
     # would otherwise dispatch a plan with partial REQ coverage on resume.
     # Written BEFORE the loop (same-dir tmp+mv), removed after it; content =
@@ -7379,6 +9650,8 @@ repair_pending_enqueue() { # .loop/fleet/enqueue-pending survived a crash betwee
   if [ "$marker_hash" != "$(decompose_plan_hash)" ]; then
     finish NEEDS_SPEC_DECISION "an interrupted enqueue left .loop/fleet/enqueue-pending, but its recorded plan identity no longer matches the contract+plan — the partial enqueue cannot be reconstructed safely; inspect ./loop.sh fleet status, regenerate the plan (./loop.sh decompose --force) or clean the queue"
   fi
+  ensure_plan_authority \
+    || finish NEEDS_SPEC_DECISION "could not reconstruct the interrupted plan's authority/source record — inspect .loop/fleet and .loop/docs/task-plan.md, then ./loop.sh discard --keep-changes"
   if ! ids=$(parse_task_plan .loop/docs/task-plan.md .loop/fleet/plan 2>/dev/null | tr '\n' ' ') \
      || ! topo=$(validate_task_plan .loop/fleet/plan "$ids" "" "$(fcfg FLEET_MAX_TASKS 12)" "" 2>/dev/null | tr '\n' ' '); then
     finish NEEDS_SPEC_DECISION "could not re-derive the approved task plan while repairing an interrupted enqueue (.loop/docs/task-plan.md) — regenerate it: ./loop.sh decompose --force"
@@ -7599,6 +9872,7 @@ fleet_inflight() { # TRUE iff a bare run must RESUME an orchestration (and
   # forever (no task plan, no FLEET_START, the planned work never attempted).
   # .loop/fleet/base-ref is deliberately not consulted (it is never cleaned
   # up, so it would misroute every repo that ever ran a fleet once).
+  discard_request_present && return 0
   supervisor_alive && return 0
   [ "$(cat .loop/state 2>/dev/null)" = "FLEET_RUNNING" ] && return 0
   [ -n "$(tasks_in claimed)" ] && return 0
@@ -7615,6 +9889,7 @@ check_fleet_contract_binding() { # fail closed when queued PLANNED tasks belong 
   # planned for (the fleet analogue of the single-loop checkpoint CONTRACT_HASH
   # guard in decide_run_mode). Manual (non-PLANNED) tasks carry their own
   # per-worktree contract and are exempt.
+  local authority source id
   planned_pending || return 0
   # neither a plan nor a marker: no decompose ever ran here — the task was
   # flagged PLANNED by hand (surgical repair / test synthesis); there is nothing
@@ -7626,6 +9901,26 @@ check_fleet_contract_binding() { # fail closed when queued PLANNED tasks belong 
      || [ "$(cat .loop/decompose-approved)" != "$(decompose_plan_hash)" ]; then
     die "queued tasks were planned for a DIFFERENT contract (the contract or task plan changed after the orchestration started) — restore the previous contract to resume, or inspect/clean the queued work: ./loop.sh fleet status | ./loop.sh fleet clean <id> [--force]"
   fi
+  # v1 plans bind every queued task to one immutable plan/source pair. Absence
+  # is tolerated only for deployments created by an older harness; once a v1
+  # record exists, mixed or partially-written authority is never dispatched.
+  [ ! -s "$PLAN_AUTHORITY_FILE" ] || {
+    authority=$(current_plan_authority)
+    source=$(current_plan_source_ref)
+    if [ -z "$authority" ] \
+       || ! git rev-parse --verify "${source}^{commit}" >/dev/null 2>&1; then
+      die_next "the planned queue has an invalid plan authority/source record" "inspect $PLAN_AUTHORITY_FILE, then ./loop.sh discard --keep-changes"
+    fi
+    plan_ref_matches \
+      || die_next "the checked-out branch differs from the branch that published the planned queue" "checkout $(current_plan_refname), then ./loop.sh run (or discard it)"
+    for id in $(tasks_in new) $(tasks_in claimed); do
+      [ "$(renv_get "$id" PLANNED 0)" = "1" ] || continue
+      [ "$(renv_get "$id" PLAN_AUTHORITY "")" = "$authority" ] \
+        && [ "$(renv_get "$id" PLAN_SOURCE_REF "")" = "$source" ] \
+        && [ "$(renv_get "$id" PLAN_SOURCE_REFNAME "")" = "$(current_plan_refname)" ] \
+        || die_next "planned task '$id' is not bound to the current immutable plan authority" "inspect ./loop.sh fleet status, then ./loop.sh discard --keep-changes"
+    done
+  }
 }
 
 fleet_merged_ids() { # $1 base -> ids of the workers whose merge commits landed in
@@ -8101,6 +10396,10 @@ cmd_decompose() { # preview/refresh the task plan without enqueueing or running
   done
   need_kit
   ensure_loop_dir
+  acquire_plan_mutation_lock \
+    || die_next "could not acquire the plan mutation barrier before decomposing" "after confirming no loop is live, run ./loop.sh fleet unlock, then ./loop.sh decompose"
+  trap release_plan_mutation_lock EXIT
+  guard_no_discard_pending
   need_awk
   need_sha
   need_agents
@@ -8268,7 +10567,7 @@ refresh_harness() { # $1 src-bin, $2 src-assets, $3 target — copy harness + pr
     cp -R "$d" "$tgt/.claude/skills/$name"
   done
 
-  # Codex-native projection: eleven shared skills, no Claude-only loop-refine.
+  # Codex-native projection: thirteen shared skills, no Claude-only loop-refine.
   project_codex_skills "$sassets" "$tgt"
 
   # doc templates: refresh only those still pristine (TEMPLATE marker) or absent —
@@ -8849,6 +11148,8 @@ reset_contract_scoped_docs() { # [--keep-contract] — archive + reset the loop 
         .loop/decompose-approved .loop/decompose-feedback.md \
         .loop/decompose-review-feedback.md .loop/plan-feedback.md \
         .loop/plan-review-feedback.md .loop/state .loop/docs-contract
+  rm -f "$PLAN_AUTHORITY_FILE" "$PLAN_DISPATCHED_FILE"
+  rm -rf .loop/fleet/rollback-review
   rm -rf .loop/observations
   rm -f .loop/observations-manifest.jsonl .loop/task-id
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -8864,6 +11165,7 @@ guard_new_definition() { # refuse/reset before a NEW-task definition session.
   # Fleet workers skip entirely: their worktree was hard-reset at bootstrap and
   # runs its own single-task definition (no .loop/templates inside a worktree).
   [ ! -f .loop/fleet-worker ] || return 0
+  guard_no_discard_pending
   # a live/parked orchestration still needs the CURRENT docs (its integration
   # gate reviews against them) — never define a new task over one
   if [ -n "$(tasks_in new)$(tasks_in claimed)" ] \
@@ -9393,6 +11695,7 @@ cmd_approve() {
   need_kit
   [ -f .loop/docs/product-contract.md ] || die_next "no .loop/docs/product-contract.md to approve" "define a task first: ./loop.sh start \"<what to build>\""
   ensure_loop_dir
+  guard_no_discard_pending
   need_sha
   local old_hash st slot tmp
   # ---- amendment vs replacement: the stamp records WHICH product contract the
@@ -9593,7 +11896,7 @@ decide_run_mode() { # $1 force_fresh $2 require_resume $3 prefer_resume -> echoe
       else
         echo fresh
       fi ;;
-    SUCCESS|NO_OP)
+    SUCCESS|NO_OP|CANCELLED)
       if [ "$require_resume" = 1 ]; then echo "refuse:the last run already completed ($st) — nothing to resume"; else echo fresh; fi ;;
     *)
       if [ "$require_resume" = 1 ]; then echo "refuse:no resumable run state (.loop/state='$st')"; else echo fresh; fi ;;
@@ -9620,6 +11923,10 @@ cmd_run() {
 
   need_kit
   ensure_loop_dir
+  acquire_plan_mutation_lock \
+    || die_next "could not acquire the plan mutation barrier before starting a run" "after confirming no loop is live, run ./loop.sh fleet unlock, then ./loop.sh run"
+  trap release_plan_mutation_lock EXIT
+  guard_no_discard_pending
   # split-brain guard for EVERY mode, before ANY side effect: without it a
   # `run --fresh` beside a LIVE loop deletes that run's run-scoped artifacts
   # (the fresh-clear below) and can even launch a decompose/fleet next to it —
@@ -9634,6 +11941,8 @@ cmd_run() {
   # cannot enter beside it. Released once the liveness pidfile takes over.
   acquire_run_claim \
     || die_next "another ./loop.sh run is already starting in this repo (pid $(cat .loop/run-claim.pid 2>/dev/null)); a dead holder is reclaimed automatically" "wait for it to appear in ./loop.sh status, or stop it, then ./loop.sh run"
+  release_plan_mutation_lock
+  trap - EXIT
   # SECURITY: verify hashes BEFORE sourcing any config shell code
   verify_approval
   load_config
@@ -10299,7 +12608,7 @@ cmd_signoff() { # ./loop.sh signoff [--yes] — COMPLETE human approval of the
 validate_models() {
   awk '
     BEGIN {
-      split("CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE", r, " ")
+      split("CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE ROLLBACK", r, " ")
       for (i in r) role[r[i]] = 1
       split("minimal low medium high xhigh max ultra", e, " ")
       for (i in e) eff[e[i]] = 1
@@ -10354,7 +12663,7 @@ validate_models() {
       print "line " NR ": unknown key " key; bad = 1
     }
     END {
-      n = split("CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE", rr, " ")
+      n = split("CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE ROLLBACK", rr, " ")
       for (i = 1; i <= n; i++) {
         ro = rr[i]
         a = (ro in agent) ? agent[ro] : ""
@@ -10582,6 +12891,7 @@ cmd_refine() { # ./loop.sh refine ['<opening note>'] — interactive design-gate
 cmd_resume_task() { # $1 id [--auto] — flip the task runnable, then actually run it
   need_project
   ensure_fleet_dirs
+  guard_no_discard_pending
   local id="" auto="" a others
   for a in "$@"; do
     case "$a" in
@@ -10676,6 +12986,7 @@ cmd_resume_list() { # every session in this repo and whether/how it resumes
                          if [ "$ck" = 1 ]; then root_verdict="yes — ./loop.sh resume"; else root_verdict="no"; fi ;;
     NEEDS_SPEC_DECISION|NEEDS_ARCHITECTURE_DECISION|NEEDS_DECOMPOSITION|RISK_REQUIRES_APPROVAL|PENDING_APPROVAL)
                          root_verdict="after deciding — ./loop.sh approve && ./loop.sh run" ;;
+    CANCELLED)           root_verdict="no — start a new requirement with ./loop.sh start" ;;
     *)                   root_verdict="no" ;;
   esac
   printf '%-38s %-8s %-24s %s\n' "SESSION" "QUEUE" "PHASE" "RESUMABLE"
@@ -10740,6 +13051,9 @@ cmd_status() {
   fi
   echo "state:    $st"
   echo "approved: $ap"
+  if discard_request_present; then
+    echo "discard:  pending (choice=$(fleet_kv_get "$DISCARD_REQUEST_FILE" CHOICE pending), authority=$(discard_request_authority))"
+  fi
   # lifetime = sum over run segments of each segment's MAX total_usd. Max, not
   # last: the NEXT process's decompose/contract rows land between a finished
   # run's final row and the next RUN_START carrying a freshly-reset (smaller)
@@ -10754,16 +13068,17 @@ cmd_status() {
     ' .loop/journal.jsonl)
   fi
   echo "cost:     \$$(cat .loop/cost-total 2>/dev/null || echo 0) (last run)${lifeline:+ / $lifeline}"
-  echo "models:   implement=$(get_model MODEL_IMPLEMENT opus) review=$(get_model MODEL_REVIEW opus) stop-eval=$(get_model MODEL_STOP_EVAL haiku)"
-  if codex_routing_enabled || [ "$(configured_agent CONTRACT)" = codex ]; then
+  echo "models:   implement=$(get_model MODEL_IMPLEMENT opus) review=$(get_model MODEL_REVIEW opus) stop-eval=$(get_model MODEL_STOP_EVAL haiku) rollback=$(get_model MODEL_ROLLBACK opus)"
+  if codex_routing_enabled || [ "$(configured_agent CONTRACT)" = codex ] \
+     || [ "$(configured_agent ROLLBACK)" = codex ]; then
     local _ag="" _r2
-    for _r2 in CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE; do
+    for _r2 in CONTRACT PLAN IMPLEMENT REVIEW REVIEW_INTERIM STOP_EVAL EVIDENCE DECOMPOSE SUPERVISE ROLLBACK; do
       [ "$(configured_agent "$_r2")" != codex ] || _ag="$_ag $(printf '%s' "$_r2" | tr '[:upper:]_' '[:lower:]-')"
     done
     echo "agents:   codex ->${_ag} (all other roles claude)"
   fi
   local _eo="" _r _v
-  for _r in IMPLEMENT REVIEW PLAN CONTRACT EVIDENCE STOP_EVAL DECOMPOSE SUPERVISE; do
+  for _r in IMPLEMENT REVIEW PLAN CONTRACT EVIDENCE STOP_EVAL DECOMPOSE SUPERVISE ROLLBACK; do
     _v=$(get_model "EFFORT_$_r" "")
     case "$_v" in minimal|low|medium|high|xhigh|max|ultra) _eo="$_eo $(printf '%s' "$_r" | tr '[:upper:]_' '[:lower:]-')=$_v" ;; esac
   done
@@ -10781,6 +13096,7 @@ cmd_status() {
     BUDGET_EXCEEDED)  hint="raise MAX_ITERATIONS/MAX_COST_USD in loop.config.sh, then ./loop.sh approve && ./loop.sh resume" ;;
     NEEDS_*|RISK_REQUIRES_APPROVAL|PENDING_APPROVAL) hint="decide (.loop/docs/decision-requests.md), then ./loop.sh approve && ./loop.sh run  — full guidance: ./loop.sh report" ;;
     INTERRUPTED)      hint="./loop.sh run   (resume where it left off)" ;;
+    CANCELLED)        hint="./loop.sh start \"<next requirement>\"" ;;
   esac
   [ -n "$hint" ] && echo "next:     $hint"
   # orchestration/fleet state, when any task exists (same table as fleet status)
@@ -10972,6 +13288,7 @@ case "$cmd" in
   setup)   cmd_setup "$@" ;;
   fleet)   cmd_fleet "$@" ;;
   add)     cmd_fleet_add "$@" ;;
+  discard) cmd_discard "$@" ;;
   init)    cmd_init "$@" ;;
   update)  cmd_update "$@" ;;
   uninstall) cmd_uninstall "$@" ;;

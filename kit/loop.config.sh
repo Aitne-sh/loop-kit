@@ -49,7 +49,7 @@ MAX_ITER_SECONDS=900       # default wall-clock watchdog per agent call
 # MAX_ITER_SECONDS — a typo here can never widen or break a running loop.
 # These live HERE (not loop.models.sh) on purpose: the watchdog is an anti-runaway
 # SAFETY budget, so raising it is gated by re-approval (this file is hashed).
-# Roles: IMPLEMENT REVIEW PLAN CONTRACT EVIDENCE STOP_EVAL DECOMPOSE SUPERVISE.
+# Roles: IMPLEMENT REVIEW PLAN CONTRACT EVIDENCE STOP_EVAL DECOMPOSE SUPERVISE ROLLBACK.
 # The heavy lever is IMPLEMENT: a genuinely large, tool-heavy iteration (big
 # refactor, slow builds/tests run as tool calls) can legitimately outlast the
 # default. If iterations are being watchdog-killed while still making progress,
@@ -64,6 +64,7 @@ MAX_ITER_SECONDS=900       # default wall-clock watchdog per agent call
 #TIMEOUT_STOP_EVAL=
 #TIMEOUT_DECOMPOSE=
 #TIMEOUT_SUPERVISE=
+#TIMEOUT_ROLLBACK=         # independent rollback safety review
 
 # Total reported USD cap across Claude-routed calls in one run. EMPTY = no cap
 # (the default). Codex calls report 0 USD and cannot be bounded by this knob;

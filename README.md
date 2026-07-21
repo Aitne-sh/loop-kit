@@ -169,8 +169,8 @@ your-project/
 ├── loop.models.sh       ← agent, model, and effort routing (edit between runs; no re-approval)
 ├── fleet.config.sh      ← parallel settings (edit between runs; no re-approval)
 ├── loop-instruction.md  ← (optional) where you write your instructions
-├── .claude/skills/      ← 12 managed Claude Code skills, including loop-refine
-├── .agents/skills/      ← 11 managed Codex projections (loop-refine is Claude-only)
+├── .claude/skills/      ← 14 managed Claude Code skills, including loop-refine
+├── .agents/skills/      ← 13 managed Codex projections (loop-refine is Claude-only)
 └── .loop/               ← everything else (hidden)
     ├── bin/evaluate.sh  ← the external checker
     ├── docs/            ← contract, plan, progress, evidence, decisions, and the
@@ -188,7 +188,7 @@ is not already a Git repository, it initializes one and creates the deployment
 commit; in an existing repository, it leaves the changes for you to review.
 
 The Claude tree is the canonical managed prompt source. During `init` and
-`update`, loop-kit projects the ten headless-compatible skills into Codex's
+`update`, loop-kit projects the thirteen headless-compatible skills into Codex's
 repository skill location, removes Claude-only frontmatter, and writes Codex
 invocation policy in each skill's `agents/openai.yaml`. It intentionally does
 not create `.codex/skills`: Codex discovers repository skills under
@@ -702,6 +702,81 @@ add → queue/new/ → claimed/ (worktree → contract → await approval → ru
                               → done/ (merged)  |  failed/ (blocked / escalated / conflict)
 ```
 
+### Cancelling a whole planned queue — `discard`
+
+`fleet stop <id>` is a resumable pause for one task. To permanently cancel the
+currently active *decomposed plan* as one unit, use:
+
+```bash
+./loop.sh discard [--rollback|--keep-changes]
+```
+
+With a TTY, omitting the flag asks whether already-merged product changes should
+also be rolled back; the safe default is to keep them. Without a TTY, exactly one
+of `--rollback` or `--keep-changes` is required, and omission refuses to begin the
+cancellation transaction. Once published, the choice is durable and cannot change
+mid-transaction; after a crash, rerun `discard` with the same flag to resume it.
+
+Discard first publishes a request bound to the plan's immutable queue authority.
+That prevents any new claim or merge, stops the supervisor and plan-owned workers,
+archives the complete plan/task state, then removes every queue entry and run record
+bearing that authority together. Tasks added manually are outside that authority:
+they are retained, and any claimed manual peer is parked in its current resumable
+phase rather than deleted or rolled back. A queued, claimed, or already-failed
+manual task that depended on a cancelled planned task is moved to `failed/` as
+`DISCARD_DEP_CANCELLED`; its other dependencies are preserved, and
+`fleet resume <id>` explicitly releases it after you review the missing dependency
+(a re-queue scraps the task's worktree, so resume refuses while that worktree still
+holds implementation work — the refusal names the exact scrap commands).
+
+`--rollback` is deliberately fail-closed and needs **both** gates:
+
+1. A deterministic structural assessor proves every product-changing commit is an
+   ordinary Fleet merge with the exact plan/source/branch trailers, task receipt,
+   and integration archive, and proves an isolated inverse restores the pinned
+   source tree.
+2. The independent `ROLLBACK` reviewer inspects the exact patch and archive in a
+   read-only session. It may veto the deterministic set; it can never widen it.
+
+Rollback is unavailable if product history contains a manual or parallel commit,
+a retained manual task depends on a candidate plan merge, the source branch or
+ancestry no longer matches, the parent tracked tree/index is dirty, another
+merge/rebase/cherry-pick/revert/bisect operation is active, the inverse does not
+apply exactly, external side effects may exist, or any provenance or ownership is
+uncertain. A dispatched implementation whose final product diff is empty still
+passes the independent side-effect review; net-zero never bypasses that gate. When
+both gates say safe, the harness creates exactly one new inverse commit in an
+isolated worktree and advances the parent with `--ff-only`; it never resets,
+rebases, or rewrites history. If the reviewed product tree already matches the
+source, it records `NOT_NEEDED` instead of creating an empty inverse commit.
+
+Cancellation does not depend on rollback succeeding. If rollback is unavailable,
+the harness commits a cancellation archive with status `UNAVAILABLE`, keeps the
+product changes, removes the planned queue authority, and finishes in `CANCELLED`
+(exit 4 so automation notices the unmet rollback request). A successful rollback or
+`--keep-changes` also finishes in `CANCELLED` (exit 0). The committed
+`.loop/docs/run-archive/<timestamp>-discard/` records the authority, queue/task
+metadata, available worktree patches, rollback inputs/verdict, and final receipt;
+it is the audit and crash-retry record for the cancelled plan. Before deleting a
+worker branch, discard pins its staged branch/worktree commits under
+`refs/loop-kit/discard/<authority>/<task>/<commit>` and uses compare-and-delete;
+a branch or worktree that advances after staging is kept. Untracked or ignored
+user files likewise keep the worktree and produce exit 4; once inspected/saved,
+`./loop.sh fleet clean --orphans` removes clean leftovers and its refusal names
+`--force` for a worktree whose kept content should be deleted too. A retained
+manual dependent (`DISCARD_DEP_CANCELLED`) that still holds implementation work
+also refuses `resume`'s re-queue until you scrap that work explicitly — the
+refusal names the exact commands. If live queue metadata
+changes after staging, it is moved recoverably under
+`.loop/fleet/discard-quarantine/<authority>/<task>/` instead of being overwritten.
+The request file is the transaction journal and is removed last, so rerunning the
+same command can finish cleanup even after plan authority was already retired.
+Recovery refs are intentionally retained after cancellation so a deleted worker
+branch cannot make its last commit unreachable. After you have inspected the
+archive/quarantine and no longer need recovery, list the exact authority with
+`git for-each-ref refs/loop-kit/discard/<authority>/`; retire only a reviewed leaf
+with `git update-ref -d <exact-ref> <expected-commit>`.
+
 <details>
 <summary>Fleet details: approvals, escalations, dependencies, and the guards that keep it from hanging</summary>
 
@@ -756,8 +831,8 @@ add → queue/new/ → claimed/ (worktree → contract → await approval → ru
   the failure surfaces at the end as a decision request rather than aborting everything.
 
 The full manual surface is `./loop.sh fleet <run | add | approve | status | report | logs
-| stop | resume | ack-plan | merge | clean | unlock>`; run `./loop.sh fleet help` for
-the details.
+| discard | stop | resume | ack-plan | merge | clean | unlock>`; run `./loop.sh fleet help`
+for the details.
 </details>
 
 <details>
@@ -830,6 +905,7 @@ Runs and fleet tasks are also resumable by id:
 ./loop.sh resume --list        # every session, its phase, and whether/how it resumes
 ./loop.sh resume <task-id>     # flip a stopped task runnable AND dispatch it
 ./loop.sh fleet clean --orphans   # garbage-collect worktrees/branches that lost their queue entry
+                                  # (--force also deletes an orphan's kept untracked/ignored content)
 ```
 
 `resume <id>` exits with the relaunched task's real outcome (`0` done, `3` needs a human,
@@ -881,7 +957,7 @@ loop until you re-approve. The key settings:
 | `ESCALATE_PATHS` | (empty) | Touching these asks for a decision (`NEEDS_ARCHITECTURE_DECISION`) — e.g. dependency or schema files. |
 | `MAX_ITERATIONS` | 10 | Hard cap on loop iterations per run. |
 | `MAX_ITER_SECONDS` | 900 | Default wall-clock watchdog on each individual agent call. |
-| `TIMEOUT_<ROLE>` | (empty → inherits `MAX_ITER_SECONDS`) | Per-role watchdog override (seconds), e.g. `TIMEOUT_IMPLEMENT=1800` so a heavy implement iteration outlasts the clerical `STOP_EVAL`/`EVIDENCE` calls. Roles: `IMPLEMENT REVIEW PLAN CONTRACT EVIDENCE STOP_EVAL DECOMPOSE SUPERVISE`. Lives here (not `loop.models.sh`) because the watchdog is a safety budget — raising it is gated by re-approval. A blank/non-numeric value silently inherits the global. |
+| `TIMEOUT_<ROLE>` | (empty → inherits `MAX_ITER_SECONDS`) | Per-role watchdog override (seconds), e.g. `TIMEOUT_IMPLEMENT=1800` so a heavy implement iteration outlasts the clerical `STOP_EVAL`/`EVIDENCE` calls. Roles: `IMPLEMENT REVIEW PLAN CONTRACT EVIDENCE STOP_EVAL DECOMPOSE SUPERVISE ROLLBACK`. `TIMEOUT_ROLLBACK` bounds the independent discard safety review. Lives here (not `loop.models.sh`) because the watchdog is a safety budget — raising it is gated by re-approval. A blank/non-numeric value silently inherits the global. |
 | `MAX_RUN_SECONDS` | (empty) | Optional wall-clock budget checked at iteration/orchestration boundaries. A later resume gets a fresh window; it does not interrupt an individual `VERIFY_COMMAND`. |
 | `MAX_COST_USD` | (empty = no cap) | A hard cap on USD reported by Claude calls. Codex reports no USD amount and is therefore unbounded by this knob; see the Codex routing notes below. |
 | `STAGNATION_N` | 2 | Consecutive no-diff iterations → STALLED. |
@@ -928,6 +1004,7 @@ by default and falls back to Codex when the Claude CLI is absent; `--app codex` 
 | `MODEL_STOP_EVAL` | The advisory stop check, every iteration | **haiku** (lightweight) |
 | `MODEL_DECOMPOSE` | Supervisor: contract → task plan | **opus** |
 | `MODEL_SUPERVISE` | Supervisor: mid-run decisions on tasks | **opus** |
+| `MODEL_ROLLBACK` | Independent read-only safety review for `discard --rollback` | **opus** |
 
 Each `MODEL_<ROLE>` takes a Claude alias — `opus` (Opus 4.8), `sonnet` (Sonnet 5),
 `haiku` (Haiku 4.5), or `fable` (Fable 5, the most capable) — or a full `claude-*`
@@ -936,10 +1013,11 @@ name; a Codex-routed role takes a Codex slug instead (`gpt-5.5`, `gpt-5.6-sol`,
 
 The same file also sets reasoning effort
 (`minimal | low | medium | high | xhigh | max | ultra`): `LOOP_EFFORT` (default `xhigh`)
-is the global value, and `EFFORT_<ROLE>` (for example, `EFFORT_STOP_EVAL` or
-`EFFORT_IMPLEMENT`) overrides it per role. The value is translated to what each role's CLI
-accepts, so one global is safe across a mixed fleet: Claude `--effort` takes
-`low|medium|high|xhigh|max` (the Codex-only tiers down-map — `ultra`→`max`, `minimal`→`low`),
+is the global value, and `EFFORT_<ROLE>` (for example, `EFFORT_STOP_EVAL`,
+`EFFORT_IMPLEMENT`, or `EFFORT_ROLLBACK`) overrides it per role. The value is translated
+to what each role's CLI accepts, so one global is safe across a mixed fleet: Claude `--effort`
+takes `low|medium|high|xhigh|max` (the Codex-only tiers down-map — `ultra`→`max`,
+`minimal`→`low`),
 while Codex `model_reasoning_effort` takes `minimal|low|medium|high|xhigh` on every model
 and additionally `max|ultra` **only on `gpt-5.6-sol` / `gpt-5.6-terra`** (on any other Codex
 model a `max`/`ultra` request is clamped to `xhigh`, so it degrades rather than errors).
@@ -981,9 +1059,9 @@ with `codex login`; for API-key authentication, use
 can be selected with `LOOP_CODEX_CMD=/path/to/codex`.
 
 `init` and `update` install Codex-native repository skills under
-`.agents/skills`. All ten projected skills can be invoked explicitly by their
+`.agents/skills`. All thirteen projected skills can be invoked explicitly by their
 `$loop-*` name; `$loop-contract` and `$loop-plan` also allow implicit matching,
-while the eight harness-internal skills disable implicit invocation. The harness
+while the eleven harness-internal skills disable implicit invocation. The harness
 still points each headless Codex call at the approved `.agents/.../SKILL.md`
 directly, so a user-global skill with the same name or a client discovery setting
 cannot silently change the loop. `loop-refine` is not projected because that
@@ -1017,10 +1095,11 @@ MODEL_EVIDENCE="gpt-5.5"
 
 The routable keys are `AGENT_IMPLEMENT`, `AGENT_PLAN`, `AGENT_REVIEW`,
 `AGENT_REVIEW_INTERIM`, `AGENT_STOP_EVAL`, `AGENT_EVIDENCE`, `AGENT_DECOMPOSE`,
-`AGENT_SUPERVISE`, and `AGENT_CONTRACT` (headless definition only — interactive sessions
-stay on Claude). Unset or unrecognized values safely fall back to `claude`;
-`AGENT_REVIEW_INTERIM` inherits `AGENT_REVIEW` when empty. A Codex-routed role must use a
-Codex model slug rather than `opus`, `sonnet`, `haiku`, `fable`, or a `claude-*` model name.
+`AGENT_SUPERVISE`, `AGENT_ROLLBACK`, and `AGENT_CONTRACT` (headless definition only —
+interactive sessions stay on Claude). Unset or unrecognized values safely fall back to
+`claude`; `AGENT_REVIEW_INTERIM` inherits `AGENT_REVIEW` when empty. A Codex-routed
+role must use a Codex model slug rather than `opus`, `sonnet`, `haiku`, `fable`, or a
+`claude-*` model name.
 Agent inheritance does not overwrite the independently tiered
 `MODEL_REVIEW_INTERIM`: when routing `AGENT_REVIEW` to Codex, also set
 `MODEL_REVIEW_INTERIM` to a Codex slug (or explicitly route interim review elsewhere).
@@ -1285,6 +1364,7 @@ that as an abnormal end (`RUN_ABEND`) and resumes from the checkpoint.
 | `STALLED` | No progress (no diff for N iterations / repeated "futile" verdicts) | 4 |
 | `BUDGET_EXCEEDED` | Hit the iteration cap, configured USD cap, or `MAX_RUN_SECONDS` boundary | 5 |
 | `INTERRUPTED` | `SIGINT` / `SIGTERM` was handled and the checkpoint was preserved | 130 |
+| `CANCELLED` | The active planned Fleet authority was permanently cancelled and its retryable audit archive committed; product changes may have been retained | 0; 4 when a requested rollback was unavailable or cleanup left quarantined artifacts |
 | (usage error) | Something's misconfigured or unapproved | 2 |
 
 **The only path to SUCCESS**, stated in full: every `VERIFY_COMMAND` passes when the
@@ -1483,10 +1563,11 @@ branches, and refuses to run against the kit repository itself.
 | `./loop.sh run [--fresh] [--single]` | Run the approved contract (auto-resumes after a crash; `--fresh` restarts; `--single` skips decomposition — queued fleet tasks stay parked). |
 | `./loop.sh decompose [--force]` | Preview or regenerate the task split without running. |
 | `./loop.sh resume [<id>\|--list] [--note '<text>']` | Continue a stopped root run or task; `--note` supplies guidance to the next root iteration. A task id may also use `--auto`. |
+| `./loop.sh discard [--rollback\|--keep-changes]` | Permanently cancel the active planned Fleet queue as one authority. TTY use may confirm the rollback choice; non-TTY use must provide one flag. Manual side-tasks survive. Rollback is optional and fail-closed; cancellation still completes with changes kept when rollback is unavailable. |
 | `./loop.sh refine ['<note>']` | At a human sign-off gate (BLOCKED): open an interactive Claude Code session to adjust reversible within-contract knobs and preview live. End it (Ctrl-C / `/exit`), then confirm to sign off the `human` rows and re-certify. A REQUIRED-behavior change belongs in the contract skill (Claude Code: `/loop-contract`; Codex: `$loop-contract`), not here. |
 | `./loop.sh signoff [--yes]` | At a human sign-off gate (BLOCKED): complete approval — lists every pending `human` acceptance row, asks one confirm (`--yes` skips it, e.g. headless), marks them `verified` and re-certifies (the evaluator and the independent reviewer still gate SUCCESS). All-or-nothing by design; to request changes instead: `./loop.sh resume --note '<what to adjust>'`. |
 | `./loop.sh add <task> [--auto] [--after <id,id>]` | Queue a Fleet task any time (alias for `fleet add`); `--force-after` accepts an explicitly failed dependency. |
-| `./loop.sh fleet <cmd>` | Fleet control: `run`, `add`, `approve`, `status`, `report`, `logs`, `stop`, `resume`, `ack-plan`, `merge`, `clean`, and `unlock`. |
+| `./loop.sh fleet <cmd>` | Fleet control: `run`, `add`, `approve`, `status`, `report`, `logs`, `discard` (alias of the root command), `stop`, `resume`, `ack-plan`, `merge`, `clean`, and `unlock`. |
 | `./loop.sh watch [--interval s] [--max-runs n]` | Re-run `run` on an interval until success or escalation. |
 | `./loop.sh status` | Show state, approval status, models, timeouts, and cost. |
 | `./loop.sh report [--text\|--html] [--open\|--no-open]` | Show evidence, drift, decisions, and cost; optionally open the latest HTML view. |

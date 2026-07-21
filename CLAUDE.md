@@ -40,7 +40,8 @@ suite. To iterate on one area, validate the change with `bash -n` first, then ru
 Do not add `&` / background a second copy — see the concurrency rules below.
 
 Inside a *deployed* project the same script drives the loop (`./loop.sh` auto, `./loop.sh start
-"<instruction>"`, `./loop.sh run`, `./loop.sh status`/`report`). You rarely run these here; the
+"<instruction>"`, `./loop.sh run`, `./loop.sh discard [--rollback|--keep-changes]`,
+`./loop.sh status`/`report`). You rarely run these here; the
 test fixtures exercise them against the fake agent instead.
 
 ## Architecture
@@ -65,15 +66,20 @@ Two layers, and the split is the point:
   `check_harness`) around each planner call turns any planner-side write or commit into
   `RISK_REQUIRES_APPROVAL`. Mechanical validation does not make semantic plan quality
   deterministic.
+  Whole-plan `discard` uses the same deterministic-authority posture: one durable request
+  stops all future claims/merges for that plan authority before its queue state is removed.
+  Optional rollback is a separate `ROLLBACK` reader role (`MODEL_ROLLBACK`,
+  `AGENT_ROLLBACK`, `EFFORT_ROLLBACK`, and approval-gated `TIMEOUT_ROLLBACK`), never model
+  authority by itself.
 - **`bin/evaluate.sh`** — the evaluator. Re-runs the user's `VERIFY_COMMANDS` *outside* the
   model. This is the maker–checker boundary: deterministic checks gate first, AI review second,
   humans see only an evidence report. No model self-grades.
 - **`kit/.claude/skills/loop-*/SKILL.md`** — the canonical *prompts*. Each phase of the spine
   is a skill: `loop-contract` (+`-review`), `loop-decompose` (+`-review`), `loop-plan`
   (+`-review`), `loop-iterate`, `loop-review`, `loop-stop-eval`, `loop-evidence`,
-  `loop-supervise`, plus `loop-setup` (interactive agent/model tuning, dual-projected) and
-  Claude-only `loop-refine`.
-  `init`/`update` project the twelve headless-compatible skills into `.agents/skills` with
+  `loop-supervise`, `loop-rollback-review`, plus `loop-setup` (interactive agent/model tuning,
+  dual-projected) and Claude-only `loop-refine`: fourteen canonical Claude skills total.
+  `init`/`update` project the thirteen headless-compatible skills into `.agents/skills` with
   Codex-valid frontmatter and invocation metadata; never maintain a second source tree or
   deploy `.codex/skills`.
 - **`kit/loop-docs/*.md`** — pristine templates for the working docs (`product-contract.md`,
@@ -90,7 +96,9 @@ mechanism implements.
 
 **The spine:** contract → approve → decompose → loop → evidence. State is once-approved and
 hash-locked, then the plan is free to evolve. Terminal states each map to an exit code
-(`SUCCESS`/`NO_OP` 0, `NEEDS_*` 3, `BLOCKED`/`STALLED` 4, `BUDGET_EXCEEDED` 5, usage/unapproved 2).
+(`SUCCESS`/`NO_OP` 0, `CANCELLED` 0 or 4 when rollback is unavailable or cleanup
+quarantines artifacts, `NEEDS_*` 3, `BLOCKED`/`STALLED` 4, `BUDGET_EXCEEDED` 5,
+usage/unapproved 2).
 The **only** path to `SUCCESS` is: every VERIFY_COMMAND passes on evaluator re-run, the success
 gate ran, the independent reviewer said APPROVE with a clean per-REQ table, an evidence report
 exists, and no unreviewed change follows it.
@@ -114,6 +122,20 @@ tasks into isolated git worktrees (siblings under `<project>-loops/`), serialize
 the merged whole against the master contract (the integration gate ignores even `REVIEW_MODE=off`),
 and handles dependency gating, replanning, and human escalation. Approved `.agents` skills and
 the repository `.codex/**` control plane are copied byte-for-byte into each worker.
+
+**Whole-plan discard.** `./loop.sh discard [--rollback|--keep-changes]` permanently revokes one
+planned queue authority as a unit; it does not delete manual side-tasks, which are retained or
+parked for resume. A TTY may confirm the choice, while non-TTY use must name a flag. Rollback
+requires both structural provenance checks and the independent read-only reviewer, and is
+UNAVAILABLE on manual/parallel product commits, a dirty tracked parent/index, branch/source
+mismatch, an unrelated Git operation, possible external side effects, or any uncertainty. A safe
+rollback is one new inverse commit advanced by `--ff-only`, never a reset/rebase/history rewrite.
+Rollback failure never resurrects the queue: product changes are retained, the cancellation
+archive is committed under `.loop/docs/run-archive/`, and the root finishes `CANCELLED`; rerunning
+the same choice after a crash resumes the durable transaction. The discard request is the WAL and
+is removed last. Cleanup trusts committed archive metadata, pins worker commits under OID-specific
+`refs/loop-kit/discard/` refs, deletes branches with compare-and-delete, and preserves post-stage
+drift or user-owned ignored files in place or under `.loop/fleet/discard-quarantine/`.
 
 ## Editing invariants (these will fail the suite if broken)
 

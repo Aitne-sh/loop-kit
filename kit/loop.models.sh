@@ -17,6 +17,7 @@ MODEL_EVIDENCE="sonnet"   # evidence report generation
 MODEL_STOP_EVAL="haiku"   # advisory stop evaluation (cheap, runs every iteration)
 MODEL_DECOMPOSE="opus"    # supervisor: master contract -> task plan (fleet orchestration)
 MODEL_SUPERVISE="opus"    # supervisor: mid-run decisions on escalated fleet tasks
+MODEL_ROLLBACK="opus"     # independent rollback safety review (can veto, never widen eligibility)
 
 # Interim reviews only (the steering feedback after every CONTINUE iteration —
 # the highest-frequency review call). Empty or removed = inherit MODEL_REVIEW.
@@ -53,6 +54,7 @@ MODEL_REVIEW_INTERIM="sonnet"
 #AGENT_EVIDENCE=""
 #AGENT_DECOMPOSE=""
 #AGENT_SUPERVISE=""       # codex here disables supervisor session reuse (fresh calls)
+#AGENT_ROLLBACK=""        # independent read-only rollback safety review
 #AGENT_CONTRACT=""        # HEADLESS definition only (auto / no-TTY start, incl.
                           # fleet workers); interactive ./loop.sh start sessions
                           # and refine always launch Claude Code.
@@ -71,7 +73,7 @@ MODEL_REVIEW_INTERIM="sonnet"
 #     max|ultra ONLY on gpt-5.6-sol / gpt-5.6-terra. On any other Codex model a
 #     max/ultra request is clamped down to xhigh (so it degrades, never errors).
 # Applies to all roles above (implement, review, plan, contract, evidence,
-# stop-eval, decompose, supervise) and to the interactive contract sessions.
+# stop-eval, decompose, supervise, rollback) and to the interactive contract sessions.
 # Higher = more thinking per call. `ultra` additionally spawns parallel Codex
 # subagents and is preview-only — expect substantially higher token use.
 #
@@ -93,6 +95,7 @@ EFFORT_EVIDENCE="medium"  # report authoring — summarization, not judgment
 #EFFORT_CONTRACT=""
 #EFFORT_DECOMPOSE=""
 #EFFORT_SUPERVISE=""
+#EFFORT_ROLLBACK=""       # independent rollback safety judgment
 
 # Runaway-context signal: when one implement call consumes >= this many agent
 # turns, the next iteration gets an advisory nudge (.loop/context-nudge.md) to

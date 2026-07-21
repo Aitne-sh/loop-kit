@@ -43,7 +43,7 @@ The skill argument (if any) is the human's opening note.
    **What it controls**. Cover the knob families: `AGENT_<ROLE>` (claude | codex),
    `MODEL_<ROLE>` (a Claude alias or a Codex slug), `EFFORT_<ROLE>` / `LOOP_EFFORT`
    (minimal..ultra), and `TURNS_NUDGE_AT`. List the phase roles (contract, plan, implement,
-   review, review-interim, stop-eval, evidence, decompose, supervise) and show the
+   review, review-interim, stop-eval, evidence, decompose, supervise, rollback) and show the
    current value from the copy alongside each, so they see what they have now.
 
 3. **Answer questions from the reference.** When they ask what a setting means or
