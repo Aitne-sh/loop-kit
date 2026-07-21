@@ -8,8 +8,8 @@ templates; there is no package manager, build step, server, or compiled artifact
 `bin/loop.sh init <target>` copies the managed files into a target project,
 including provider-native skill trees for Claude Code and Codex.
 
-Read `CLAUDE.md` before changing behavior. Use `README.md` as the user-facing
-manual, but confirm implementation claims against the scripts and tests.
+Read `CLAUDE.md` before changing behavior. Use `README.md` and `docs/*.md` as the
+user-facing manual, but confirm implementation claims against the scripts and tests.
 
 ## Repository Map
 
@@ -19,8 +19,8 @@ manual, but confirm implementation claims against the scripts and tests.
   `VERIFY_COMMANDS` before model review.
 - `kit/.claude/skills/loop-*/SKILL.md`: canonical prompts for contract, planning,
   implementation, review, decomposition, supervision, and evidence phases.
-  Deployment projects ten of them into `.agents/skills` for Codex; `loop-refine`
-  remains Claude-only.
+  Deployment projects thirteen of the fourteen into `.agents/skills` for Codex;
+  `loop-refine` remains Claude-only.
 - `kit/loop-docs/`: pristine templates copied into deployed projects.
 - `kit/*.config.sh` and `kit/loop.models.sh`: shipped configuration defaults.
 - `tests/run_tests.sh`: driver for the authoritative zero-token behavioral suite.
@@ -31,6 +31,9 @@ manual, but confirm implementation claims against the scripts and tests.
 - `tests/artifact-lifecycle.txt`: required ownership classification for every
   `.loop/` path literal introduced in `bin/loop.sh`.
 - `examples/`: small deployment fixtures, not the harness implementation.
+- `README.md` plus `docs/*.md`: the user manual. `README.md` covers the pitch,
+  the command lifecycle, and the architecture; each `docs/` page owns one
+  subsystem in depth. Keep a behavior change and its documentation page in sync.
 
 ## Parallel-Session Safety
 
@@ -75,7 +78,7 @@ Assume Claude Code and Codex sessions may be implementing concurrently.
   checks must all pass. Errors, timeouts, outages, or spent budgets never become
   `SUCCESS`.
 - Keep shipped defaults synchronized across `kit` configuration, fallback logic
-  in `bin/loop.sh`, `README.md`, and mirrored test assertions.
+  in `bin/loop.sh`, `docs/configuration.md`, and mirrored test assertions.
 
 ## Validation
 

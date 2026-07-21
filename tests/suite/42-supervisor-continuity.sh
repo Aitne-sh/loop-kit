@@ -431,17 +431,21 @@ case "$upd_out2" in
 esac
 check "still exactly one FLEET_DECOMPOSE line" drift-note 1 "$(grep -cE '^FLEET_DECOMPOSE=' "$WORK/drift-note/fleet.config.sh")"
 
-section "config: FLEET_MAX_* defaults agree across code fallback, README, fleet.config.sh"
+section "config: FLEET_MAX_* defaults agree across code fallback, docs, fleet.config.sh"
 # guard the three-way mirror so a future edit to one place can't silently diverge
 # (the exact drift Fix B closed: code fallback that disagreed with the shipped value)
+# The documented value lives in docs/configuration.md — the config tables moved out of
+# README.md when the manual was split into README + docs/ (AGENTS.md names it as the mirror).
+doc_mirror="$ROOT/docs/configuration.md"
+[ -f "$doc_mirror" ] || bad "config mirror doc missing: docs/configuration.md" config-mirror
 mirror_ok=1
 for key in FLEET_MAX_PARALLEL FLEET_MAX_TASKS FLEET_MAX_REPLAN_TASKS FLEET_MAX_PLAN_REVISIONS; do
   shipped=$(grep -E "^${key}=" "$ROOT/kit/fleet.config.sh" | tail -1 | sed -E 's/[^0-9]//g')
   badfb=$(grep -oE "fcfg ${key} [0-9]+" "$ROOT/bin/loop.sh" | awk -v s="$shipped" '$3!=s{print}')
-  readme_n=$(grep -E "^\| .${key}. \|" "$ROOT/README.md" | head -1 | awk -F'|' '{gsub(/[^0-9]/,"",$3); print $3}')
+  doc_n=$(grep -E "^\| .${key}. \|" "$doc_mirror" | head -1 | awk -F'|' '{gsub(/[^0-9]/,"",$3); print $3}')
   [ -n "$shipped" ] || { mirror_ok=0; echo "  $key: no shipped value parsed"; }
   [ -z "$badfb" ] || { mirror_ok=0; echo "  $key: fcfg fallback(s) != shipped $shipped: $badfb"; }
-  [ "$readme_n" = "$shipped" ] || { mirror_ok=0; echo "  $key: README=$readme_n != shipped=$shipped"; }
+  [ "$doc_n" = "$shipped" ] || { mirror_ok=0; echo "  $key: docs/configuration.md=$doc_n != shipped=$shipped"; }
 done
 if [ "$mirror_ok" = 1 ]; then ok "config default 3-way mirror agrees"; else bad "config default 3-way mirror drift" config-mirror; fi
 

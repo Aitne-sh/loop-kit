@@ -119,9 +119,13 @@ Two layers, and the split is the point:
 `init`/`update` copy `bin/*` + `kit/*` into a project as `loop.sh`,
 `.loop/bin/evaluate.sh`, `.claude/skills/loop-*`, projected `.agents/skills/loop-*`,
 `.loop/docs/*`, and the config files. They preserve user-owned `AGENTS.md`,
-`AGENTS.override.md`, `.codex/**`, and non-managed skills. `README.md` (extensive) is the user
-manual; its "How the theory maps to the implementation" table cites the primary sources each
-mechanism implements.
+`AGENTS.override.md`, `.codex/**`, and non-managed skills. The user manual is `README.md`
+(pitch, the `init`→`setup`→`start`→`discard` command lifecycle, architecture) plus one
+`docs/*.md` page per subsystem — `contract`, `iteration`, `fleet`, `discard`,
+`configuration`, `codex`, `states-and-recovery`, `security`, `html-views`, `deployment`,
+`testing`, `theory`. A behavior change updates the owning page, not the README summary
+alone; `docs/theory.md` cites the primary sources each mechanism implements, and
+`docs/configuration.md` is the shipped-default mirror the suite pins.
 
 **The spine:** contract → approve → decompose → loop → evidence. State is once-approved and
 hash-locked, then the plan is free to evolve. Terminal states each map to an exit code
@@ -201,9 +205,15 @@ drift or user-owned ignored files in place or under `.loop/fleet/discard-quarant
   separate environment capabilities.
 - **Planner publication is harness-owned.** DECOMPOSE and iteration-0 PLAN stay in the
   read-only `planner` envelope path; never let a model write their authoritative documents
-  and never widen those call sites back to `full`. Candidate bytes belong only in the
-  ignored, contract-scoped `.loop/plan-candidates/`; decompose and implementation-plan
-  candidates are re-validated after their independent reviews (`loop-decompose-review` /
+  and never widen those call sites back to `full`. Candidate bytes belong only in
+  ignored, contract-scoped channels: staging in `.loop/plan-candidates/`, plus the
+  rejected attempt appended verbatim to the git-ignored `*-feedback.md` for the retry
+  (`append_rejected_attempt` — guarded by `git check-ignore`, capped at the envelope's
+  1 MiB; the retry fixes only the named violations instead of regenerating from
+  scratch). The envelope tolerates prose before its opening marker (extraction is
+  marker-bounded; a stray marker or duplicate verdict still rejects). Decompose and
+  implementation-plan candidates are re-validated after their independent reviews
+  (`loop-decompose-review` /
   `loop-plan-review`; opt-out `LOOP_DECOMPOSE_REVIEW=0` / `LOOP_PLAN_REVIEW=0` — the
   plan-review verdict token is `IMPL-PLAN-REVIEW:`, never `PLAN-REVIEW:`, which the fleet
   phase-boundary review owns), and only the harness publishes `.loop/docs/task-plan.md` /
