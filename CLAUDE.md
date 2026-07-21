@@ -18,16 +18,21 @@ compiled artifact. The deliverable is the scripts themselves.
 ```bash
 # Full test suite — the primary gate. Zero-token E2E: swaps fake agents in for `claude` /
 # `codex` (LOOP_CLAUDE_CMD / LOOP_CODEX_CMD) and drives every terminal state,
-# review/stop-eval, the fleet, the resume matrix, and tamper defenses. ~1000+ assertions,
-# a few minutes. Ends with a shellcheck gate.
-tests/run_tests.sh
+# review/stop-eval, the fleet, the resume matrix, and tamper defenses. ~1000+ assertions.
+# Ends with a shellcheck gate.
+tests/run_tests.sh                       # parallel lane at -j<auto: cores-1, capped 4>, then serial
+tests/run_tests.sh -j1                   # strict manifest order, one process (baseline mode)
+tests/run_tests.sh --only 50-discard     # ONE suite file (substring match); repeatable
+tests/run_tests.sh --list                # every suite file and its lane
+LOOP_TEST_TIMING=1 tests/run_tests.sh    # + a slowest-sections table
 
 # Fast syntax check while iterating on the harness (loop.sh targets bash, not POSIX sh —
 # `sh -n` will report false errors on its process-substitution/arrays; use bash).
 bash -n bin/loop.sh
 
-# Lint (also run as the suite's final assertion)
-shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh tests/fake_codex.sh tests/run_tests.sh
+# Lint (also run as the suite's final assertion, over the suite files too)
+shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh tests/fake_codex.sh \
+           tests/run_tests.sh tests/lib.sh tests/suite/*.sh
 
 # Deploy / manage the kit in a target project (run from THIS repo = "kit mode")
 bin/loop.sh init <dir> [--template demo1-bugfix|demo2-feature]
@@ -35,9 +40,28 @@ bin/loop.sh update <dir> [--approve]
 bin/loop.sh uninstall <dir> [--force]     # removes every deployed file + run state
 ```
 
-There is **no single-test filter** — `run_tests.sh` is one linear script that runs the entire
-suite. To iterate on one area, validate the change with `bash -n` first, then run the full suite.
-Do not add `&` / background a second copy — see the concurrency rules below.
+The suite is a **driver plus one file per area**: `tests/run_tests.sh` decides what runs and
+aggregates the counts; the assertions live in `tests/suite/NN-*.sh`, each of which sources
+`tests/lib.sh` (every shared helper — `make_fixture`, `run_loop`, `wait_sup`, the fleet/orch/
+discard/resume fixture builders) and is also runnable on its own. `tests/suite/manifest.txt`
+fixes the order and classifies every file as `parallel` or `serial`; a file missing from it, or
+carrying any other lane, is a hard error, so a new suite file cannot be silently skipped.
+
+**Lanes.** The parallel lane runs at `-j` (default: cores − 1, capped at 4 — the suite shares
+the machine with agent sessions; raise it explicitly on an idle box), then the serial lane runs
+alone. The parallel stage is work-bound, not critical-path bound: measured wall time tracks
+total work ÷ `-j`, so `-j` is the knob, not further file splitting. Put a test in `serial` only for one of the two reasons the driver
+header documents: it SIGKILLs a real `loop.sh` and then asserts the recorded pid is dead
+(`ps -p <pid> | grep loop.sh` is machine-global, so a pid recycled by a sibling lane reads as
+alive), or it pins `MAX_ITER_SECONDS=1` / observes process topology, where CPU contention
+changes what is measured. Everything else — including nearly all of the fleet — waits on
+observable state through bounded polls and is lane-safe.
+
+Bounded waits (`while [ "$n" -lt $((N * POLL_SCALE)) ]`, `SUP_WAIT_MAX`) are **hang backstops,
+not assertions**; the driver raises them when lanes share the CPU so contention shows up as a
+slower suite, never as a spurious timeout FAIL. Never express an assertion as one of these
+ceilings. Do not add `&` / background a second copy of the driver — see the concurrency rules
+below.
 
 Inside a *deployed* project the same script drives the loop (`./loop.sh` auto, `./loop.sh start
 "<instruction>"`, `./loop.sh run`, `./loop.sh discard [--rollback|--keep-changes]`,
@@ -211,11 +235,12 @@ wrapper path contains that session's id).
 
 **Rules:**
 
-- **Never edit `bin/loop.sh`, `tests/run_tests.sh`, or `kit/**` while any test suite is running** —
-  yours or a peer's. `run_tests.sh` is read incrementally by bash (a live edit corrupts the running
-  script) and its PID-liveness checks are machine-global, so a second concurrent suite makes fleet
-  timing tests flaky (the `run_tests.sh` header documents this). Wait for the suite to finish, or
-  run yours only once no peer suite is active.
+- **Never edit `bin/loop.sh`, `tests/**`, or `kit/**` while any test suite is running** —
+  yours or a peer's. Suite files are read incrementally by bash (a live edit corrupts the
+  running script), and the suite reads `kit/**` + `bin/**` as test *input*. The driver
+  parallelizes *within* one suite (lanes), but two concurrent **drivers** are still forbidden:
+  PID-liveness validation is machine-global, so the other run's recycled pids can be adopted as
+  live tasks. Wait for the suite to finish, or run yours only once no peer suite is active.
 - **Do not revert, overwrite, or `git checkout` changes you did not make.** Treat them as a peer's
   in-flight requirement to preserve.
 - **Re-read immediately before each edit.** mtimes shift under you; use `Read` then `Edit` with

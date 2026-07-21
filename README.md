@@ -1481,8 +1481,16 @@ prompt-injection regression corpus for the skills.
 ## Tests
 
 ```bash
-tests/run_tests.sh
+tests/run_tests.sh                      # everything (parallel lane, then the serial lane)
+tests/run_tests.sh --list               # every suite file and its lane
+tests/run_tests.sh --only 50-discard    # just one area, while iterating
+LOOP_TEST_TIMING=1 tests/run_tests.sh   # + a slowest-sections table
 ```
+
+The assertions live in `tests/suite/NN-*.sh`, one file per area, each sourcing the shared
+`tests/lib.sh`; `tests/run_tests.sh` is the driver that runs them and aggregates the counts.
+Files listed as `parallel` in `tests/suite/manifest.txt` run concurrently, then the small
+`serial` lane — the tests whose subject is process identity or wall-clock timing — runs alone.
 
 The suite runs fake Claude and Codex agents (`LOOP_CLAUDE_CMD` and `LOOP_CODEX_CMD`) to
 drive every terminal state end to end — more than 1,400 assertions at zero token cost.

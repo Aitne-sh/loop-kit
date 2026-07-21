@@ -18,8 +18,10 @@ jobs:
   suite:
     name: suite (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # macOS has crossed 25 minutes as the behavioral suite has grown. Keep the
-    # watchdog bounded, but leave enough headroom for hosted-runner variance.
+    # The suite is exec-latency bound, not CPU bound, so it runs its parallel lane
+    # concurrently (tests/run_tests.sh -j). Keep the watchdog well above the
+    # expected wall time — hosted-runner variance is large and a timeout here
+    # reports as a mystery failure rather than a slow suite.
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -56,15 +58,26 @@ jobs:
           shellcheck --version 2>/dev/null | awk '/version:/{print "shellcheck " $2}' || echo "no shellcheck on runner"
           command -v claude >/dev/null && echo "claude shim on PATH" || echo "no claude on PATH"
       - name: Run full suite (includes shellcheck gate)
+        env:
+          LOOP_TEST_TIMING: "1"
         run: |
           log="$RUNNER_TEMP/loop-suite.log"
           set +e
           ./tests/run_tests.sh 2>&1 | tee "$log"
           status=${PIPESTATUS[0]}
           set -e
+          # Wall time + the slowest sections, on every run: suite duration is a
+          # thing that regresses silently, and this is the only place it is recorded.
+          {
+            echo "## suite (${{ matrix.os }})"
+            echo '```text'
+            grep -E '^(passed:|wall:)' "$log" || true
+            sed -n '/^slowest sections:/,/^$/p' "$log" | head -20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           if [ "$status" -ne 0 ]; then
             {
-              echo '## Full suite failure (last 160 lines)'
+              echo '### Full suite failure (last 160 lines)'
               echo '```text'
               tail -n 160 "$log"
               echo '```'
@@ -134,7 +147,8 @@ jobs:
       - name: Prove LF checkout (shebangs are not CRLF)
         run: |
           fail=0
-          for f in bin/loop.sh bin/evaluate.sh tests/run_tests.sh tests/fake_claude.sh; do
+          for f in bin/loop.sh bin/evaluate.sh tests/run_tests.sh tests/lib.sh \
+                   tests/fake_claude.sh tests/suite/*.sh; do
             if head -1 "$f" | od -An -c | grep -qF '\r'; then
               echo "CRLF in first line of $f — .gitattributes eol=lf not applied"; fail=1
             fi
@@ -142,11 +156,14 @@ jobs:
           [ "$fail" -eq 0 ] && echo "OK: shebangs are LF"
           exit "$fail"
       - name: Syntax check
-        run: bash -n bin/loop.sh bin/evaluate.sh tests/run_tests.sh tests/fake_claude.sh
+        run: |
+          bash -n bin/loop.sh bin/evaluate.sh tests/run_tests.sh tests/lib.sh \
+                 tests/fake_claude.sh tests/suite/*.sh
       - name: shellcheck
         run: |
           if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh tests/run_tests.sh
+            shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh \
+                       tests/run_tests.sh tests/lib.sh tests/suite/*.sh
           else
             echo "shellcheck not on the runner; skipping"
           fi

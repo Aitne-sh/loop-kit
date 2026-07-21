@@ -23,8 +23,11 @@ manual, but confirm implementation claims against the scripts and tests.
   remains Claude-only.
 - `kit/loop-docs/`: pristine templates copied into deployed projects.
 - `kit/*.config.sh` and `kit/loop.models.sh`: shipped configuration defaults.
-- `tests/run_tests.sh`: authoritative zero-token behavioral suite using
-  `tests/fake_claude.sh` and `tests/fake_codex.sh`; it exercises the deployed layout.
+- `tests/run_tests.sh`: driver for the authoritative zero-token behavioral suite.
+  The assertions live in `tests/suite/NN-*.sh` (each sources `tests/lib.sh` and is
+  runnable on its own); `tests/suite/manifest.txt` fixes the order and assigns each
+  file to the `parallel` or `serial` lane. It uses `tests/fake_claude.sh` and
+  `tests/fake_codex.sh`, and exercises the deployed layout.
 - `tests/artifact-lifecycle.txt`: required ownership classification for every
   `.loop/` path literal introduced in `bin/loop.sh`.
 - `examples/`: small deployment fixtures, not the harness implementation.
@@ -43,10 +46,10 @@ Assume Claude Code and Codex sessions may be implementing concurrently.
 4. If another change touches the same code, preserve both requirements and
    integrate them coherently. Do not choose one implementation by discarding the
    other. If they genuinely conflict, stop and report the exact conflict.
-5. Never edit `bin/loop.sh`, `tests/run_tests.sh`, or `kit/**` while any test
-   suite is running. Never start a second suite, or a suite alongside a real
-   Fleet run; PID-liveness checks are machine-global and concurrent runs become
-   flaky.
+5. Never edit `bin/loop.sh`, `tests/**`, or `kit/**` while any test suite is
+   running. The driver parallelizes within one suite, but never start a second
+   driver, or a suite alongside a real Fleet run; PID-liveness checks are
+   machine-global and concurrent runs become flaky.
 
 ## Implementation Invariants
 
@@ -79,7 +82,8 @@ Assume Claude Code and Codex sessions may be implementing concurrently.
 During iteration, run `bash -n` on every changed shell script. Run:
 
 ```bash
-shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh tests/fake_codex.sh tests/run_tests.sh
+shellcheck bin/loop.sh bin/evaluate.sh tests/fake_claude.sh tests/fake_codex.sh \
+           tests/run_tests.sh tests/lib.sh tests/suite/*.sh
 ```
 
 The final behavioral gate is:
@@ -88,8 +92,9 @@ The final behavioral gate is:
 tests/run_tests.sh
 ```
 
-It has no single-test filter and must run alone, in the foreground, after peer
-suites and Fleet processes finish. A passing suite proves harness mechanics; it
+Use `tests/run_tests.sh --only <name>` to iterate on one suite file and
+`--list` to see them all; the full run must still happen alone, in the
+foreground, after peer suites and Fleet processes finish. A passing suite proves harness mechanics; it
 does not by itself prove real-model output quality. For documentation-only
 changes, also run `git diff --check` and verify every referenced command/path.
 
