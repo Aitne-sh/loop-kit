@@ -100,6 +100,13 @@ HOLISTIC_EVERY_N=3         # every Nth interim review widens its diff to the WHO
 HOLISTIC_TRIGGER_LINES=400 # additionally widen when a single iteration changes
                            # at least this many lines (big diffs shift global
                            # coherence the most). 0 = no size trigger.
+GATE_SPLIT_LINES=400       # run diffs of at least this many changed lines split the
+                           # success-gate review into TWO calls: core (per-REQ verdicts,
+                           # checklist audit, assumption adjudication) + an erosion-only
+                           # audit (duplication, dead code, falsified doc claims). One
+                           # call carrying all of it over a big diff reliably drops the
+                           # erosion end. Both must APPROVE. Costs one extra reviewer
+                           # call per gate visit on large runs. 0 = single-call gate.
 MAX_REVISIONS=3            # consecutive reviewer rejections -> BLOCKED (human review).
                            # Counted per review type: success-gate rejections and
                            # interim (per-iteration) rejections have separate counters,

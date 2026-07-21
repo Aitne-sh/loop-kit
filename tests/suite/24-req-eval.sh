@@ -736,6 +736,123 @@ RC=0
 ./loop.sh approve >/dev/null 2>&1 </dev/null || RC=$?
 check "clean re-approve passes the lint (exit 0)" aclint-clean 0 "$RC"
 
+section "approve lint: padding typo, sequence gap, and dangling AC references are refused"
+# the three-scheme incident in miniature: the contract's own AC list holds a
+# zero-padding outlier (AC-09), its prose cites an id the list never defines
+# (AC-010), and loop.config.sh comments count with a third scheme (AC-011).
+# Check (c) stays silent — every ANCHOR has a checklist row — so only the
+# shape/closure checks can surface this before approval.
+make_fixture aclint-idscheme
+cat >> .loop/docs/product-contract.md <<'EOF'
+
+## Acceptance Criteria
+- AC-001 (cmd): ./check.sh exits 0
+- AC-002 (cmd): a
+- AC-003 (cmd): b
+- AC-004 (cmd): c
+- AC-005 (cmd): d
+- AC-006 (cmd): e
+- AC-007 (cmd): f
+- AC-008 (cmd): g
+- AC-09 (cmd): the design doc stays in sync
+- AC-012 (cmd): existing paths stay reachable
+
+## Validation Commands
+1. ./check.sh — proves AC-001..AC-008 / AC-010
+EOF
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | check.sh proves the fix | cmd | pending | - |
+| AC-002 | REQ-001 | a | cmd | pending | - |
+| AC-003 | REQ-001 | b | cmd | pending | - |
+| AC-004 | REQ-001 | c | cmd | pending | - |
+| AC-005 | REQ-001 | d | cmd | pending | - |
+| AC-006 | REQ-001 | e | cmd | pending | - |
+| AC-007 | REQ-001 | f | cmd | pending | - |
+| AC-008 | REQ-001 | g | cmd | pending | - |
+| AC-09 | REQ-001 | design doc in sync | cmd | pending | - |
+| AC-012 | REQ-001 | existing paths reachable | cmd | pending | - |
+EOF
+printf '# gate regression guard (AC-011 and the preservation invariants)\n' >> loop.config.sh
+git add -A && git commit -q -m "three-scheme AC numbering"
+RC=0
+./loop.sh approve >"$WORK/lint-out" 2>&1 </dev/null || RC=$?
+check "approve refused (exit 3, unattended)" aclint-idscheme 3 "$RC"
+if grep -q 'AC-09 (did you mean AC-009?)' "$WORK/lint-out"; then
+  ok "lint flags the zero-padding outlier with the intended id"
+else
+  bad "padding-typo lint message absent: $(tr '\n' ' ' < "$WORK/lint-out")" aclint-idscheme
+fi
+if grep -q "AC sequence skips: AC-010 AC-011" "$WORK/lint-out"; then
+  ok "lint reports the sequence gap"
+else
+  bad "sequence-gap lint message absent: $(tr '\n' ' ' < "$WORK/lint-out")" aclint-idscheme
+fi
+if grep -q 'never defined as Acceptance Criteria: AC-010 AC-011' "$WORK/lint-out"; then
+  ok "lint names the dangling prose/config references"
+else
+  bad "dangling-reference lint message absent: $(tr '\n' ' ' < "$WORK/lint-out")" aclint-idscheme
+fi
+if ! grep -q 'no checklist row' "$WORK/lint-out"; then
+  ok "anchor->row check stays silent (precision guard)"
+else
+  bad "check (c) fired although every anchor has a row" aclint-idscheme
+fi
+
+section "approve lint: one zero-padded scheme with closed references approves"
+make_fixture aclint-idscheme-clean
+cat >> .loop/docs/product-contract.md <<'EOF'
+
+## Acceptance Criteria
+- AC-001 (cmd): ./check.sh exits 0
+- AC-002 (cmd): the fix is minimal
+
+## Validation Commands
+1. ./check.sh — proves AC-001 and AC-002
+EOF
+cat > .loop/docs/acceptance-checklist.md <<'EOF'
+# Acceptance Checklist
+
+| AC | REQ | Expectation | Method | Status | Evidence |
+|---|---|---|---|---|---|
+| AC-001 | REQ-001 | check.sh proves the fix | cmd | pending | - |
+| AC-002 | REQ-001 | the fix is minimal | cmd | pending | - |
+EOF
+printf '# regression guard for AC-001\n' >> loop.config.sh
+git add -A && git commit -q -m "clean id scheme"
+RC=0
+./loop.sh approve >/dev/null 2>&1 </dev/null || RC=$?
+check "clean scheme approves (exit 0)" aclint-idscheme-clean 0 "$RC"
+
+section "verify commands receive LOOP_ITERATION / LOOP_OBSERVATIONS_DIR"
+# probes that name observation artifacts per iteration consume these instead of
+# parsing the harness-private .loop/run-checkpoint (not a stable interface).
+# The baseline pass exports iteration 0; the evaluator exports the current one.
+make_fixture verify-env
+cat > check.sh <<'EOF'
+#!/bin/sh
+[ -n "$LOOP_ITERATION" ] || exit 3
+case "$LOOP_OBSERVATIONS_DIR" in */.loop/observations) ;; *) exit 4 ;; esac
+mkdir -p "$LOOP_OBSERVATIONS_DIR"
+echo "$LOOP_ITERATION" >> "$LOOP_OBSERVATIONS_DIR/env-iterations.txt"
+grep -q fixed value.txt
+EOF
+chmod +x check.sh
+git add -A && git commit -q -m "env-asserting gate command"
+./loop.sh approve >/dev/null
+run_loop "READY_NOW"
+check "exit code 0 (gate passes with env asserted)" verify-env 0 "$RC"
+check "state SUCCESS" verify-env SUCCESS "$STATE"
+if grep -qx 0 .loop/observations/env-iterations.txt \
+   && grep -qx 1 .loop/observations/env-iterations.txt; then
+  ok "baseline exported iteration 0 and the evaluator the current iteration"
+else
+  bad "iteration env values wrong: $(tr '\n' ' ' < .loop/observations/env-iterations.txt 2>/dev/null)" verify-env
+fi
+
 section "static: sizing rubric / row disciplines / budget+safe-gate rules / channel-loss escalation"
 if grep -qF 'MAX_ITERATIONS` ≈ max(6, 2 × REQ count + red→green command count)' "$SK/loop-contract/SKILL.md"; then
   ok "loop-contract ships the stop-condition sizing rubric"
@@ -756,5 +873,24 @@ if grep -qF 'observation channel unusable' "$SK/loop-iterate/SKILL.md"; then
   ok "loop-iterate ships the channel-loss escalation"
 else
   bad "channel-loss escalation missing from loop-iterate" prompt-invariants
+fi
+if grep -qF '**One numbering scheme, everywhere.**' "$SK/loop-contract/SKILL.md" \
+   && grep -qF 'LOOP_ITERATION' "$SK/loop-contract/SKILL.md"; then
+  ok "loop-contract ships the AC numbering discipline + probe env contract"
+else
+  bad "AC numbering / probe-env rules missing from loop-contract" prompt-invariants
+fi
+if grep -qF '**Loop AC ids stay out of product files.**' "$SK/loop-iterate/SKILL.md" \
+   && grep -qF '**Extending an enumerated set closes with a sweep.**' "$SK/loop-iterate/SKILL.md" \
+   && grep -qF 'LOOP_OBSERVATIONS_DIR' "$SK/loop-iterate/SKILL.md"; then
+  ok "loop-iterate ships the AC-id scoping, cardinality-sweep and probe-env rules"
+else
+  bad "AC-id scoping / sweep / probe-env rules missing from loop-iterate" prompt-invariants
+fi
+if grep -qF 'split=erosion' "$SK/loop-review/SKILL.md" \
+   && grep -qF 'claims this run falsified' "$SK/loop-review/SKILL.md"; then
+  ok "loop-review ships the split-gate mandate + falsified-claims lens"
+else
+  bad "split-gate / falsified-claims rules missing from loop-review" prompt-invariants
 fi
 

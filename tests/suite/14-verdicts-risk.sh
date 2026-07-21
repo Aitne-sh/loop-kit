@@ -168,3 +168,77 @@ else
   bad "banner printed with no DR entry (template leak)" blocked-quiet
 fi
 
+
+section "split gate: over GATE_SPLIT_LINES the gate runs core + erosion calls"
+make_fixture gate-split
+printf 'GATE_SPLIT_LINES=1\n' >> loop.config.sh
+./loop.sh approve >/dev/null   # loop.config.sh is hash-governed — re-approve the edit
+run_loop "READY_NOW" "APPROVE,APPROVE"
+check "exit code 0" gate-split 0 "$RC"
+check "state SUCCESS" gate-split SUCCESS "$STATE"
+if grep -q 'mode=gate split=core' .loop/fake-review-prompts \
+   && grep -q 'mode=gate scope=run split=erosion' .loop/fake-review-prompts; then
+  ok "gate split into split=core and split=erosion review calls"
+else
+  bad "split tokens missing from review prompts: $(tr '\n' ';' < .loop/fake-review-prompts)" gate-split
+fi
+if grep -q '"state": "REVIEW_EROSION_APPROVE"' .loop/journal.jsonl; then
+  ok "erosion approval journaled"
+else
+  bad "REVIEW_EROSION_APPROVE missing from journal" gate-split
+fi
+
+section "split gate: an erosion REVISE rejects the candidate and feeds back"
+make_fixture gate-split-revise
+printf 'GATE_SPLIT_LINES=1\n' >> loop.config.sh
+./loop.sh approve >/dev/null
+run_loop "READY_NOW,READY_NOW" "APPROVE,REVISE,APPROVE,APPROVE"
+check "exit code 0" gate-split-revise 0 "$RC"
+check "state SUCCESS" gate-split-revise SUCCESS "$STATE"
+if grep -q '"state": "REVIEW_EROSION_REVISE"' .loop/journal.jsonl \
+   && grep -q '"state": "REVIEW_EROSION_APPROVE"' .loop/journal.jsonl; then
+  ok "erosion rejection then approval journaled"
+else
+  bad "erosion verdicts missing from journal" gate-split-revise
+fi
+if grep -q 'gate erosion review' "$WORK/last-run.out" \
+   || grep -q '"state": "REVIEW_EROSION_REVISE"' .loop/journal.jsonl; then
+  ok "erosion rejection surfaced"
+else
+  bad "erosion rejection invisible" gate-split-revise
+fi
+
+section "split gate: under the threshold the gate stays a single call"
+make_fixture gate-nosplit
+printf 'GATE_SPLIT_LINES=100000\n' >> loop.config.sh
+./loop.sh approve >/dev/null
+run_loop "READY_NOW" "APPROVE"
+check "exit code 0" gate-nosplit 0 "$RC"
+check "state SUCCESS" gate-nosplit SUCCESS "$STATE"
+if ! grep -q 'split=' .loop/fake-review-prompts; then
+  ok "no split tokens under the threshold"
+else
+  bad "split activated under the threshold" gate-nosplit
+fi
+
+section "review advisory: loop AC ids leaking into the product diff are journaled"
+make_fixture ac-leak-warn
+run_loop "CONTINUE_AC_LEAK,READY_NOW"
+check "exit code 0 (advisory never blocks)" ac-leak-warn 0 "$RC"
+check "state SUCCESS" ac-leak-warn SUCCESS "$STATE"
+if grep -q '"state": "AC_ID_IN_PRODUCT_WARN"' .loop/journal.jsonl \
+   && grep -q 'AC-001' .loop/journal.jsonl; then
+  ok "product-diff AC id journaled as advisory WARN"
+else
+  bad "AC_ID_IN_PRODUCT_WARN missing from journal" ac-leak-warn
+fi
+
+section "review advisory: a clean product diff journals no AC-id warning"
+make_fixture ac-leak-clean
+run_loop "CONTINUE_FIX,READY_NOW"
+check "exit code 0" ac-leak-clean 0 "$RC"
+if ! grep -q '"state": "AC_ID_IN_PRODUCT_WARN"' .loop/journal.jsonl; then
+  ok "no advisory on a clean diff"
+else
+  bad "spurious AC_ID_IN_PRODUCT_WARN" ac-leak-clean
+fi

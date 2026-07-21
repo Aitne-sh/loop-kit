@@ -1084,6 +1084,11 @@ load_config() {
   : "${REVIEW_MODE:=always}"     # always | candidate | off
   : "${HOLISTIC_EVERY_N:=3}"     # every Nth interim review audits the WHOLE run diff (0 = off)
   : "${HOLISTIC_TRIGGER_LINES:=400}" # iteration diffs >= this many lines also widen the review (0 = off)
+  : "${GATE_SPLIT_LINES:=400}"   # run diffs >= this many lines split the gate review into
+                                 # core (per-REQ/checklist/assumptions) + erosion calls (0 = off)
+  case "$GATE_SPLIT_LINES" in
+    *[!0-9]*) die_next "GATE_SPLIT_LINES must be a non-negative integer" "fix GATE_SPLIT_LINES in loop.config.sh" ;;
+  esac
   : "${STOP_EVAL:=true}"
   : "${MET_FORCE_N:=2}"          # consecutive MET stop-evals + verify green -> force the success gate (0 = off)
   : "${LOOP_OBS_MAX_FILE_KB:=2048}"
@@ -2620,6 +2625,16 @@ run_review() { # $1 iter, $2 diff-base-ref, $3 mode (interim|gate), $4 scope (it
     ':(exclude).loop' ':(exclude).claude' ':(exclude).agents' ':(exclude).codex' \
     > .loop/review-diff.patch 2>/dev/null \
     || : > .loop/review-diff.patch
+  # Advisory backstop: loop AC ids are run-scoped, but once written into
+  # product files (docs, code comments, probe output, filenames) they outlive
+  # the run and collide with the next contract's numbering (observed twice in
+  # one repo: ac-id-integrity-hardening-plan.md §1.1). Added lines only;
+  # journaled WARN, never a block — some repos legitimately carry AC-n tokens.
+  local ac_leak=""
+  ac_leak=$(grep -E '^\+[^+]' .loop/review-diff.patch 2>/dev/null \
+              | grep -oE 'AC-[0-9]+' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)
+  [ -z "$ac_leak" ] || journal_append "$1" "AC_ID_IN_PRODUCT_WARN" \
+    "product diff introduces loop-scoped AC ids ($ac_leak) — prefer descriptive slugs in product files; AC ids belong under .loop/ (advisory)"
   if [ ! -s .loop/review-diff.patch ]; then
     if [ "$mode" != "gate" ]; then return 0; fi
     # An empty task diff is not evidence that the approved contract is met.
@@ -2640,6 +2655,19 @@ run_review() { # $1 iter, $2 diff-base-ref, $3 mode (interim|gate), $4 scope (it
     run)   base_prompt="$base_prompt scope=run" ;;
     state) base_prompt="$base_prompt scope=state" ;;
   esac
+  # Split gate (GATE_SPLIT_LINES, 0=off): past the threshold, one call carrying
+  # the per-REQ verdict table + checklist audit + assumption adjudication + the
+  # erosion audit over a big diff reliably loses the erosion end (attention
+  # budget — see ac-id-integrity-hardening-plan.md §1.2). The primary call
+  # drops the erosion audit (split=core); an erosion-only second call
+  # (run_gate_erosion_review) runs after a primary APPROVE, and both must pass.
+  local split_active=0
+  if [ "$mode" = "gate" ] && [ "$scope" != "state" ] \
+     && [ "${GATE_SPLIT_LINES:-0}" -gt 0 ] 2>/dev/null \
+     && [ "$(iter_diff_lines "$2")" -ge "${GATE_SPLIT_LINES:-0}" ] 2>/dev/null; then
+    split_active=1
+    base_prompt="$base_prompt split=core"
+  fi
   [ -z "$extra" ] || base_prompt="$base_prompt$extra"
   prompt="$base_prompt"
   # the gate may also ESCALATE (a human-only question surfaced at the gate);
@@ -2717,6 +2745,57 @@ $res"
     rm -f .loop/review-feedback.md
   fi
   journal_append "$1" "REVIEW_$REVIEW_VERDICT" "[$mode] $verdict"
+  # Second half of a split gate: erosion-only audit over the same diff. Runs
+  # only after a primary APPROVE — a REVISE/ESCALATE already sends the loop
+  # back, and stacking a second rejection on it would double-charge the
+  # MAX_REVISIONS budget for one gate visit.
+  if [ "$split_active" = 1 ] && [ "$REVIEW_VERDICT" = "APPROVE" ]; then
+    run_gate_erosion_review "$1" "$2"
+  fi
+  return 0
+}
+
+run_gate_erosion_review() { # $1 iter, $2 diff-base-ref — erosion half of a split
+  # gate review; may downgrade REVIEW_VERDICT (APPROVE -> REVISE/ERROR).
+  # Same fail-closed posture as the primary: an unparseable verdict is REVISE,
+  # a dead reviewer call is ERROR (the caller's gate retry/BLOCKED handling
+  # applies). No per-REQ table here — requirements were judged by the core call;
+  # this one owns only what that call was too loaded to see (duplication, dead
+  # code, contradictory approaches, claims the diff falsified).
+  local res="" verdict="" prompt label="iter-$1-review-gate-erosion"
+  local base_prompt="/loop-review base=$2 mode=gate scope=run split=erosion"
+  local vhint="'VERDICT: APPROVE <summary>' or 'VERDICT: REVISE <summary>'"
+  prompt="$base_prompt"
+  for _ in 1 2; do
+    run_claude "$label" "$prompt" "$MODEL_REVIEW" reader REVIEW || continue
+    res=$(agent_result "$label")
+    verdict=$(extract_verdict "$res" "VERDICT: (APPROVE|REVISE)")
+    [ -z "$verdict" ] || break
+    prompt="$base_prompt (FORMAT REMINDER: the LAST line of your reply must be exactly $vhint — plain text, no code fence. Your previous attempt contained no parseable verdict.)"
+  done
+  if [ -z "$res" ]; then
+    REVIEW_VERDICT="ERROR"
+    journal_append "$1" "REVIEW_ERROR" "erosion reviewer call failed twice${AGENT_FAIL_DIAG:+ — last error: $AGENT_FAIL_DIAG}"
+    return 0
+  fi
+  case "$verdict" in
+    "VERDICT: APPROVE"*)
+      journal_append "$1" "REVIEW_EROSION_APPROVE" "[gate] $verdict"
+      note "review (gate erosion) -> APPROVE"
+      ;;
+    *)
+      [ -n "$verdict" ] || verdict="VERDICT: REVISE (unparseable erosion-review output after a format-reminder retry — treated as revise)"
+      REVIEW_VERDICT="REVISE"
+      { # primary APPROVE already cleared review-feedback.md; write fresh
+        echo "# Reviewer feedback (iteration $1, gate erosion review) — address the must-fix items FIRST next iteration"
+        echo
+        printf '%s\n' "$verdict"
+        printf '%s\n' "$res"
+      } > .loop/review-feedback.md
+      journal_append "$1" "REVIEW_EROSION_REVISE" "[gate] $verdict"
+      note "review (gate erosion) -> REVISE"
+      ;;
+  esac
   return 0
 }
 
@@ -11804,6 +11883,56 @@ EOF
     [ -z "$miss" ] || lint="$lint
   - contract Acceptance Criteria name AC ids with no checklist row:$miss"
   fi
+  # (f) id-shape anomalies among the contract's own AC anchors — a zero-padding
+  # outlier (AC-09 among AC-001..AC-012) is almost always a typo of the padded
+  # id, and (g) below cannot see it because the malformed id IS "defined".
+  # Sequence gaps are reported too: a skipped number is either a deliberate
+  # removal (override it) or the other half of the same typo. Both classes
+  # seeded the 2026-07-21 three-scheme incident (ac-id-integrity-hardening-plan.md).
+  local shape="" gaps=""
+  if [ -n "$anchor_ids" ]; then
+    shape=$(printf '%s\n' "$anchor_ids" | awk -F- '
+      { ids[NR]=$0; nums[NR]=$2; cnt[length($2)]++
+        if (length($2)>1 && substr($2,1,1)=="0") padded++ }
+      END {
+        # the typo class is a zero-padding INCONSISTENCY (AC-09 among
+        # AC-001..AC-012). A scheme with no leading zeros anywhere is plain
+        # unpadded numbering — digit growth (AC-9 -> AC-10) is consistent
+        if (!padded) exit
+        best=0; maj=0
+        for (l in cnt) if (cnt[l]>best || (cnt[l]==best && l+0>maj)) { best=cnt[l]; maj=l+0 }
+        # flag only when re-padding to the majority width CHANGES the id, so a
+        # legitimate overflow of the scheme (AC-100 among AC-001..) stays quiet
+        for (i=1;i<=NR;i++) {
+          s = sprintf("AC-%0" maj "d", nums[i]+0)
+          if (s != ids[i]) printf "%s (did you mean %s?) ", ids[i], s
+        }
+      }' 2>/dev/null | sed 's/ $//' || true)
+    [ -z "$shape" ] || lint="$lint
+  - AC id zero-padding differs from the contract's own scheme (likely a typo): $shape"
+    gaps=$(printf '%s\n' "$anchor_ids" | awk -F- '
+      { n=$2+0; if (n>max) max=n; if (min==0 || n<min) min=n; seen[n]=1
+        if (length($2)>w) w=length($2) }
+      END { for (i=min;i<=max;i++) if (!seen[i]) printf " AC-%0" w "d", i }' 2>/dev/null || true)
+    [ -z "$gaps" ] || lint="$lint
+  - the contract's AC sequence skips:$gaps (fine if deliberately removed; otherwise a numbering slip)"
+  fi
+  # (g) cross-reference closure INSIDE the definition: every AC-nnn token the
+  # contract's prose (Validation Commands included) or loop.config.sh mentions
+  # must be defined as an Acceptance-Criteria anchor. Checked STRICTLY against
+  # the anchors — not the checklist — because the incident this guards against
+  # is a config/checklist numbering scheme drifting away from the contract's
+  # while every id still "exists somewhere": lint (c) walks anchors->checklist
+  # only and stays blind to it.
+  local dangling="" tok
+  if [ -n "$anchor_ids" ]; then
+    for tok in $( { grep -oE 'AC-[0-9]+' "$pc" 2>/dev/null; \
+                    grep -oE 'AC-[0-9]+' loop.config.sh 2>/dev/null; } | sort -u ); do
+      printf '%s\n' "$anchor_ids" | grep -qx "$tok" || dangling="$dangling $tok"
+    done
+    [ -z "$dangling" ] || lint="$lint
+  - AC ids referenced in the contract prose or loop.config.sh but never defined as Acceptance Criteria:$dangling"
+  fi
   # (d) destructive gate commands — the evaluator re-runs VERIFY_COMMANDS via
   # /bin/sh every iteration, and on the unattended path they are model-authored
   # (allowlist-oracle theory adapted: the gate stays the project's own commands,
@@ -11835,6 +11964,13 @@ EOF
   [ -n "$lint" ] || return 0
   if [ -t 0 ] && [ -t 1 ] && [ "$AUTO_MODE" != "1" ] && [ ! -f .loop/fleet-worker ]; then
     printf 'loop: the loop definition failed the approval lint:%s\n' "$lint"
+    # (h) an override must be an informed decision, not a snooze button: the
+    # missing-checklist-row class is re-checked by the success gate's
+    # deterministic preflight (6.6), which will hard-refuse promotion on the
+    # very same ids — overriding here only defers that refusal to the most
+    # expensive possible moment (observed 2026-07-21: two overrides, then a
+    # FORCED_GATE_REFUSED on the same id three iterations later).
+    [ -z "$miss" ] || printf 'loop: NOTE — overriding does NOT waive these: the success gate will refuse promotion until a verified checklist row exists for:%s\n' "$miss"
     local ans=""
     printf 'loop: approve anyway? [y/N] '
     read -r ans || ans=n
@@ -12392,7 +12528,10 @@ cmd_run() {
     : > .loop/baseline-verify.log
     for _cmd in "${VERIFY_COMMANDS[@]}"; do
       echo "\$ $_cmd" >> .loop/baseline-verify.log
-      if /bin/sh -c "$_cmd" >/dev/null 2>&1; then
+      # same iteration-context contract as the evaluator's run_verify_pass;
+      # the baseline pass is iteration 0 by definition
+      if LOOP_ITERATION=0 LOOP_OBSERVATIONS_DIR="$PWD/.loop/observations" \
+         /bin/sh -c "$_cmd" >/dev/null 2>&1; then
         echo "[PASS] $_cmd" >> .loop/baseline-verify.log
         _green=$((_green + 1))
       else

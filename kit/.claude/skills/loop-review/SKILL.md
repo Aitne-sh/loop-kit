@@ -36,6 +36,23 @@ and `mode=<interim|gate>` — the mode changes what you judge:
   manifest. Render the same mandatory per-REQ verdict table. APPROVE only when
   the current state itself proves every REQ and AC; unverified areas are REVISE.
 
+On large run diffs the harness splits the gate into two calls
+(`GATE_SPLIT_LINES` in loop.config.sh): one attention budget cannot hold a big
+diff AND every gate duty at once, and what drops first is the erosion end. A
+`split=` token narrows your mandate:
+
+- **`split=core`** (with `mode=gate`) — everything gate mode requires EXCEPT
+  the Erosion audit: per-REQ verdict table, checklist audit, assumption
+  adjudication, requirements check. Skip the Erosion audit entirely — a
+  dedicated second call owns it; spend the reclaimed budget on the duties that
+  remain yours.
+- **`split=erosion`** (with `mode=gate scope=run`) — the Erosion audit ONLY,
+  over the whole run diff. No per-REQ table, no checklist audit, no assumption
+  adjudication — the core call already judged those; re-judging them here
+  double-charges the loop for one gate visit. Verdict is two-valued
+  (`VERDICT: APPROVE` / `VERDICT: REVISE`), with erosion findings as the
+  must-fix items. Erosion is your ONLY concern — read the diff for nothing else.
+
 ## Read — requirement-first, in this order
 
 Read the goalposts before the code, so the diff cannot frame your judgment:
@@ -144,11 +161,20 @@ can look locally fine while the whole degrades. Over the full diff, look for
 erosion **introduced by this run**:
 
 - duplicated implementations of the same behavior (two helpers doing one job,
-  a reimplementation of something the codebase already had)
+  a reimplementation of something the codebase already had). Before accepting a
+  new helper, check whether a file with a similar name or role already provides
+  it — the classic miss is a verbatim copy living in a sibling file the diff
+  never touches.
 - dead or abandoned code from earlier iterations (unused functions, orphaned
   files, commented-out attempts)
 - contradictory approaches between iterations (two conventions for the same
   concern, half-migrated patterns)
+- **claims this run falsified** — a statement in a project doc or comment that
+  the run's own changes made untrue (a doc still saying "X consumes Y" after
+  the run removed that consumer; a comment still counting "the seven roles"
+  after the run added an eighth). Context lines of the diff are the highest-
+  yield place to look: a hunk that edits the line NEXT to a now-false claim
+  means the author read it and still left it standing.
 - complexity concentration a requirement does not justify
 
 These are must-fix ONLY when objective and attributable to this run's diff;

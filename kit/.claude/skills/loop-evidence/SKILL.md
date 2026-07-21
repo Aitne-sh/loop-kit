@@ -111,7 +111,7 @@ Replace the template (remove the `<!-- TEMPLATE -->` marker):
    against the verified checklist and the evaluator manifest, so an extra
    one (a historical capture, an invented path, a brace pattern like
    `settings-{a,b}.png`) fails the gate. Refer to superseded captures
-   prefix-less (`iter2-AC-xxx-probe.log`), never in full path form
+   prefix-less (`iter2-settings-roundtrip.png`), never in full path form
 4. **Starting unknowns & assumptions made** — first the unknowns the run
    STARTED with (from `.loop/docs/unknowns.md`: questions asked, deferred
    defaults, direction verdicts — so the reviewer begins where the definition

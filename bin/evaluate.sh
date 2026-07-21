@@ -455,11 +455,19 @@ case "$VERIFY_RETRIES" in *[!0-9]*|"") VERIFY_RETRIES=0 ;; esac
 [ "$VERIFY_RETRIES" -le 2 ] || VERIFY_RETRIES=2
 
 run_verify_pass() { # $1 log-file -> 0 when every command passed
-  local vp_ok=1 vp_rc vp_cmd
+  local vp_ok=1 vp_rc vp_cmd vp_iter
+  # Iteration context for the commands themselves: a probe that names its
+  # observation artifacts per iteration needs the number, and parsing the
+  # harness-private .loop/run-checkpoint from product code couples the project
+  # to harness internals (observed: a probe hardwired to the checkpoint file
+  # silently writes iter0-* when run outside the loop). Consume these instead.
+  vp_iter=$(grep -E '^ITERATION=' .loop/run-checkpoint 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  case "$vp_iter" in ''|*[!0-9]*) vp_iter=0 ;; esac
   : > "$1"
   for vp_cmd in "${VERIFY_COMMANDS[@]}"; do
     echo "\$ $vp_cmd" >> "$1"
-    if /bin/sh -c "$vp_cmd" >> "$1" 2>&1; then
+    if LOOP_ITERATION="$vp_iter" LOOP_OBSERVATIONS_DIR="$PWD/.loop/observations" \
+       /bin/sh -c "$vp_cmd" >> "$1" 2>&1; then
       echo "[PASS] $vp_cmd" >> "$1"
     else
       vp_rc=$?

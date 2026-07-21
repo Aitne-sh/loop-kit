@@ -135,6 +135,27 @@ evaluator manifest stamp still matches this contract and product tree.
   against the contract and the repository alone, record the assumption and
   continue; only when a human's preference or a contract change is genuinely
   required do you escalate (step 5).
+- **Generalizing beyond a requirement's named surface is a recorded decision,
+  not a freebie.** When the natural implementation extends a same-shape change
+  to surfaces the contract does not name (every role where a REQ names one
+  role, every screen where it names one screen), doing so can be the right
+  call — but it is exactly the kind of discovery-driven default the ledger
+  exists for: append an AS-N entry naming the generalization and why the
+  narrow version would be worse. A silent generalization is invisible scope
+  judgment; a later audit reads it as drift.
+- **Extending an enumerated set closes with a sweep.** After adding a member
+  to a counted set (roles, stages, states, review loops), grep the WHOLE repo
+  for the old cardinality in every spelling — "seven", "7 roles", arithmetic
+  in sizing/rationale comments, UI copy — and update each hit (or note the
+  deliberate exceptions in progress.md). The classic escape is a rationale
+  comment in a file your diff never touches: no diff-based review can see it,
+  only this sweep can.
+- **Loop AC ids stay out of product files.** `AC-xxx` ids are scoped to THIS
+  run's contract; the next contract renumbers from AC-001. Never write them
+  into product docs, code comments, test names, probe source, output strings,
+  or filenames outside `.loop/` — they outlive the run there and collide with
+  the next contract's numbering. Use descriptive names in product files and
+  let the checklist row's Evidence citation carry the AC binding.
 
 ## 3. Self-verify
 
@@ -147,14 +168,21 @@ Then close the acceptance-checklist rows this milestone touched. A `cmd` row
 cites the command that proves it. A `run` row flips to `verified` ONLY by
 actually running the artifact and observing the behavior — launch the
 app/probe, watch the expectation hold, and save the observation artifact
-(screenshot, probe log; name it `iter<N>-AC-xxx-*`) under
+(screenshot, probe log; name it `iter<N>-<what-it-shows>`, a descriptive
+slug — the checklist row citing the path carries the AC binding, so the AC
+id need not and should not appear in a probe's source) under
 `.loop/observations/` (create the directory if needed), recording its path
-in the row's Evidence column. The cell must contain EXACTLY ONE literal
+in the row's Evidence column. A probe script run through VERIFY_COMMANDS
+receives `LOOP_ITERATION` and `LOOP_OBSERVATIONS_DIR` from the harness —
+compose artifact paths from those, and never parse `.loop/run-checkpoint`
+or other harness-private files (they are not a stable interface, and a
+probe hardwired to them misbehaves when run outside the loop).
+The cell must contain EXACTLY ONE literal
 `.loop/observations/` path — the canonical artifact the evaluator stamps;
 a second literal path (even an honest historical one) makes the evaluator
 refuse the row. When you recapture, REPLACE the old path — never append the
 new one alongside it; if you mention prior captures at all, write them
-prefix-less (`iter2-AC-xxx-probe.log`, not the full path). Never write
+prefix-less (`iter2-settings-roundtrip.png`, not the full path). Never write
 brace patterns (`settings-{a,b}.png`) — one full literal path.
 The same discipline covers EVERY other certification cell: a requirements-
 ledger row or a `cmd`/`human` checklist row may name a full

@@ -94,6 +94,10 @@ Rules:
   one exact REQ token. Never delete a completed REQ's last row.
 - Include a testing milestone if the contract's acceptance criteria require new
   tests (VERIFY_COMMANDS in loop.config.sh must be able to prove the new behavior).
+  For a "document X stays in sync" criterion, plan the test as identifier-
+  presence assertions only (the class names, node ids, config keys the
+  implementation uses) — never literal prose sentences or diagram-label
+  strings, which break on harmless rewording and prove nothing about truth.
 - Keep it short — a working checklist, not a design document.
 
 ## Output — implementation-plan payload

@@ -689,6 +689,24 @@ Fill `.loop/docs/product-contract.md` (replace the template, remove the
   `.loop/docs/acceptance-checklist.md`: the evaluator anchors obligations to
   the AC ids named in the approved contract, so a deleted checklist row can
   never shrink what the loop owes.
+  **One numbering scheme, everywhere.** AC ids are zero-padded (`AC-001`,
+  not `AC-01`/`AC-1`) and sequential with no gaps, and EVERY `AC-nnn` token
+  anywhere in the definition — the Acceptance Criteria list, the Validation
+  Commands prose, `loop.config.sh` comments, the checklist — must name an id
+  the Acceptance Criteria list defines. Before presenting the definition,
+  self-check this closure: a contract whose prose cites an id its own AC list
+  never defines, or whose config comments count the same expectations under a
+  parallel numbering, seeds a mid-run repair spiral (the approve lint refuses
+  these, but a definition that needs the override was authored wrong).
+  AC ids are also **run-scoped**: they must never be baked into product files
+  (docs, code, probe sources, output strings, filenames) — the next contract
+  renumbers from AC-001 and permanent copies collide. Product-side artifacts
+  use descriptive names; the checklist maps name → AC.
+  A criterion of the "document X is in sync" kind is verified by asserting
+  the presence of the identifiers the implementation uses — never by
+  asserting prose sentences or diagram-label literals (those tests break on
+  harmless rewording and prove nothing about truth); reviewer audits, not
+  greppy tests, own stale-claim detection.
 - **Validation Commands**: mirror of VERIFY_COMMANDS, each classified as
   **red→green** (expected to FAIL on the current baseline; passing proves the
   new behavior — e.g. tests the loop is required to add) or **stays-green**
@@ -773,6 +791,13 @@ Update `loop.config.sh` consistently with the contract:
   as drift). Probes must be self-contained and self-terminating (start
   server → wait → observe → kill), and their feasibility in headless mode
   was proven by the Step 1.5 spike before being made binding.
+  The harness exports `LOOP_ITERATION` and `LOOP_OBSERVATIONS_DIR` to every
+  VERIFY_COMMAND — a probe that names its artifacts per iteration composes
+  paths from those, and never parses `.loop/run-checkpoint` or any other
+  harness-private file (not a stable interface; a probe hardwired to one
+  misbehaves whenever it runs outside the loop). Artifact names are
+  descriptive slugs — the checklist row citing the path carries the AC
+  binding, so the run-scoped AC id stays out of the probe's source.
   VERIFY_COMMANDS are re-run via /bin/sh by the external evaluator — an
   agent skill or MCP connector can never appear here, so an
   agent-browser-channel check exists only as a `run` checklist row, never

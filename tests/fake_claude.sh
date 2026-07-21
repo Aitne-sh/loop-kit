@@ -1291,6 +1291,14 @@ case "$action" in
     progress_note "kept verification green while advancing"
     echo "CONTINUE verified work remains" > .loop/agent-state
     ;;
+  CONTINUE_AC_LEAK)
+    # writes a run-scoped AC id into a PRODUCT file (the anti-pattern the
+    # review-time AC_ID_IN_PRODUCT_WARN advisory exists to surface)
+    echo fixed > value.txt
+    printf 'probe output: AC-001 PASS\n' > probe-notes.txt
+    progress_note "fixed value.txt; probe notes carry an AC id"
+    echo "CONTINUE milestone M1 done" > .loop/agent-state
+    ;;
   CONTINUE_ASSUMPTION)
     # in-contract ambiguity: conservative default + AS entry + real code change,
     # and the loop CONTINUES instead of escalating
