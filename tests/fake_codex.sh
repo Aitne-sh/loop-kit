@@ -175,11 +175,24 @@ run_exec() {
   if [ "${LOOP_FAKE_CODEX:-}" != NOMSG ]; then
     printf '%s\n' "$result" > "$output"
   fi
+  # Optional token injection for cost-estimation tests: LOOP_FAKE_CODEX_TOKENS
+  # = "input,cached,output" (all 0 by default, matching a zero-token stub).
+  fk_in=0; fk_cached=0; fk_out=0
+  if [ -n "${LOOP_FAKE_CODEX_TOKENS:-}" ]; then
+    fk_in=${LOOP_FAKE_CODEX_TOKENS%%,*}
+    fk_rest=${LOOP_FAKE_CODEX_TOKENS#*,}
+    fk_cached=${fk_rest%%,*}
+    fk_out=${fk_rest#*,}
+    case "$fk_in" in ''|*[!0-9]*) fk_in=0 ;; esac
+    case "$fk_cached" in ''|*[!0-9]*) fk_cached=0 ;; esac
+    case "$fk_out" in ''|*[!0-9]*) fk_out=0 ;; esac
+  fi
+  fk_usage=$(printf '{"input_tokens":%s,"cached_input_tokens":%s,"output_tokens":%s}' "$fk_in" "$fk_cached" "$fk_out")
   if [ "${LOOP_FAKE_CODEX:-}" = REORDER ]; then
     printf '{"thread_id":"%s","type":"thread.started"}\n' "$thread"
     printf '{"sequence":1,"type":"turn.started"}\n'
     printf '{"item":{"type":"agent_message","text":"fake"},"type":"item.completed"}\n'
-    printf '{"usage":{"input_tokens":0,"output_tokens":0},"type":"turn.completed"}\n'
+    printf '{"usage":%s,"type":"turn.completed"}\n' "$fk_usage"
   elif [ "${LOOP_FAKE_CODEX:-}" = NESTED_ERROR ]; then
     # the delegated work already ran and -o holds its real result; only the
     # event stream is adversarial: fatal-looking markers as nested DATA
@@ -194,7 +207,7 @@ run_exec() {
     printf '{"type":"thread.started","thread_id":"%s"}\n' "$thread"
     printf '{"type":"turn.started"}\n'
     printf '{"type":"item.completed","item":{"type":"agent_message","text":"fake"}}\n'
-    printf '{"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}\n'
+    printf '{"type":"turn.completed","usage":%s}\n' "$fk_usage"
   fi
 }
 

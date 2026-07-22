@@ -50,6 +50,11 @@ CODEX_PROBE_DONE=0
 CODEX_COST_WARNING_EMITTED=0
 AGENT_ROUTE_WARNING_EMITTED=0
 TOTAL_COST=0
+# TOTAL_COST_EST — the ESTIMATED share of TOTAL_COST (Codex token×price approximations,
+# never a vendor-reported figure). Folded into TOTAL_COST so it governs MAX_COST_USD,
+# but tracked separately so every surface that prints the total can mark it as containing
+# an estimate. Process memory like TOTAL_COST; mirrored to .loop/cost-total-est.
+TOTAL_COST_EST=0
 CHILD_PID=""
 AGENT_PID=""
 TASK_ID=""
@@ -988,6 +993,7 @@ ckpt_write() { # $1 iter $2 agent_failures $3 gate_revise $4 iter_revise $5 resu
     echo "GATE_REVISE_COUNT=$3"
     echo "ITER_REVISE_COUNT=$4"
     echo "TOTAL_COST=$TOTAL_COST"
+    echo "TOTAL_COST_EST=$TOTAL_COST_EST"
     echo "CONTRACT_HASH=${RUN_CONTRACT_HASH:-}"
     echo "HARNESS_HASH=${RUN_HARNESS_HASH:-}"
     echo "CONFIG_HASH_SANS_BUDGET=${CK_CONFIG_SB:-}"
@@ -1340,21 +1346,38 @@ restore_total_cost() { # re-adopt the logical run's cumulative cost in a fresh
     TOTAL_COST=$(ckpt_get TOTAL_COST)
   fi
   [ -n "$TOTAL_COST" ] || TOTAL_COST=0
+  # the estimated share travels with the total so its disclosure survives resume
+  TOTAL_COST_EST=$(cat .loop/cost-total-est 2>/dev/null || true)
+  if [ -z "$TOTAL_COST_EST" ] && [ -f .loop/run-checkpoint ]; then
+    TOTAL_COST_EST=$(ckpt_get TOTAL_COST_EST)
+  fi
+  [ -n "$TOTAL_COST_EST" ] || TOTAL_COST_EST=0
 }
 
 warn_codex_cost_untracked() {
   [ "$CODEX_COST_WARNING_EMITTED" = 0 ] || return 0
-  [ -n "${MAX_COST_USD:-}" ] || return 0
   # CONTRACT counts alongside the in-run roles: fleet workers define their task
   # contracts mid-run, and headless definition spends Codex before any cap
   # could apply — either way the cap's coverage claim no longer holds.
   codex_routing_enabled || [ "$(configured_agent CONTRACT)" = codex ] || return 0
-  CODEX_COST_WARNING_EMITTED=1
-  note "warning: MAX_COST_USD cannot bound Codex calls — Codex USD cost is recorded as 0; the cap covers Claude calls only"
   # This is preflight bookkeeping, not an agent call. Seed explicit zero mirrors
   # so a prior call/run cannot lend stale cost or turn values to the audit row.
   echo 0 > .loop/last-cost
   echo 0 > .loop/last-turns
+  if codex_pricing_configured; then
+    # Prices are set: Codex USD is ESTIMATED (推定) from token usage, folded into
+    # TOTAL_COST, and DOES count against MAX_COST_USD. The estimate can be wrong
+    # (stale prices, cache/reasoning nuances, subscription = no per-token charge).
+    CODEX_COST_WARNING_EMITTED=1
+    note "note: Codex USD is ESTIMATED from token usage × PRICE_* in loop.config.sh (推定値 / approximate) — it IS included in the reported total and in MAX_COST_USD"
+    journal_append "preflight" "CODEX_COST_ESTIMATED" "Codex cost estimated from token usage x configured prices (approximate; included in reported totals and the MAX_COST_USD cap)"
+    return 0
+  fi
+  # No prices configured: Codex cost stays 0 and cannot be bounded. Only worth
+  # warning about when a USD cap exists (otherwise there is nothing to mislead).
+  [ -n "${MAX_COST_USD:-}" ] || return 0
+  CODEX_COST_WARNING_EMITTED=1
+  note "warning: MAX_COST_USD cannot bound Codex calls — Codex USD cost is recorded as 0; the cap covers Claude calls only (set PRICE_* in loop.config.sh to enable estimated Codex costing)"
   journal_append "preflight" "CODEX_COST_UNTRACKED" "Codex-routed roles report no USD cost; MAX_COST_USD covers Claude calls only"
 }
 
@@ -1734,6 +1757,21 @@ add_cost() { # $1 usd — TOTAL_COST (in-memory) is authoritative; the file is d
   echo "$TOTAL_COST" > .loop/cost-total
 }
 
+add_cost_est() { # $1 usd — the ESTIMATED portion of a just-added cost (Codex token×price).
+  # Tracked alongside add_cost so displays can annotate the total; never a vendor figure.
+  TOTAL_COST_EST=$(awk -v a="$TOTAL_COST_EST" -v b="$1" 'BEGIN{printf "%.6f", a + b}')
+  echo "$TOTAL_COST_EST" > .loop/cost-total-est
+}
+
+cost_str() { # the cumulative total, annotated when it contains a Codex estimate so the
+  # "推定値 / estimate" disclosure travels with every place the total is shown.
+  if awk -v e="${TOTAL_COST_EST:-0}" 'BEGIN{exit !(e+0 > 0)}'; then
+    printf '$%s (incl. ~$%s estimated Codex spend / 推定値を含む)' "$TOTAL_COST" "$TOTAL_COST_EST"
+  else
+    printf '$%s' "$TOTAL_COST"
+  fi
+}
+
 budget_exceeded() { # never true when MAX_COST_USD is empty (no cap configured)
   [ -n "$MAX_COST_USD" ] || return 1
   awk -v t="$TOTAL_COST" -v m="$MAX_COST_USD" 'BEGIN{exit !(t >= m)}'
@@ -1741,6 +1779,41 @@ budget_exceeded() { # never true when MAX_COST_USD is empty (no cap configured)
 
 remaining_budget() { # only meaningful when MAX_COST_USD is set
   awk -v m="$MAX_COST_USD" -v t="$TOTAL_COST" 'BEGIN{r = m - t; if (r < 0.01) r = 0.01; printf "%.2f", r}'
+}
+
+price_key() { # $1 model slug -> uppercased key fragment with non-alnum -> '_'
+  # (gpt-5.6-sol -> GPT_5_6_SOL). Prices live as PRICE_<key>_IN/CACHED/OUT in the
+  # contract-hashed loop.config.sh (a hard-cap input, so it must be hashed).
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_' | sed 's/_*$//'
+}
+
+codex_pricing_configured() { # true when ANY PRICE_* rate is set (estimation is active)
+  local n
+  for n in ${!PRICE_@}; do
+    [ -n "${!n}" ] && return 0
+  done
+  return 1
+}
+
+codex_cost_estimate() { # $1 model $2 input_tokens $3 cached_input_tokens $4 output_tokens
+  # -> APPROXIMATE USD (6dp). 0 when the model has no configured price row (never guess).
+  local model="$1" in_t="$2" cached_t="$3" out_t="$4" key vin vcached vout p_in p_cached p_out
+  key=$(price_key "$model")
+  vin="PRICE_${key}_IN"; vcached="PRICE_${key}_CACHED"; vout="PRICE_${key}_OUT"
+  p_in="${!vin:-}"; p_cached="${!vcached:-}"; p_out="${!vout:-}"
+  # No price for this model -> estimate 0 (falls through to today's behavior).
+  if [ -z "$p_in" ] && [ -z "$p_out" ]; then printf '0'; return 0; fi
+  # Missing sub-rates: an unset in/out leg counts as 0; cached with no rate falls
+  # back to the full input rate (conservative — never under-bills against the cap).
+  [ -n "$p_in" ] || p_in=0
+  [ -n "$p_out" ] || p_out=0
+  [ -n "$p_cached" ] || p_cached="$p_in"
+  # Codex reports input_tokens as the TOTAL prompt (cached included); bill the
+  # uncached remainder at the full rate and the cached subset at the cached rate.
+  awk -v i="$in_t" -v c="$cached_t" -v o="$out_t" -v pi="$p_in" -v pc="$p_cached" -v po="$p_out" 'BEGIN{
+    unc = i - c; if (unc < 0) unc = 0
+    printf "%.6f", (unc*pi + c*pc + o*po) / 1000000
+  }'
 }
 
 derive_allowed_tools() {
@@ -1850,6 +1923,7 @@ normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
   local raw="$1" msg="$2" out="$3" status="$4"
   local summary="" thread="" thread_escaped="" turns=0 failed=0 error_nr=0 fatal_type=""
   local is_error=false result_escaped="" error_line="" error_text="" error_tmp=""
+  local tok_in=0 tok_cached=0 tok_out=0
   CODEX_FAIL_CAUSE=""
   if [ -f "$raw" ]; then
     # One pass over the event stream, TOP-LEVEL fields only. An item payload
@@ -1888,8 +1962,39 @@ normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
         }
         return i
       }
+      function read_usage(s, i, n,   c, key, val) {   # s[i] == "{" of a top-level usage object
+        # Pull input_tokens / cached_input_tokens / output_tokens into LU_* (numbers
+        # only; nested sub-objects are skipped). Structural, so a "usage" key inside a
+        # quoted transcript can never reach here — only the genuine top-level usage does.
+        LU_IN = 0; LU_CACHED = 0; LU_OUT = 0
+        i++
+        while (i <= n) {
+          i = skip_ws(s, i, n); c = substr(s, i, 1)
+          if (c == "}") return i + 1
+          if (c != "\"") { i++; continue }
+          i = read_string(s, i, n, 1); key = STR
+          if (!STR_OK) return i
+          i = skip_ws(s, i, n)
+          if (substr(s, i, 1) != ":") return i
+          i = skip_ws(s, i + 1, n); c = substr(s, i, 1)
+          if (c == "{" || c == "[") { i = skip_container(s, i, n) }
+          else if (c == "\"") { i = read_string(s, i, n, 0) }
+          else {
+            val = ""
+            while (i <= n) { c = substr(s, i, 1); if (c == "," || c == "}" || c ~ /[ \t\r]/) break; val = val c; i++ }
+            if (key == "input_tokens") LU_IN = val + 0
+            else if (key == "cached_input_tokens") LU_CACHED = val + 0
+            else if (key == "output_tokens") LU_OUT = val + 0
+          }
+          i = skip_ws(s, i, n); c = substr(s, i, 1)
+          if (c == ",") { i++; continue }
+          if (c == "}") return i + 1
+          return i
+        }
+        return i
+      }
       function top_fields(s,   n, i, c, key) {   # LTYPE/LTHREAD from top-level keys only
-        LTYPE = ""; LTHREAD = ""
+        LTYPE = ""; LTHREAD = ""; LU_IN = 0; LU_CACHED = 0; LU_OUT = 0
         n = length(s)
         i = skip_ws(s, 1, n)
         if (substr(s, i, 1) != "{") return
@@ -1908,7 +2013,8 @@ normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
             if (key == "type") LTYPE = STR
             else if (key == "thread_id") LTHREAD = STR
           } else if (c == "{" || c == "[") {
-            i = skip_container(s, i, n)
+            if (key == "usage" && c == "{") i = read_usage(s, i, n)
+            else i = skip_container(s, i, n)
           } else {
             while (i <= n) { c = substr(s, i, 1); if (c == "," || c == "}" || c ~ /[ \t\r]/) break; i++ }
           }
@@ -1938,21 +2044,27 @@ normalize_codex_envelope() { # $1 raw-jsonl $2 last-message $3 envelope $4 exit
         top_fields(line)
         if (LTYPE == "item.completed") turns++
         else if (LTYPE == "thread.started") { if (thread == "" && LTHREAD != "") thread = LTHREAD }
+        else if (LTYPE == "turn.completed") { tin += LU_IN; tcached += LU_CACHED; tout += LU_OUT }
         else if (LTYPE == "turn.failed" || LTYPE == "error") {
           if (LTYPE == "error" && error_nr == 0) error_nr = NR
           if (!failed) { failed = 1; fatal_type = LTYPE }
         }
       }
-      END { printf "%d|%d|%d|%s|%s\n", turns+0, failed+0, error_nr+0, fatal_type, thread }
+      # token totals sit between fatal_type and thread: they are integers, so a
+      # "|" in an exotic thread_id still folds only into the last field.
+      END { printf "%d|%d|%d|%s|%d|%d|%d|%s\n", turns+0, failed+0, error_nr+0, fatal_type, tin+0, tcached+0, tout+0, thread }
     ' "$raw" 2>/dev/null) || summary=""
     # thread reads last: an exotic thread_id containing "|" folds into the
     # final field instead of shifting the numeric ones.
-    IFS='|' read -r turns failed error_nr fatal_type thread <<EOF
+    IFS='|' read -r turns failed error_nr fatal_type tok_in tok_cached tok_out thread <<EOF
 $summary
 EOF
   fi
   case "$turns" in ''|*[!0-9]*) turns=0 ;; esac
   case "$error_nr" in ''|*[!0-9]*) error_nr=0 ;; esac
+  case "$tok_in" in ''|*[!0-9]*) tok_in=0 ;; esac
+  case "$tok_cached" in ''|*[!0-9]*) tok_cached=0 ;; esac
+  case "$tok_out" in ''|*[!0-9]*) tok_out=0 ;; esac
   [ "$failed" = 1 ] || failed=0
   if [ "$failed" = 1 ]; then
     is_error=true
@@ -1981,8 +2093,11 @@ EOF
     fi
   fi
   thread_escaped=$(printf '%s' "$thread" | json_escape)
-  printf '{"type": "result", "result": "%s", "session_id": "%s", "num_turns": %s, "total_cost_usd": 0, "is_error": %s}\n' \
-    "$result_escaped" "$thread_escaped" "$turns" "$is_error" > "$out"
+  # total_cost_usd stays 0: Codex reports no USD. The token counts travel in the
+  # envelope so run_claude can compute an APPROXIMATE USD estimate from the
+  # contract-hashed price table (pricing lives in shell config, not here).
+  printf '{"type": "result", "result": "%s", "session_id": "%s", "num_turns": %s, "total_cost_usd": 0, "input_tokens": %s, "cached_input_tokens": %s, "output_tokens": %s, "is_error": %s}\n' \
+    "$result_escaped" "$thread_escaped" "$turns" "$tok_in" "$tok_cached" "$tok_out" "$is_error" > "$out"
 }
 
 run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader|planner,
@@ -2126,8 +2241,22 @@ run_claude() { # $1 label, $2 prompt, $3 model, $4 mode: full|reader|planner,
     normalize_codex_envelope "$raw" "$msg" "$out" "$status"
   fi
 
-  cost=$(json_field "$out" total_cost_usd 0)
-  add_cost "$cost"
+  if [ "$agent" = codex ]; then
+    # Codex reports no USD; estimate it from this call's token usage × the
+    # contract-hashed price table. 0 when no price row exists for the model
+    # (identical to today's behavior). The estimate folds into TOTAL_COST (so it
+    # governs MAX_COST_USD) and is mirrored into TOTAL_COST_EST for disclosure.
+    local _ti _tc _to
+    _ti=$(json_field "$out" input_tokens 0)
+    _tc=$(json_field "$out" cached_input_tokens 0)
+    _to=$(json_field "$out" output_tokens 0)
+    cost=$(codex_cost_estimate "$model" "$_ti" "$_tc" "$_to")
+    add_cost "$cost"
+    add_cost_est "$cost"
+  else
+    cost=$(json_field "$out" total_cost_usd 0)
+    add_cost "$cost"
+  fi
   echo "$cost" > .loop/last-cost
   # agent turns of THIS call (top-level scalar in the result JSON): the cheap
   # deterministic runaway-context signal — cache-read cost is a per-turn
@@ -2266,7 +2395,7 @@ finish() { # $1 state, $2 reason
   echo "══════════════════════════════════════════════════"
   echo " RESULT: $state"
   if [ -n "$reason" ]; then echo " $reason"; fi
-  echo " total cost this run: \$$TOTAL_COST"
+  echo " total cost this run: $(cost_str)"
   echo " details: ./loop.sh report   |   trail: git log --oneline"
   # For states that KEEP the checkpoint (see the case below), print the exact
   # continue command so a human can retry immediately. It is `resume`, NOT a
@@ -6664,13 +6793,18 @@ print_overlap() { # changed-file intersection between branches — merge early w
 cmd_fleet_report() {
   need_project
   ensure_fleet_dirs
-  local id="${1:-}" wt total c
+  local id="${1:-}" wt total c ce total_est
   if [ -n "$id" ]; then
     wt=$(renv_get "$id" WT "")
     echo "task:     $id"
     echo "queue:    $(task_qdir "$id")   phase: $(renv_get "$id" PHASE "")   result: $(renv_get "$id" RESULT "-")"
     echo "branch:   $(renv_get "$id" BRANCH "-")   worktree: ${wt:--}"
-    echo "cost:     \$$(cat "$wt/.loop/cost-total" 2>/dev/null || echo 0)"
+    ce=$(cat "$wt/.loop/cost-total-est" 2>/dev/null || echo 0)
+    if awk -v e="$ce" 'BEGIN{exit !(e+0 > 0)}'; then
+      echo "cost:     \$$(cat "$wt/.loop/cost-total" 2>/dev/null || echo 0) (incl. ~\$$ce estimated Codex spend / 推定値を含む)"
+    else
+      echo "cost:     \$$(cat "$wt/.loop/cost-total" 2>/dev/null || echo 0)"
+    fi
     if [ -n "$wt" ] && [ -f "$wt/.loop/docs/evidence-report.md" ] \
        && ! grep -q '<!-- TEMPLATE -->' "$wt/.loop/docs/evidence-report.md"; then
       echo "════════ evidence ════════"
@@ -6680,14 +6814,21 @@ cmd_fleet_report() {
   fi
   cmd_fleet_status
   total=0
+  total_est=0
   for id in $(all_task_ids); do
     wt=$(renv_get "$id" WT "")
     [ -n "$wt" ] || continue
     c=$(cat "$wt/.loop/cost-total" 2>/dev/null || echo 0)
     total=$(awk -v a="$total" -v b="$c" 'BEGIN{printf "%.4f", a + b}')
+    ce=$(cat "$wt/.loop/cost-total-est" 2>/dev/null || echo 0)
+    total_est=$(awk -v a="$total_est" -v b="$ce" 'BEGIN{printf "%.4f", a + b}')
   done
   echo
-  echo "total cost across live runs: \$$total"
+  if awk -v e="$total_est" 'BEGIN{exit !(e+0 > 0)}'; then
+    echo "total cost across live runs: \$$total (incl. ~\$$total_est estimated Codex spend / 推定値を含む)"
+  else
+    echo "total cost across live runs: \$$total"
+  fi
 }
 
 cmd_fleet_logs() {
@@ -10354,7 +10495,7 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
     # a USD cap (when configured) also bounds the parent-side calls: check at
     # the same cadence as run_iteration_loop — before each round's spending
     if budget_exceeded; then
-      finish BUDGET_EXCEEDED "spent \$$TOTAL_COST >= cap \$$MAX_COST_USD during orchestration"
+      finish BUDGET_EXCEEDED "spent $(cost_str) >= cap \$$MAX_COST_USD during orchestration"
     fi
     if [ -n "${MAX_RUN_SECONDS:-}" ] && [ $((SECONDS - run_wall_start)) -ge "$MAX_RUN_SECONDS" ]; then
       finish BUDGET_EXCEEDED "wall clock $((SECONDS - run_wall_start))s >= MAX_RUN_SECONDS=${MAX_RUN_SECONDS} during orchestration"
@@ -10434,7 +10575,7 @@ run_fleet_orchestration() { # $1 start|resume — dispatch the planned queue, th
     done
     orch_check_failures
     if budget_exceeded; then
-      finish BUDGET_EXCEEDED "spent \$$TOTAL_COST >= cap \$$MAX_COST_USD before the integration gate"
+      finish BUDGET_EXCEEDED "spent $(cost_str) >= cap \$$MAX_COST_USD before the integration gate"
     fi
 
     # ---- integration gate: the merged whole vs the MASTER contract ----
@@ -12416,6 +12557,9 @@ cmd_run() {
     TOTAL_COST=$(cat .loop/cost-total 2>/dev/null || true)
     [ -n "$TOTAL_COST" ] || TOTAL_COST=$(ckpt_get TOTAL_COST)
     [ -n "$TOTAL_COST" ] || TOTAL_COST=0
+    TOTAL_COST_EST=$(cat .loop/cost-total-est 2>/dev/null || true)
+    [ -n "$TOTAL_COST_EST" ] || TOTAL_COST_EST=$(ckpt_get TOTAL_COST_EST)
+    [ -n "$TOTAL_COST_EST" ] || TOTAL_COST_EST=0
 
     resumes=$(ckpt_int RESUME_COUNT 0)
     resumes=$((resumes + 1))
@@ -12500,7 +12644,7 @@ cmd_run() {
     elif [ "$prev_state" = "STALLED" ]; then
       note "resuming a STALLED run with unchanged context — consider: ./loop.sh resume --note '<what to try differently>'"
     fi
-    note "resuming interrupted run at iteration $i/$MAX_ITERATIONS (resume #$resumes, spent: \$$TOTAL_COST)"
+    note "resuming interrupted run at iteration $i/$MAX_ITERATIONS (resume #$resumes, spent: $(cost_str))"
     note "models: implement=$MODEL_IMPLEMENT review=$MODEL_REVIEW plan=$MODEL_PLAN evidence=$MODEL_EVIDENCE stop-eval=$MODEL_STOP_EVAL"
     note "effort: $(resolve_effort | grep . || echo 'cli-default') (all in-loop calls)"
   else
@@ -12561,6 +12705,8 @@ cmd_run() {
     [ -s .loop/ac-seen ] || rm -f .loop/ac-seen
     TOTAL_COST=0
     echo 0 > .loop/cost-total          # display mirror; the in-memory total is authoritative
+    TOTAL_COST_EST=0
+    echo 0 > .loop/cost-total-est      # estimated-share mirror (reset with the total)
     echo RUNNING > .loop/state
     # single-loop liveness pidfile — seed it the INSTANT state flips to RUNNING,
     # BEFORE the slow iteration-0 planning call below (a real model call lasting
@@ -12618,7 +12764,7 @@ run_iteration_loop() { # $1 i $2 run_start_ref $3 agent_failures $4 gate_revise 
   while [ "$i" -le "$MAX_ITERATIONS" ]; do
     run_beat   # covers the between-agent-call bookkeeping (git commits, parsing)
     if budget_exceeded; then
-      finish BUDGET_EXCEEDED "spent \$$TOTAL_COST >= cap \$$MAX_COST_USD before iteration $i"
+      finish BUDGET_EXCEEDED "spent $(cost_str) >= cap \$$MAX_COST_USD before iteration $i"
     fi
     if [ -n "${MAX_RUN_SECONDS:-}" ] && [ $((SECONDS - run_wall_start)) -ge "$MAX_RUN_SECONDS" ]; then
       finish BUDGET_EXCEEDED "wall clock $((SECONDS - run_wall_start))s >= MAX_RUN_SECONDS=${MAX_RUN_SECONDS} before iteration $i"
@@ -12628,7 +12774,7 @@ run_iteration_loop() { # $1 i $2 run_start_ref $3 agent_failures $4 gate_revise 
     # so a crash/kill here resumes at EXACTLY this point (idempotent to re-run).
     ckpt_write "$i" "$agent_failures" "$gate_revise_count" "$iter_revise_count" "$resumes"
 
-    note "── iteration $i/$MAX_ITERATIONS (spent: \$$TOTAL_COST) ──"
+    note "── iteration $i/$MAX_ITERATIONS (spent: $(cost_str)) ──"
     pre_ref=$(git rev-parse HEAD)
     rm -f .loop/agent-state
     write_split_nudge "$i"   # fleet-worker budget signal (advisory; no-op otherwise)
@@ -12765,7 +12911,7 @@ run_iteration_loop() { # $1 i $2 run_start_ref $3 agent_failures $4 gate_revise 
     esac
 
     if budget_exceeded; then
-      finish BUDGET_EXCEEDED "spent \$$TOTAL_COST >= cap \$$MAX_COST_USD after iteration $i"
+      finish BUDGET_EXCEEDED "spent $(cost_str) >= cap \$$MAX_COST_USD after iteration $i"
     fi
     i=$((i + 1))
   done
@@ -13394,7 +13540,12 @@ cmd_status() {
       END { sum += seg; printf "$%.4f lifetime, %d runs", sum, runs }
     ' .loop/journal.jsonl)
   fi
-  echo "cost:     \$$(cat .loop/cost-total 2>/dev/null || echo 0) (last run)${lifeline:+ / $lifeline}"
+  local _cest; _cest=$(cat .loop/cost-total-est 2>/dev/null || echo 0)
+  local _cnote=""
+  if awk -v e="$_cest" 'BEGIN{exit !(e+0 > 0)}'; then
+    _cnote=" [incl. ~\$$_cest estimated Codex spend / 推定値を含む]"
+  fi
+  echo "cost:     \$$(cat .loop/cost-total 2>/dev/null || echo 0) (last run)${lifeline:+ / $lifeline}${_cnote}"
   echo "models:   implement=$(get_model MODEL_IMPLEMENT opus) review=$(get_model MODEL_REVIEW opus) stop-eval=$(get_model MODEL_STOP_EVAL haiku) rollback=$(get_model MODEL_ROLLBACK opus)"
   if codex_routing_enabled || [ "$(configured_agent CONTRACT)" = codex ] \
      || [ "$(configured_agent ROLLBACK)" = codex ]; then
@@ -13604,6 +13755,10 @@ cmd_report() {
         }
       }
     ' .loop/journal.jsonl
+    local _cest_r; _cest_r=$(cat .loop/cost-total-est 2>/dev/null || echo 0)
+    if awk -v e="$_cest_r" 'BEGIN{exit !(e+0 > 0)}'; then
+      echo "note: the last-run totals above include ~\$$_cest_r of ESTIMATED Codex spend (推定値 / token×price approximation from loop.config.sh, not a billed figure)"
+    fi
   else
     echo "(no journal yet — run ./loop.sh)"
   fi

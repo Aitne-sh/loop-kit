@@ -66,15 +66,43 @@ MAX_ITER_SECONDS=900       # default wall-clock watchdog per agent call
 #TIMEOUT_SUPERVISE=
 #TIMEOUT_ROLLBACK=         # independent rollback safety review
 
-# Total reported USD cap across Claude-routed calls in one run. EMPTY = no cap
-# (the default). Codex calls report 0 USD and cannot be bounded by this knob;
-# the harness warns when a run combines Codex routing with a non-empty cap.
-# Claude Code subscription (Pro/Max) usage has no per-token charge and the
-# reported USD is notional — a cap here would stop healthy loops early.
-# Set a number ONLY when the user explicitly asks for a hard cost cap
-# (e.g. API-billed usage). When set, it is enforced from loop.sh's in-memory
-# total and mirrored to each Claude call via --max-budget-usd.
+# Total reported USD cap across one run. EMPTY = no cap (the default). It is
+# enforced from loop.sh's in-memory total and mirrored to each Claude call via
+# --max-budget-usd. Claude reports real per-call USD; Codex reports none, so
+# Codex spend counts only when you fill the PRICE_* table below (then it is
+# ESTIMATED from token usage and DOES count against this cap). Claude Code and
+# ChatGPT subscription (Pro/Max) usage has no per-token charge and the reported/
+# estimated USD is notional — a cap here would stop healthy loops early. Set a
+# number ONLY when the user explicitly asks for a hard cost cap (e.g. API-billed
+# usage).
 MAX_COST_USD=""
+
+# ---- Codex cost estimation (APPROXIMATE) ----------------------------------
+# Codex/OpenAI does not report a USD amount, only token counts. If you set the
+# per-model prices below, loop.sh multiplies each Codex call's token usage by
+# them to produce an ESTIMATE, folds it into the reported total AND the
+# MAX_COST_USD cap, and labels every total that contains it as "推定値 / est".
+#
+# ⚠ The result is ALWAYS an estimate, never a bill. It can be wrong because:
+#   • On a ChatGPT subscription there is NO per-token charge (marginal $ ≈ 0);
+#     this is an API-equivalent figure, not what you actually pay.
+#   • Prices drift — these are hand-maintained; verify against your provider's
+#     current pricing page / billing dashboard. The harness cannot fetch them.
+#   • Cache/reasoning nuances: cached input is billed cheaper (PRICE_*_CACHED,
+#     defaults to the input rate if unset); reasoning tokens ride in output.
+# Because these prices feed the hard cap, they are part of the approval hash:
+# changing them requires ./loop.sh approve (same as MAX_COST_USD).
+#
+# Format (USD per 1,000,000 tokens). Key = model slug uppercased, every
+# non-alphanumeric char -> "_"  (gpt-5.6-sol -> GPT_5_6_SOL). Leave empty/
+# absent to keep Codex cost at 0 for that model (today's behavior). EXAMPLE
+# VALUES ONLY — replace with your provider's real, current numbers:
+#PRICE_GPT_5_5_IN="1.25"        # uncached input  $/1M
+#PRICE_GPT_5_5_CACHED="0.125"   # cached input    $/1M
+#PRICE_GPT_5_5_OUT="10.00"      # output          $/1M
+#PRICE_GPT_5_6_SOL_IN=""
+#PRICE_GPT_5_6_SOL_CACHED=""
+#PRICE_GPT_5_6_SOL_OUT=""
 
 # Stop heuristics
 STAGNATION_N=2             # consecutive no-diff iterations -> STALLED

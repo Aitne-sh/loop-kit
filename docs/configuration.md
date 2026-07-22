@@ -20,7 +20,8 @@ loop until you re-approve. The key settings:
 | `MAX_ITER_SECONDS` | 900 | Default wall-clock watchdog on each individual agent call. |
 | `TIMEOUT_<ROLE>` | (empty → inherits `MAX_ITER_SECONDS`) | Per-role watchdog override (seconds), e.g. `TIMEOUT_IMPLEMENT=1800` so a heavy implement iteration outlasts the clerical `STOP_EVAL`/`EVIDENCE` calls. Roles: `IMPLEMENT REVIEW PLAN CONTRACT EVIDENCE STOP_EVAL DECOMPOSE SUPERVISE ROLLBACK`. `TIMEOUT_ROLLBACK` bounds the independent discard safety review. Lives here (not `loop.models.sh`) because the watchdog is a safety budget — raising it is gated by re-approval. A blank/non-numeric value silently inherits the global. |
 | `MAX_RUN_SECONDS` | (empty) | Optional wall-clock budget checked at iteration/orchestration boundaries. A later resume gets a fresh window; it does not interrupt an individual `VERIFY_COMMAND`. |
-| `MAX_COST_USD` | (empty = no cap) | A hard cap on USD reported by Claude calls. Codex reports no USD amount and is therefore unbounded by this knob; see [Running roles on Codex](codex.md).  |
+| `MAX_COST_USD` | (empty = no cap) | A hard cap on reported USD. Claude reports real USD; Codex reports none, so it counts only if you set the `PRICE_*` table (then it is **estimated** and bounded by this cap). See [Running roles on Codex](codex.md).  |
+| `PRICE_<MODEL>_IN` / `_CACHED` / `_OUT` | (empty = Codex cost 0) | Optional per-1M-token USD rates that turn on **approximate** Codex costing (model slug uppercased, non-alphanumerics → `_`). Hashed with the contract. See [Running roles on Codex](codex.md).  |
 | `STAGNATION_N` | 2 | Consecutive no-diff iterations → STALLED. |
 | `REPEAT_FAIL_N` | 3 | Identical verify failure this many times → BLOCKED. Also derives the oscillation window: ≤2 distinct failure fingerprints across `2×N` consecutive failing iterations → BLOCKED (catches the fix-A-breaks-B ping-pong the identical rule misses). The same threshold caps identical deterministic *promotion refusals* (the agent declares ready, the evaluator's ledger/checklist checks refuse with a byte-identical reason each lap) → BLOCKED instead of iterating to the budget. |
 | `FUTILE_N` | 2 | Consecutive "futile" stop-eval verdicts → STALLED. |
@@ -145,7 +146,11 @@ Claude-reported cost (it then enforces an in-memory running total and adds
 `--max-budget-usd` to every Claude call).
 The contract session never suggests or sets a USD cap unless you bring up cost yourself.
 Claude-reported cost is tracked and logged; Codex calls are recorded as 0 because its result
-does not expose USD. `./loop.sh status` shows the last run **and** the lifetime total across
+does not expose USD — unless you fill the per-model `PRICE_*` table in `loop.config.sh`, in
+which case Codex cost is **estimated** from token usage, folded into the reported total and
+`MAX_COST_USD`, and labeled `推定値 / estimated` everywhere it appears (an estimate, never a
+bill; the prices are hashed with the contract — see [Running roles on Codex](codex.md)).
+`./loop.sh status` shows the last run **and** the lifetime total across
 all runs (derived from the append-only journal), and
 `./loop.sh report --text` breaks the last run down by role (implement / interim vs gate
 review / plan / evidence / stop-eval) plus the largest implement call by agent turns, so a

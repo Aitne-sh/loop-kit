@@ -101,10 +101,23 @@ harness default (a worker file that still defines a key keeps its own approved
 value). The approved `.agents` skills and repository `.codex/**` control plane are
 also copied byte-for-byte into each Fleet worktree.
 
-Codex does not report a USD amount in the normalized result, so Codex calls are journaled
-with cost 0. Reported USD totals and `MAX_COST_USD` therefore cover Claude calls only; the
-harness warns when a USD cap is combined with Codex routing, but cannot enforce that cap
-against Codex usage. The raw Codex JSONL remains available for usage auditing.
+Codex does not report a USD amount, only token counts (`turn.completed.usage`). By default
+Codex calls are journaled with cost 0, and reported USD totals and `MAX_COST_USD` cover Claude
+calls only; the harness warns when a USD cap is combined with Codex routing.
+
+**Optional cost estimation.** Fill the per-model `PRICE_*` table in `loop.config.sh` (USD per
+1M tokens, keyed by the model slug uppercased with non-alphanumerics mapped to `_` — e.g.
+`gpt-5.6-sol` → `PRICE_GPT_5_6_SOL_IN/CACHED/OUT`) and the harness multiplies each Codex call's
+token usage by those rates. The result is an **estimate, never a bill**: it is folded into the
+reported total *and* the `MAX_COST_USD` cap, and every total that contains it is labeled
+`推定値 / estimated` (`.loop/cost-total-est` mirrors the estimated share; a one-time
+`CODEX_COST_ESTIMATED` journal row records that the run's totals include estimates). The
+estimate can diverge from reality for three structural reasons: a ChatGPT subscription has no
+per-token charge (this is an API-equivalent figure, not what you pay); prices are
+hand-maintained and drift (the harness never fetches them); and cached input is billed at
+`PRICE_*_CACHED` (defaulting to the input rate) while reasoning tokens ride inside output.
+Because these prices feed the hard cap, they are part of the contract approval hash — changing
+a rate requires `./loop.sh approve`. The raw Codex JSONL also remains available for auditing.
 
 A useful maker–checker split is Codex for `IMPLEMENT` and Claude for `REVIEW`: independent
 vendors reduce the chance that one model family's blind spot appears on both sides. This is

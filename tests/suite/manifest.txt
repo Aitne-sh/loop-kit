@@ -8,6 +8,7 @@
 20-cost-guards.sh parallel
 21-interrupt-subtree.sh serial
 22-preflight-guards.sh parallel
+23-codex-cost-est.sh parallel
 24-req-eval.sh parallel
 26-loop-memory.sh parallel
 30-fleet-basic.sh parallel
