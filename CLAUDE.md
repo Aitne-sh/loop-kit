@@ -219,8 +219,8 @@ drift or user-owned ignored files in place or under `.loop/fleet/discard-quarant
   phase-boundary review owns), and only the harness publishes `.loop/docs/task-plan.md` /
   `implementation-plan.md`. The containment check is deliberately cheap (git porcelain +
   HEAD ref + `check_harness`) — per-call full-tree hashing, off-tree guard mirrors, and
-  plan context-binding were evaluated and rejected as disproportionate (heavier variants
-  live on the parked `codex-hardening-wip` branch). Claude planner sessions get only
+  plan context-binding were evaluated and rejected as disproportionate; do not reintroduce
+  them without a concrete threat that the cheap check misses. Claude planner sessions get only
   Read/Glob/Grep, but project hooks/plugins/MCP are NOT structurally isolated; Codex
   `read-only` is a local-filesystem boundary only.
 - **`RISK_REQUIRES_APPROVAL` is a guard verdict, not a decision request.** finish() shows
